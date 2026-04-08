@@ -5,7 +5,9 @@ Submission to the Partcl/HRT Macro Placement Challenge.
 Score: **1.4159** average across 17 IBM benchmarks (all valid, zero overlaps).
 
 Code: [`submissions/vmallela/placer.py`](submissions/vmallela/placer.py)
+
 Submission notes: [`submissions/vmallela/README.md`](submissions/vmallela/README.md)
+
 Experiment log: [`submissions/vmallela/EXPERIMENTS.md`](submissions/vmallela/EXPERIMENTS.md)
 
 Original competition README: [`COMPETITION.md`](COMPETITION.md)
