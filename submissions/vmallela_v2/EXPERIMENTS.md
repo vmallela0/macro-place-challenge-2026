@@ -93,7 +93,11 @@ See `submissions/experiments/` for the raw `placer_exp_vNN.py` files and
 - v117: ibm04 @ 1800s seed=404
 - v118: ibm06 @ 2500s seed=606
 
-Final result collated: avg **1.1492** across 17 benchmarks.
+Final result collated: avg **1.1533** across 17 benchmarks, all runs ≤ 1 hour
+(the competition's hard timeout). An earlier 4800s run on ibm17 had produced
+1.4211 but exceeded the per-benchmark cap, so it is not counted — the legal
+ibm17 result is 1.4895 at 3010s. The placer now hard-caps `TOTAL_TIME_LIMIT`
+at 3300s in `OptimalPlacer.__init__` regardless of env override.
 
 ## Methodology
 

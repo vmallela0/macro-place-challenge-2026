@@ -58,9 +58,15 @@ from _moves import lns_destroy_repair_phase
 
 
 class OptimalPlacer:
+    # Competition hard cap: 1 hour per benchmark. We leave 300s headroom
+    # for legalization + cost computation after the placer returns, so
+    # the placer's own budget is capped at 3300s regardless of env input.
+    _COMPETITION_CAP_SECONDS = 3300
+
     def __init__(self, seed=42):
         self.seed = seed
-        self.TOTAL_TIME_LIMIT = int(os.environ.get("PLACER_TOTAL_BUDGET", 3300))
+        requested = int(os.environ.get("PLACER_TOTAL_BUDGET", self._COMPETITION_CAP_SECONDS))
+        self.TOTAL_TIME_LIMIT = min(requested, self._COMPETITION_CAP_SECONDS)
         self.SOFT_PHASE_BUDGET = int(os.environ.get("PLACER_SOFT_BUDGET",
                                                      self.TOTAL_TIME_LIMIT * 3 // 5))
         self.PARALLEL_WORKERS = int(os.environ.get("PLACER_PARALLEL_WORKERS", 0))

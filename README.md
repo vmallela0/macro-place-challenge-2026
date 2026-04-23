@@ -4,8 +4,9 @@ Submissions to the Partcl/HRT Macro Placement Challenge.
 
 ## Current best: `vmallela_v2`
 
-Score: **1.1492** average across 17 IBM benchmarks (all valid, zero overlaps).
-That is **+6.0% under Cezar (ReFine, leaderboard #1 at 1.2224)**.
+Score: **1.1533** average across 17 IBM benchmarks — all VALID (zero overlaps),
+every run ≤ 1 hour (competition cap). That is **+5.7% under Cezar (ReFine,
+leaderboard #1 at 1.2224)**.
 
 Code: [`submissions/vmallela_v2/placer.py`](submissions/vmallela_v2/placer.py)
 Submission notes: [`submissions/vmallela_v2/README.md`](submissions/vmallela_v2/README.md)
