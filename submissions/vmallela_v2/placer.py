@@ -147,10 +147,14 @@ class OptimalPlacer:
         print(f"  [cd1] cost={best_cost:.6f}", flush=True)
 
         # Per-net optimization (NEW in v4)
+        # exp 0 bug-fix: per_net_optimize now returns fresh hard positions
+        # (previously it returned pos_np unchanged, so the hard-macro moves it
+        # made in incr_eval were wiped by the subsequent hard_lns sync).
         pn_budget = min(60, max(15, hard_deadline - (time.time() - t0) - 30) * 0.1)
         try:
-            _, c = per_net_optimize(best_pos, benchmark, incr_eval, max_time=pn_budget)
-            if c < best_cost: best_cost = c
+            new_pos, c = per_net_optimize(best_pos, benchmark, incr_eval, max_time=pn_budget)
+            if c < best_cost:
+                best_cost, best_pos = c, new_pos
             print(f"  [per_net] cost={best_cost:.6f}", flush=True)
         except Exception: pass
 

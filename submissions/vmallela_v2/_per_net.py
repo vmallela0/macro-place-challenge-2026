@@ -15,6 +15,20 @@ import numpy as np
 
 
 def per_net_optimize(pos_np, benchmark, incr_eval, max_time, verbose=False):
+    """Per-net HPWL optimizer.
+
+    BUG FIX (exp 0): the caller in placer.py passed `best_pos` (hard positions)
+    and read back (_, c) — discarding any updated hard positions. But this
+    function moves HARD macros in incr_eval during its line search. The next
+    hard-operator (hard_lns, _coord_descent) then called
+    `incr_eval.sync_positions(best_pos)` which RESET incr_eval's hard state
+    back to pre-per_net, wiping out every hard-macro improvement per_net had
+    just found.
+
+    Fix: return `best_pos_hard` (a freshly-copied incr_eval.macro_pos[:n_hard]
+    snapshot at the moment best_cost was last beaten) so the caller can
+    actually propagate the hard positions.
+    """
     n_hard = benchmark.num_hard_macros
     n_total = benchmark.macro_positions.shape[0]
     cw, ch = float(benchmark.canvas_width), float(benchmark.canvas_height)
@@ -32,6 +46,8 @@ def per_net_optimize(pos_np, benchmark, incr_eval, max_time, verbose=False):
 
     current_cost = incr_eval.get_proxy_cost()
     best_cost = current_cost
+    # Snapshot hard positions at entry — this is what we'd return if no improvement.
+    best_pos_hard = incr_eval.macro_pos[:n_hard].copy().astype(np.float64)
     t0 = time.time()
     n_moves = 0
 
@@ -102,10 +118,13 @@ def per_net_optimize(pos_np, benchmark, incr_eval, max_time, verbose=False):
                     current_cost = c
                     if c < best_cost:
                         best_cost = c
+                        # Snapshot hard positions at the new best cost so the
+                        # caller can propagate the hard-macro moves (exp 0 fix).
+                        best_pos_hard = incr_eval.macro_pos[:n_hard].copy().astype(np.float64)
                     n_moves += 1
                     break  # take first improving alpha
                 incr_eval.undo_move()
 
     if verbose:
         print(f"    per_net: {n_moves} moves, cost {best_cost:.6f}")
-    return pos_np, best_cost
+    return best_pos_hard, best_cost
