@@ -426,140 +426,147 @@ class IncrementalEvaluator:
         return 0, 0
 
     def __two_pin_net_routing(self, source_gcell, node_gcells, weight):
-        """plc_client_os.py L1269 — verbatim"""
+        """plc_client_os.py L1269 — vectorized L-route between source and sink.
+
+        Entry format: (is_H: bool, indices: np.int32 array, weight: float).
+        One segment per call per direction (H then V). _unroute_net applies the
+        inverse via numpy fancy-index subtract.
+        """
         temp_gcell = list(node_gcells)
         if temp_gcell[0] == source_gcell:
             sink_gcell = temp_gcell[1]
         else:
             sink_gcell = temp_gcell[0]
 
-        row_min = min(sink_gcell[0], source_gcell[0])
-        row_max = max(sink_gcell[0], source_gcell[0])
-        col_min = min(sink_gcell[1], source_gcell[1])
-        col_max = max(sink_gcell[1], source_gcell[1])
+        src_r, src_c = source_gcell[0], source_gcell[1]
+        snk_r, snk_c = sink_gcell[0], sink_gcell[1]
+        gc = self.grid_col
 
-        # H routing
-        for col_idx in range(col_min, col_max, 1):
-            col = col_idx
-            row = source_gcell[0]
-            idx = row * self.grid_col + col
-            self.H_routing_raw[idx] += weight
-            self._current_entries.append((idx, weight, True))
+        # H routing at source row: cols [col_min, col_max)
+        if src_c != snk_c:
+            c0 = src_c if src_c < snk_c else snk_c
+            c1 = src_c if src_c > snk_c else snk_c
+            h_start = src_r * gc + c0
+            h_end = src_r * gc + c1
+            self.H_routing_raw[h_start:h_end] += weight
+            h_idx = np.arange(h_start, h_end, dtype=np.int32)
+            self._current_entries.append((True, h_idx, weight))
 
-        # V routing
-        for row_idx in range(row_min, row_max, 1):
-            row = row_idx
-            col = sink_gcell[1]
-            idx = row * self.grid_col + col
-            self.V_routing_raw[idx] += weight
-            self._current_entries.append((idx, weight, False))
+        # V routing at sink col: rows [row_min, row_max)
+        if src_r != snk_r:
+            r0 = src_r if src_r < snk_r else snk_r
+            r1 = src_r if src_r > snk_r else snk_r
+            v_idx = np.arange(r0, r1, dtype=np.int32) * gc + snk_c
+            self.V_routing_raw[v_idx] += weight
+            self._current_entries.append((False, v_idx, weight))
 
     def __l_routing(self, node_gcells, weight):
-        """plc_client_os.py L1299 — verbatim"""
+        """plc_client_os.py L1299 — vectorized."""
         node_gcells.sort(key=lambda x: (x[1], x[0]))
         y1, x1 = node_gcells[0]
         y2, x2 = node_gcells[1]
         y3, x3 = node_gcells[2]
-        # H routing (x1, y1) to (x2, y1)
-        for col in range(x1, x2):
-            row = y1
-            idx = row * self.grid_col + col
-            self.H_routing_raw[idx] += weight
-            self._current_entries.append((idx, weight, True))
+        gc = self.grid_col
 
-        # H routing (x2, y2) to (x2, y3)
-        for col in range(x2, x3):
-            row = y2
-            idx = row * self.grid_col + col
-            self.H_routing_raw[idx] += weight
-            self._current_entries.append((idx, weight, True))
-
-        # V routing (x2, min(y1, y2)) to (x2, max(y1, y2))
-        for row in range(min(y1, y2), max(y1, y2)):
-            col = x2
-            idx = row * self.grid_col + col
+        # H (x1..x2-1 at row y1)
+        if x2 > x1:
+            s, e = y1 * gc + x1, y1 * gc + x2
+            self.H_routing_raw[s:e] += weight
+            self._current_entries.append((True, np.arange(s, e, dtype=np.int32), weight))
+        # H (x2..x3-1 at row y2)
+        if x3 > x2:
+            s, e = y2 * gc + x2, y2 * gc + x3
+            self.H_routing_raw[s:e] += weight
+            self._current_entries.append((True, np.arange(s, e, dtype=np.int32), weight))
+        # V (rows min(y1,y2)..max-1 at col x2)
+        r0 = y1 if y1 < y2 else y2
+        r1 = y1 if y1 > y2 else y2
+        if r1 > r0:
+            idx = np.arange(r0, r1, dtype=np.int32) * gc + x2
             self.V_routing_raw[idx] += weight
-            self._current_entries.append((idx, weight, False))
-
-        # V routing (x3, min(y2, y3)) to (x3, max(y2, y3))
-        for row in range(min(y2, y3), max(y2, y3)):
-            col = x3
-            idx = row * self.grid_col + col
+            self._current_entries.append((False, idx, weight))
+        # V (rows min(y2,y3)..max-1 at col x3)
+        r0 = y2 if y2 < y3 else y3
+        r1 = y2 if y2 > y3 else y3
+        if r1 > r0:
+            idx = np.arange(r0, r1, dtype=np.int32) * gc + x3
             self.V_routing_raw[idx] += weight
-            self._current_entries.append((idx, weight, False))
+            self._current_entries.append((False, idx, weight))
 
     def __t_routing(self, node_gcells, weight):
-        """plc_client_os.py L1328 — verbatim"""
+        """plc_client_os.py L1328 — vectorized."""
         node_gcells.sort()
         y1, x1 = node_gcells[0]
         y2, x2 = node_gcells[1]
         y3, x3 = node_gcells[2]
-        xmin = min(x1, x2, x3)
-        xmax = max(x1, x2, x3)
+        xmin = x1 if x1 < x2 else x2
+        if x3 < xmin:
+            xmin = x3
+        xmax = x1 if x1 > x2 else x2
+        if x3 > xmax:
+            xmax = x3
+        gc = self.grid_col
 
-        # H routing (xmin, y2) to (xmax, y2)
-        for col in range(xmin, xmax):
-            row = y2
-            idx = row * self.grid_col + col
-            self.H_routing_raw[idx] += weight
-            self._current_entries.append((idx, weight, True))
-
-        # V routing (x1, y1) to (x1, y2)
-        for row in range(min(y1, y2), max(y1, y2)):
-            col = x1
-            idx = row * self.grid_col + col
+        # H (xmin..xmax-1 at row y2)
+        if xmax > xmin:
+            s, e = y2 * gc + xmin, y2 * gc + xmax
+            self.H_routing_raw[s:e] += weight
+            self._current_entries.append((True, np.arange(s, e, dtype=np.int32), weight))
+        # V (rows min(y1,y2)..max-1 at col x1)
+        r0 = y1 if y1 < y2 else y2
+        r1 = y1 if y1 > y2 else y2
+        if r1 > r0:
+            idx = np.arange(r0, r1, dtype=np.int32) * gc + x1
             self.V_routing_raw[idx] += weight
-            self._current_entries.append((idx, weight, False))
-
-        # V routing (x3, y3) to (x3, y2)
-        for row in range(min(y2, y3), max(y2, y3)):
-            col = x3
-            idx = row * self.grid_col + col
+            self._current_entries.append((False, idx, weight))
+        # V (rows min(y2,y3)..max-1 at col x3)
+        r0 = y2 if y2 < y3 else y3
+        r1 = y2 if y2 > y3 else y3
+        if r1 > r0:
+            idx = np.arange(r0, r1, dtype=np.int32) * gc + x3
             self.V_routing_raw[idx] += weight
-            self._current_entries.append((idx, weight, False))
+            self._current_entries.append((False, idx, weight))
 
     def __three_pin_net_routing(self, node_gcells, weight):
-        """plc_client_os.py L1354 — verbatim"""
+        """plc_client_os.py L1354 — vectorized inline branches."""
         temp_gcell = list(node_gcells)
         temp_gcell.sort(key=lambda x: (x[1], x[0]))
         y1, x1 = temp_gcell[0]
         y2, x2 = temp_gcell[1]
         y3, x3 = temp_gcell[2]
+        gc = self.grid_col
 
         if x1 < x2 and x2 < x3 and min(y1, y3) < y2 and max(y1, y3) > y2:
             self.__l_routing(temp_gcell, weight)
         elif x2 == x3 and x1 < x2 and y1 < min(y2, y3):
-            for col_idx in range(x1, x2, 1):
-                row = y1
-                col = col_idx
-                idx = row * self.grid_col + col
-                self.H_routing_raw[idx] += weight
-                self._current_entries.append((idx, weight, True))
-
-            for row_idx in range(y1, max(y2, y3)):
-                col = x2
-                row = row_idx
-                idx = row * self.grid_col + col
+            # H (x1..x2-1 at row y1)
+            s, e = y1 * gc + x1, y1 * gc + x2
+            self.H_routing_raw[s:e] += weight
+            self._current_entries.append((True, np.arange(s, e, dtype=np.int32), weight))
+            # V (y1..max(y2,y3)-1 at col x2)
+            r_max = y2 if y2 > y3 else y3
+            if r_max > y1:
+                idx = np.arange(y1, r_max, dtype=np.int32) * gc + x2
                 self.V_routing_raw[idx] += weight
-                self._current_entries.append((idx, weight, False))
+                self._current_entries.append((False, idx, weight))
         elif y2 == y3:
-            for col in range(x1, x2):
-                row = y1
-                idx = row * self.grid_col + col
-                self.H_routing_raw[idx] += weight
-                self._current_entries.append((idx, weight, True))
-
-            for col in range(x2, x3):
-                row = y2
-                idx = row * self.grid_col + col
-                self.H_routing_raw[idx] += weight
-                self._current_entries.append((idx, weight, True))
-
-            for row in range(min(y2, y1), max(y2, y1)):
-                col = x2
-                idx = row * self.grid_col + col
+            # H (x1..x2-1 at row y1)
+            if x2 > x1:
+                s, e = y1 * gc + x1, y1 * gc + x2
+                self.H_routing_raw[s:e] += weight
+                self._current_entries.append((True, np.arange(s, e, dtype=np.int32), weight))
+            # H (x2..x3-1 at row y2)
+            if x3 > x2:
+                s, e = y2 * gc + x2, y2 * gc + x3
+                self.H_routing_raw[s:e] += weight
+                self._current_entries.append((True, np.arange(s, e, dtype=np.int32), weight))
+            # V (min(y1,y2)..max(y1,y2)-1 at col x2)
+            r0 = y1 if y1 < y2 else y2
+            r1 = y1 if y1 > y2 else y2
+            if r1 > r0:
+                idx = np.arange(r0, r1, dtype=np.int32) * gc + x2
                 self.V_routing_raw[idx] += weight
-                self._current_entries.append((idx, weight, False))
+                self._current_entries.append((False, idx, weight))
         else:
             self.__t_routing(temp_gcell, weight)
 
@@ -747,12 +754,15 @@ class IncrementalEvaluator:
         self.net_routing_cache[net_id] = list(self._current_entries)
 
     def _unroute_net(self, net_id):
-        """Remove a net's routing contribution from V/H_routing_raw."""
-        for flat_idx, amount, is_H in self.net_routing_cache[net_id]:
-            if is_H:
-                self.H_routing_raw[flat_idx] -= amount
+        """Remove a net's routing contribution. New entry format: tuples of
+        (is_H: bool, indices: np.int32, amount: float); segments within a single
+        net are non-self-intersecting (L/T shapes), so direct fancy-index
+        subtract is safe."""
+        for is_h, indices, amount in self.net_routing_cache[net_id]:
+            if is_h:
+                self.H_routing_raw[indices] -= amount
             else:
-                self.V_routing_raw[flat_idx] -= amount
+                self.V_routing_raw[indices] -= amount
         self.net_routing_cache[net_id] = []
 
     def _full_recompute_congestion(self):
