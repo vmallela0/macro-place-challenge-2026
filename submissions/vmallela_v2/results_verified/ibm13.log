@@ -1,0 +1,58 @@
+================================================================================
+evaluate · OptimalPlacer  (submissions/vmallela_v2/placer.py)
+================================================================================
+
+  ibm13... #[INFO] Reading from external/MacroPlacement/Testcases/ICCAD04/ibm13/netlist.pb.txt
+[INFO] Retrieving Meta information from .plc comments
+#[PLACEMENT GRID] Col: 43, Row: 43
+#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96
+#[CONGESTION SMOOTH RANGE] Smooth Range: 2
+#[OVERLAP THRESHOLD] Threshold: 0.0040
+#[INFO] Reading from external/MacroPlacement/Testcases/ICCAD04/ibm13/netlist.pb.txt
+[INFO] Retrieving Meta information from .plc comments
+#[PLACEMENT GRID] Col: 43, Row: 43
+#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96
+#[CONGESTION SMOOTH RANGE] Smooth Range: 2
+#[OVERLAP THRESHOLD] Threshold: 0.0040
+#[INFO] Reading from external/MacroPlacement/Testcases/ICCAD04/ibm13/netlist.pb.txt
+[INFO] Retrieving Meta information from .plc comments
+#[PLACEMENT GRID] Col: 43, Row: 43
+#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96
+#[CONGESTION SMOOTH RANGE] Smooth Range: 2
+#[OVERLAP THRESHOLD] Threshold: 0.0040
+  [legalize] 604.1s cost=1.384379
+#[INFO] Reading from external/MacroPlacement/Testcases/ICCAD04/ibm13/netlist.pb.txt
+[INFO] Retrieving Meta information from .plc comments
+#[PLACEMENT GRID] Col: 43, Row: 43
+#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96
+#[CONGESTION SMOOTH RANGE] Smooth Range: 2
+#[OVERLAP THRESHOLD] Threshold: 0.0040
+  [cd1] cost=1.358425
+  [per_net] cost=1.189695
+  [hard_lns] cost=1.176565
+  [cycle_1] t=147.4 cost=1.045062
+  [cycle_2] t=60.0 cost=1.033537
+  [cycle_3] t=60.0 cost=1.026478
+  [cycle_4] t=60.0 cost=1.020552
+  [cycle_5] t=60.0 cost=1.017851
+  [cycle_6] t=60.0 cost=1.014667
+  [cycle_7] t=60.0 cost=1.012512
+  [cycle_8] t=60.0 cost=1.008920
+  [cycle_9] t=60.0 cost=1.006358
+  [cycle_10] t=60.0 cost=1.005227
+  [cycle_11] t=60.0 cost=1.004132
+  [cycle_12] t=60.0 cost=1.003172
+  [cycle_13] t=60.0 cost=1.002587
+  [cycle_14] t=60.0 cost=1.001795
+  [cycle_15] t=60.0 cost=1.000714
+  [cycle_16] t=60.0 cost=0.999679
+  [cycle_17] t=60.0 cost=0.999357
+  [cycle_18] t=60.0 cost=0.999201
+  [cycle_19] t=60.0 cost=0.998744
+  [cycle_20] t=60.0 cost=0.998744
+  [cycle_21] t=42.0 cost=0.998744
+  [cycle_22] t=29.4 cost=0.998744
+  [cycle_23] t=20.6 cost=0.998744
+  [plateau] stop at cycle 23
+  [TOTAL] 2502.5s cycles=23 final=0.998744
+proxy=1.0010  (wl=0.062 den=0.615 cong=1.262)  VALID  [2503.36s]
