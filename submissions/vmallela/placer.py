@@ -228,6 +228,15 @@ class IncrementalEvaluator:
         self.pin_is_macro = self.pin_macro >= 0
         self.n_pins = len(flat_pins)
 
+        # Reverse index: pins belonging to each macro. O(pins_per_macro) lookup
+        # for move_macro's pin-update hot path (was O(n_pins) linear scan).
+        _macro_pin_lists = [[] for _ in range(n_total)]
+        for pi in range(self.n_pins):
+            mi = int(self.pin_macro[pi])
+            if mi >= 0:
+                _macro_pin_lists[mi].append(pi)
+        self.macro_pins = [np.array(lst, dtype=np.int32) for lst in _macro_pin_lists]
+
         # Current pin positions
         # float32 to match PlacementCost pin position precision
         self.pin_x = np.zeros(self.n_pins, dtype=np.float32)
@@ -277,12 +286,15 @@ class IncrementalEvaluator:
                 self.pin_y[i] = self.pin_yoff[i]
 
     def _update_pins_for_macro(self, macro_idx):
-        """Update pin positions for all pins belonging to a specific macro."""
+        """Update pin positions for all pins belonging to a specific macro.
+        Vectorized via precomputed macro_pins reverse index. Preserves original
+        semantics: float32 macro_pos + float64 pin_xoff → float64 sum cast to
+        float32 on store into pin_x (matches PlacementCost)."""
         mx, my = self.macro_pos[macro_idx]
-        for i in range(self.n_pins):
-            if self.pin_macro[i] == macro_idx:
-                self.pin_x[i] = mx + self.pin_xoff[i]
-                self.pin_y[i] = my + self.pin_yoff[i]
+        pins = self.macro_pins[macro_idx]
+        if pins.size:
+            self.pin_x[pins] = mx + self.pin_xoff[pins]
+            self.pin_y[pins] = my + self.pin_yoff[pins]
 
     # --- Wirelength ---
 
@@ -774,10 +786,10 @@ class IncrementalEvaluator:
         old_total_hpwl = self.total_hpwl
         old_wl_cost = self.wirelength_cost
 
-        # Save affected pin positions
-        affected_pins = [i for i in range(self.n_pins) if self.pin_macro[i] == macro_idx]
-        old_pin_x = {i: self.pin_x[i] for i in affected_pins}
-        old_pin_y = {i: self.pin_y[i] for i in affected_pins}
+        # Save affected pin positions (O(pins_per_macro) via reverse index)
+        affected_pins = self.macro_pins[macro_idx]
+        old_pin_x = self.pin_x[affected_pins].copy()
+        old_pin_y = self.pin_y[affected_pins].copy()
 
         # Save density state (affected cells)
         w, h = self.macro_w[macro_idx], self.macro_h[macro_idx]
@@ -807,6 +819,7 @@ class IncrementalEvaluator:
             'old_net_hpwl': old_net_hpwl,
             'old_total_hpwl': old_total_hpwl,
             'old_wl_cost': old_wl_cost,
+            'affected_pins': affected_pins,
             'old_pin_x': old_pin_x,
             'old_pin_y': old_pin_y,
             'old_density_cells': old_density_cells,
@@ -871,11 +884,11 @@ class IncrementalEvaluator:
         self.macro_pos[macro_idx, 0] = u['old_x']
         self.macro_pos[macro_idx, 1] = u['old_y']
 
-        # Restore pin positions
-        for i, x in u['old_pin_x'].items():
-            self.pin_x[i] = x
-        for i, y in u['old_pin_y'].items():
-            self.pin_y[i] = y
+        # Restore pin positions (arrays aligned with 'affected_pins' index array)
+        pins = u['affected_pins']
+        if pins.size:
+            self.pin_x[pins] = u['old_pin_x']
+            self.pin_y[pins] = u['old_pin_y']
 
         # Restore wirelength
         for nid, hpwl in u['old_net_hpwl'].items():
