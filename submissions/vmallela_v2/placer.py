@@ -244,9 +244,16 @@ class OptimalPlacer:
             except Exception: pass
             if time.time() - t0 > soft_deadline: break
 
-            _, c = _coord_descent(best_pos, benchmark, plc_cd,
+            # exp 0b bug-fix: this hard-polish call in the soft cycle used to
+            # read `_, c = ...`, discarding the returned best-hard-positions.
+            # If the polish found an improving hard move, best_cost updated
+            # but best_pos stayed at the previous hard state. Next cycle's
+            # operators called `sync_positions(best_pos)` which wiped those
+            # hard improvements back out. Capture the returned pos too.
+            p, c = _coord_descent(best_pos, benchmark, plc_cd,
                                   max_time=cycle_t * 0.20, incr_eval=incr_eval)
-            if c < best_cost: best_cost = c
+            if c < best_cost:
+                best_cost, best_pos = c, p
 
             print(f"  [cycle_{cycle}] t={cycle_t:.1f} cost={best_cost:.6f}", flush=True)
 
