@@ -250,7 +250,7 @@ class OptimalPlacer:
             if gain < 5e-5:
                 plateau += 1
                 cycle_t = max(8, cycle_t * 0.7)
-                if plateau >= 4:
+                if plateau >= int(os.environ.get('PLACER_PLATEAU_N', 4)):
                     # Escape-basin: spend remaining budget on aggressive LNS.
                     # Rotation: large hard-LNS with congestion-biased seeds,
                     # then large soft-LNS. If any escapes, reset plateau and

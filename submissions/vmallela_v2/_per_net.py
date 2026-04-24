@@ -73,8 +73,11 @@ def per_net_optimize(pos_np, benchmark, incr_eval, max_time, verbose=False):
             ox = float(incr_eval.macro_pos[m, 0])
             oy = float(incr_eval.macro_pos[m, 1])
 
-            # Try multiple step magnitudes toward target
-            for alpha in [1.0, 0.5, 0.25, 0.1]:
+            # exp 7: line-search env-gated.
+            _ls = __import__('os').environ.get('PLACER_EXP7_LINESEARCH', '0') == '1'
+            _alphas = [1.0, 0.5, 0.25, 0.125, 0.0625] if _ls else [1.0, 0.5, 0.25, 0.1]
+            _ls_best_c, _ls_best_x, _ls_best_y = None, None, None
+            for alpha in _alphas:
                 nx = ox + alpha * (tx - ox)
                 ny = oy + alpha * (ty - oy)
                 if m < n_hard:
