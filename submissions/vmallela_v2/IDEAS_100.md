@@ -615,3 +615,31 @@ Format per entry: `VNN — idea-ref — ibm01 proxy @ 220 s — delta vs
 v51 (0.8533) — notes`.
 
 <!-- results appended here as tests complete -->
+
+## Round-1 fast tests (ibm01 @ 220 s, single thread, seed=42)
+
+Baseline for comparison: v51/v80 at 220 s ≈ 0.8533 (jitter ±0.002).
+
+| Variant | Idea | ibm01 proxy | Δ vs baseline | Wall | Verdict |
+|---------|------|-------------|---------------|------|---------|
+| v123 | D12 UCB1-ordered probe direction with early-accept-on-first-improving | **0.8542** | +0.0009 | 212 s | Tied / within jitter — probe-direction ordering does not meaningfully change quality at this budget. |
+| v124 | A1 control — reverse macro order (ascending net-count) in soft CD | 0.8575 | +0.0042 | 213 s | Worse by a clear margin: the default "most-connected first" heuristic is real and worth ~0.004. |
+| v125 | A19 LNS seed biased by sum-of-incident-net-sizes (proxy for congestion contribution) | 0.8578 | +0.0045 | 215 s | Worse. Uniform random LNS seed beats this weighting — biasing oversamples the same high-connectivity macros LNS has already repaired. |
+
+### Takeaways from round 1
+
+1. **The default probe-direction order is already near-optimal at our budgets.** UCB1-with-early-accept finishes in the same cost bucket (Δ=0.0009 is inside the 0.002 jitter floor), so more sophisticated bandit schemes here are unlikely to pay.
+2. **Macro-order heuristic is load-bearing.** Ascending net-count lost 0.004 vs descending. This is a measurable effect that an A/B confirms — the existing implementation is not arbitrary.
+3. **LNS seed-selection heuristics can hurt.** Weighting seeds by net-size incidence over-concentrates destroy sets on the same few hubs; the uniform-random baseline gives better coverage of the soft-macro configuration space.
+
+### Round-2 candidates (implementable, not yet tested)
+
+- **A5 three-macro cyclic swap** — 3-cycle permutation of macros sharing a high-weight net, evaluated atomically against the 2-swap. Tests whether k = 3 escapes a basin k = 2 cannot.
+- **A11 + A22 quadratic placement via PCG** as an additional seed for the legalization tournament. Known to give strong HPWL-optimal seeds in classical analytical placers.
+- **A25 ePlace-style Poisson density surrogate** as a probe pre-filter: reject probes whose Poisson potential increases above a threshold before calling `move_macro`. Would not change accepted moves but might prune evaluation.
+- **D10 multi-armed bandit for cycle allocation** — replace the fixed 5/35/15/30/15 split by UCB over per-operator cost-gain-per-second. Tests whether the manual split is suboptimal.
+- **D11 Thompson sampling probe direction** (sibling of D12): sample from Beta-Dirichlet, no explicit exploration bonus. Expected similar to D12.
+- **D17 importance-weighted macro sampling** inside CD: probability of visiting macro `i` on pass `k+1` ∝ observed |ΔCost| on pass `k`. Focuses effort on recently-moving macros.
+- **D21 IRLS** for the HPWL subproblem: iteratively-reweighted least-squares gives weighted-median convergence but exposes a smooth Hessian approximation for a larger step.
+
+No round-2 tests have been run yet; they would need another 3–5 ibm01 runs at 220 s plus minor code changes each.
