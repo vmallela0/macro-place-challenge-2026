@@ -121,27 +121,42 @@ class OptimalPlacer:
                         return True
             return False
 
-        # exp-fast-tournament: optionally evaluate tournament candidates with
-        # the incremental evaluator (~50ms vs ~1.3s for compute_proxy_cost).
-        # 25× more candidates fit in LEGALIZE_BUDGET → much wider basin search.
-        # Equivalent to PlacementCost up to 1e-6, validated by the eq-test.
+        # exp-fast-tournament: evaluate tournament candidates with the
+        # incremental evaluator (~50ms vs ~1.3s for compute_proxy_cost).
+        #
+        # BUG FIX (round 5): the original strict _has_overlap check rejected
+        # too many candidates on big benchmarks (ibm10/17 had legalize+refine
+        # outputs with sub-0.0040 overlaps that PlacementCost accepts but my
+        # strict check did not), leading to best_pos=None → invalid output.
+        #
+        # New design: skip the strict pre-filter; gather top-K candidates by
+        # incremental cost, then validate them through the OFFICIAL
+        # PlacementCost only at the end. Keep the lowest-cost one with
+        # overlap_count == 0.
         _fast_t = os.environ.get("PLACER_EXP_FAST_TOURNAMENT", "0") == "1"
         _t_eval = None
+        _top_k = int(os.environ.get("PLACER_FAST_TOURN_K", 8))
+        _top_candidates = []  # list of (cost, pos_np); kept sorted ascending
         if _fast_t:
             _t_plc = _load_plc(benchmark.name)
             _t_eval = IncrementalEvaluator(_t_plc, benchmark)
 
         def _try(pos_np):
             nonlocal best_pos, best_cost
-            if _has_overlap(pos_np):
-                return
             if _fast_t and _t_eval is not None:
+                # Skip strict overlap pre-filter — let PlacementCost validate at end.
                 _t_eval.sync_positions(pos_np)
                 c = _t_eval.get_proxy_cost()
-                if c < best_cost:
-                    best_cost = c
-                    best_pos = pos_np.copy()
+                # Maintain top-K by cost (no strict overlap rejection here).
+                if len(_top_candidates) < _top_k:
+                    _top_candidates.append((c, pos_np.copy()))
+                    _top_candidates.sort(key=lambda x: x[0])
+                elif c < _top_candidates[-1][0]:
+                    _top_candidates[-1] = (c, pos_np.copy())
+                    _top_candidates.sort(key=lambda x: x[0])
             else:
+                if _has_overlap(pos_np):
+                    return
                 full = benchmark.macro_positions.clone()
                 full[:n_hard] = torch.tensor(pos_np, dtype=torch.float32)
                 r = compute_proxy_cost(full, benchmark, plc_eval)
@@ -163,6 +178,19 @@ class OptimalPlacer:
                     if h in seen: continue
                     seen.add(h)
                     _try(refined)
+
+        # Fast tournament tail: validate top-K via official PlacementCost,
+        # take the lowest-cost overlap-free one.
+        if _fast_t:
+            print(f"  [legalize] fast collected {len(_top_candidates)} candidates",
+                  flush=True)
+            for incr_c, pos_np in _top_candidates:
+                full = benchmark.macro_positions.clone()
+                full[:n_hard] = torch.tensor(pos_np, dtype=torch.float32)
+                r = compute_proxy_cost(full, benchmark, plc_eval)
+                if r["overlap_count"] == 0 and r["proxy_cost"] < best_cost:
+                    best_cost = r["proxy_cost"]
+                    best_pos = pos_np.copy()
 
         print(f"  [legalize] {time.time() - t0:.1f}s cost={best_cost:.6f}", flush=True)
         if best_pos is None:
