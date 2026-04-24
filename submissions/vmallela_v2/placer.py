@@ -269,9 +269,13 @@ class OptimalPlacer:
                           f"(hard-cong {hard_t:.0f}s + soft {soft_t:.0f}s)", flush=True)
                     escaped = False
                     try:
+                        # exp 14: parametrize escape destroy size + candidates.
+                        _esc_h_dest = int(os.environ.get("PLACER_ESC_HARD_DESTROY", 20))
+                        _esc_h_cand = int(os.environ.get("PLACER_ESC_HARD_CAND", 60))
                         p, c = lns_destroy_repair_phase(
                             best_pos, benchmark, incr_eval,
-                            max_time=hard_t, n_destroy=20, n_candidates=60,
+                            max_time=hard_t,
+                            n_destroy=_esc_h_dest, n_candidates=_esc_h_cand,
                             seed_selector="congestion")
                         if c < best_cost - 5e-5:
                             best_cost, best_pos = c, p
@@ -280,9 +284,12 @@ class OptimalPlacer:
                     except Exception as e:
                         print(f"  [escape.hard-cong] err: {e}", flush=True)
                     try:
+                        _esc_s_dest = int(os.environ.get("PLACER_ESC_SOFT_DESTROY", 30))
+                        _esc_s_cand = int(os.environ.get("PLACER_ESC_SOFT_CAND", 50))
                         _, c = soft_lns_phase(
                             best_pos, benchmark, incr_eval,
-                            max_time=soft_t, n_destroy=30, n_candidates=50)
+                            max_time=soft_t,
+                            n_destroy=_esc_s_dest, n_candidates=_esc_s_cand)
                         if c < best_cost - 5e-5:
                             best_cost = c
                             escaped = True
