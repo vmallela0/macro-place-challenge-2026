@@ -1,360 +1,365 @@
-# Submission: Soft-macro CD + adaptive cycles + per-net HPWL
+# vmallela_v2 — a coordinate-descent macro placer with incremental proxy-cost evaluation
 
-**Author:** vmallela
-**Reported proxy cost:** 1.1172 (average across 17 IBM ICCAD04 benchmarks)
-**All benchmarks:** VALID, zero overlaps, every run under the 1-hour cap
-**Previous submission:** `submissions/vmallela/` (1.4156 avg)
+Author: vmallela
+Depends on: `submissions/vmallela/` (reuses its `IncrementalEvaluator`, push-apart, and legalizer)
 
-## TL;DR
+## Overview
 
-v1's incremental coordinate-descent pipeline, rebuilt around a realization
-that the bottleneck wasn't the hard-macro placement — it was that we were
-throwing away the soft-macro (std-cell cluster) optimization work on every
-cost evaluation.
-
-Three unlocks stack multiplicatively:
-
-1. **Return soft positions** from `_set_placement`. v1 was committing
-   only the hard-macro coordinates from its internal state and letting
-   soft positions fall back to whatever the benchmark shipped with,
-   silently discarding every soft move the placer had just computed.
-   Soft macros dominate HPWL and congestion (stdcell clusters carry
-   most of the net weight). Fixing this alone is worth ~14% off the
-   average proxy cost.
-2. **Adaptive cycle-budget scheduler.** Each refinement cycle's wall
-   time shrinks ×0.7 on plateau (gain < 5×10⁻⁵) and grows ×1.1 on
-   rapid improvement (gain > 0.01). Stops early after 4 consecutive
-   plateau cycles. This stops burning budget on cycles that won't
-   improve cost, and gives more time to cycles that are making progress.
-3. **Per-net HPWL optimization** interleaved with CD. On each net,
-   visit movable pins in weight-descending order and step each pin
-   toward the weighted median of the other pins on the same net. This
-   catches cases where CD's axis-aligned probe hops can't escape but a
-   pure HPWL-shrink step can.
-
-Plus a stateful 2-layer MLP surrogate that learns which soft-macro
-probe directions pay off across cycles and keeps its weights between
-cycles (`_soft_surrogate_v2.py`).
-
-Combined verified single-run average on 17 IBM benches: **1.1172**.
-Cezar (the current leaderboard #1) is 1.2224 — we're −8.6% on average.
-
-## Pipeline
+This submission is a search-based macro placer that optimizes the exact
+ICCAD-style proxy cost
 
 ```
-Phase 1: Push-apart preprocessing
-  └─ 3 damping configurations (conservative / moderate / aggressive)
-
-Phase 2: Legalization tournament
-  ├─ 30 orderings × 4 step-sizes × 5 starting positions
-  ├─ Tested against real proxy cost (not HPWL)
-  └─ Best legalized seed by real proxy cost wins
-  (Budget: max(60, min(600, TOTAL_BUDGET // 5)))
-
-Phase 3: Hard-macro coordinate descent + LNS + swap polish
-  ├─ 8-direction probe per macro (inherited from v1)
-  └─ LNS destroy-repair cycles for escape from local minima
-
-Phase 4: Soft-macro refinement cycles (adaptive duration)
-  Each cycle interleaves, in wall-clock proportion:
-    ▸  5%  FD soft attraction (net-centroid targets)
-    ▸ 35%  Stateful MLP-surrogate soft CD (ranks probe candidates)
-    ▸ 15%  Regular soft CD (size-scaled probe deltas)
-    ▸ 30%  Soft LNS (destroy connected subset, reinsert greedily)
-    ▸ 15%  Hard CD polish  ← interleaves per-net HPWL step
-
-  Duration per cycle:
-    ▸ shrink ×0.7 if gain < 5e-5
-    ▸ grow   ×1.1 if gain > 0.01
-    ▸ stop after 4 consecutive plateau cycles
+proxy = 1.0 · HPWL_norm + 0.5 · density_norm + 0.5 · congestion_norm
 ```
 
-## Why this beats v1 (and Cezar)
+directly, without a smooth surrogate. The central enabling component is
+an incremental cost evaluator (inherited from v1) that supports per-move
+updates in O(affected pins + affected grid cells) rather than
+recomputing the full cost from scratch. With that primitive, coordinate
+descent on a single-macro move costs a few milliseconds instead of
+~1 s, which makes local search on the non-smooth objective tractable
+over a 1-hour wall-clock budget.
 
-v1's pipeline was already strong on hard-macro placement: the incremental
-evaluator makes coordinate descent on the *exact* proxy cost tractable
-(~300× faster than `PlacementCost`), and v1's parallel-restart scheme
-explores multiple basins.
+v2 differs from v1 along three axes. First, the inner-loop placement
+tensor is expanded to cover both hard (physical macros, non-zero area,
+overlap-constrained) and soft (std-cell clusters, zero-area,
+overlap-unconstrained) modules; v1 committed only hard positions in its
+final write-back. Second, the refinement loop replaces fixed per-phase
+wall-clock budgets with an adaptive schedule that shrinks cycle
+duration on plateau and grows it on improvement. Third, between
+coordinate-descent cycles the placer runs a per-net weighted-median
+pin-stepping pass that targets the HPWL component of the objective
+directly — a classical result (Kahng and Tsay-Kuh, among others) that
+is awkward to integrate with gradient-based analytical placers but
+natural inside an exact-objective search loop.
 
-Two design choices constrained v1:
+## Problem setting
 
-- **Hard-macro-only CD.** Soft macros were moved only indirectly, via
-  `plc.optimize_stdcells`, and the result was discarded by
-  `_set_placement`. A placement that wins on hard-macro positions but
-  pessimizes soft-macro HPWL can score worse than one with slightly
-  worse hard positions but well-placed soft clusters.
-- **Fixed cycle budgets.** A cycle that plateaus in 30 seconds eats the
-  same budget as one that's still improving at cycle end. v1 burned
-  substantial budget on already-converged cycles.
+The benchmarks are the 17-instance IBM ICCAD 2004 suite plus four
+commercial NG45 designs. Each benchmark supplies a grid-based canvas,
+a netlist with hard macros and soft macro clusters (std cells
+aggregated by a preprocessing step), and an initial floorplan in a
+`.plc` file. A valid placement is one with zero overlaps above a
+0.0040 threshold.
 
-v2 lifts both: soft-macro CD is a first-class phase, and cycle duration
-is reactive to observed gain. The per-net HPWL step handles the subset
-of moves that CD's integer-lattice probe can't reach but a continuous
-weighted-median can.
+The objective is a weighted sum of three grid-based metrics:
+
+- **HPWL_norm.** Sum of normalized half-perimeter wirelength across
+  all nets, weighted by fanout. Linear in pin position, separable
+  across x and y axes.
+- **density_norm.** Sum of squared excess density over a macro-size
+  grid, plus a scaled variance term. Not smooth across grid-cell
+  boundaries.
+- **congestion_norm.** Sum of the top-10% most congested edges in a
+  smoothed routing-resource map, after accounting for macro
+  blockages. Integer-grid function; discrete jumps when a macro
+  crosses a cell boundary.
+
+The proxy is not differentiable, so analytical placers (DREAMPlace,
+RePlAce, variants) optimize a smooth approximation — HPWL plus a
+bell-shaped density term — and accept whatever congestion the routing
+step finds afterwards. Search-based placers (ours, simulated
+annealing, several reinforcement-learning variants) can optimize the
+exact sum but pay an evaluation cost per trial move.
+
+## Algorithm
+
+The pipeline has five phases. Phase budgets are derived from the
+total wall-clock budget (default 3300 s; hard-capped at 3300 s in the
+submission to leave 300 s for the competition harness's
+post-placement validator and cost computation).
+
+### Phase 1 — Push-apart preprocessing
+
+A low-cost overlap resolver seeded by the benchmark's initial
+placement. Three damping settings are run in parallel (conservative
+0.4, moderate 0.6, aggressive 0.8 over 300/500/800 iterations). The
+best result seeds Phase 2.
+
+### Phase 2 — Legalization tournament
+
+Given four candidate seeds (the three push-apart outputs plus the raw
+initial placement), the placer runs 30 greedy orderings × 4 step-size
+schedules against each seed, accepting moves that reduce the exact
+proxy cost. This is an expensive step by design — a few percent of
+the final cost is determined here by which basin the tournament picks.
+Wall-clock budget: `max(60, min(600, T/5))`.
+
+### Phase 3 — Hard-macro coordinate descent + LNS
+
+A standard coordinate descent with an 8-direction probe per macro.
+The search lattice is size-scaled: macros sized larger than a grid
+cell probe in larger steps. Each probe is evaluated via the
+incremental evaluator and accepted if the total proxy cost improves.
+When CD plateaus, a large-neighborhood-search operator destroys
+5–15 connected macros (via net-BFS) and repairs greedily; this
+escapes local minima that single-macro moves cannot.
+
+### Phase 4 — Soft-macro refinement (adaptive cycles)
+
+This is the bulk of the budget (~60%). Each cycle interleaves five
+operators in wall-clock proportion:
+
+| Fraction | Operator                          | Purpose                                  |
+|---------:|-----------------------------------|------------------------------------------|
+|      5 % | Force-directed soft attraction    | Pull soft clusters toward net centroids  |
+|     35 % | MLP-surrogate-ranked soft CD      | Prioritize probes predicted to help      |
+|     15 % | Regular soft CD                   | Standard local search                    |
+|     30 % | Soft large-neighborhood search    | Destroy/repair clusters                  |
+|     15 % | Hard-CD polish + per-net HPWL step| Maintain hard positions, shrink HPWL     |
+
+After each cycle, the placer compares the observed cost gain to two
+thresholds and adjusts the next cycle's duration:
+
+```
+gain < 5e-5   → next_duration *= 0.7     # plateau: shorten
+gain > 1e-2   → next_duration *= 1.1     # improving: lengthen
+```
+
+The phase terminates after four consecutive plateau cycles. In
+practice, easy benchmarks stop at 5–15 cycles; hard benchmarks
+(ibm17, ibm18) use 30 or more.
+
+### Phase 5 — Inside the hard-CD polish: weighted-median pin stepping
+
+In every cycle's hard-polish slot, a per-net HPWL pass runs before
+the CD probes. Nets are visited in descending order of pin-count ×
+weight. For each movable pin `p` on a net with other pins
+`{q_1, …, q_k}` of weights `{w_1, …, w_k}`, the target position for
+each axis is the `w`-weighted median of the `q_i` along that axis —
+the classical 1-D Fermat-Weber solution for HPWL on that net. The
+pin is stepped a fraction (default 0.5) toward the target, and the
+move is accepted only if the full proxy cost improves (not just
+HPWL). This is complementary to CD: CD searches an integer-lattice
+neighborhood along 8 axis directions, whereas the weighted-median
+target is continuous and generally off-axis.
+
+## Key subsystems
+
+### IncrementalEvaluator (inherited from v1)
+
+A NumPy-backed evaluator that mirrors the official `PlacementCost`
+semantics and maintains:
+
+- per-net HPWL in a float64 array, updated on move by re-evaluating
+  only the affected nets,
+- a per-cell density grid, updated by subtracting the macro's old
+  footprint and adding its new footprint,
+- routing resource arrays plus their smoothed versions, updated by
+  unrouting the affected nets at the old position and re-routing at
+  the new position, then re-smoothing only the affected region.
+
+Float32 macro positions and float64 aggregations match PlacementCost
+exactly at grid-cell boundaries — this was the difficult part of v1,
+and v2 does not modify it.
+
+**Equivalence to batch PlacementCost is verified** in
+`tests/test_evaluator_equivalence.py`: across ibm01 / ibm06 / ibm10,
+100 random hard-macro moves per benchmark, the maximum observed
+absolute difference between the incremental and batch evaluators is
+2.75 × 10⁻⁷. The diff does not grow with problem size (ibm10 has
+786 hard macros; its max diff is 2.64 × 10⁻⁷) nor with move count
+(max is set in the first few moves and remains flat). This is
+consistent with IEEE-754 summation-order rounding, not a logic bug.
+
+### Soft position write-back
+
+v1 computed but did not return soft-macro positions from its main
+loop. v2 returns a `(num_hard + num_soft, 2)` placement tensor
+covering both module types. Because the proxy cost weights HPWL,
+density, and congestion equally in structure but the pin count is
+dominated by the soft std-cell clusters, propagating the soft
+optimization accounts for a meaningful fraction of the measured
+improvement over v1.
+
+### Adaptive cycle scheduler
+
+Motivated by the observation in v1 that roughly half of each cycle's
+wall-clock was spent in the plateau tail. The scheduler above is a
+simple multiplicative adjustment with a hard floor (60 s) and a
+four-strike termination. It is not claimed to be optimal; it is a
+practical heuristic that avoids the two obvious failure modes (over-
+and under-spending).
+
+### MLP surrogate (`_soft_surrogate_v2.py`)
+
+A 2-layer MLP that takes 11 features per probe candidate — current
+proxy components, macro position and size, probe displacement, and
+benchmark-level normalizations — and predicts whether the probe will
+reduce cost. Training data is collected during regular CD cycles
+(probe features paired with observed cost delta). The surrogate
+ranks candidates for the next soft-CD slice; candidates predicted
+unhelpful are skipped. Model weights persist across cycles so that
+accumulated training carries forward. Backed by MPS on Apple Silicon
+where available, CPU otherwise. The measured improvement in
+controlled A/B tests is ~0.003 on the average cost (see
+`EXPERIMENTS.md`, entry v19).
+
+### Weighted-median pin stepping (`_per_net.py`)
+
+Classical result: for a single net with pin weights `w_i`, the HPWL
+is minimized in each axis by placing a free pin at the `w`-weighted
+median of the other pins' positions along that axis (see e.g. Kahng
+et al., *VLSI Physical Design*, Chapter 4, or the earlier result by
+Tsay and Kuh for timing-driven placement). The pass here applies
+this per-net for movable pins, gated by the full proxy cost (HPWL
+reductions that cost density or congestion elsewhere are rejected).
 
 ## Per-benchmark results
 
-| Bench | Verified proxy | Wall time | Status        |
-|-------|----------------|-----------|---------------|
-| ibm01 | 0.8107         | 1926 s    | VALID, 0 overlaps |
-| ibm02 | 1.1002         | 1989 s    | VALID, 0 overlaps |
-| ibm03 | 0.9912         | 1667 s    | VALID, 0 overlaps |
-| ibm04 | 0.9889         | 2054 s    | VALID, 0 overlaps |
-| ibm06 | 1.1826         | 2367 s    | VALID, 0 overlaps |
-| ibm07 | 1.1277         | 2376 s    | VALID, 0 overlaps |
-| ibm08 | 1.1132         | 2789 s    | VALID, 0 overlaps |
-| ibm09 | 0.8238         | 2243 s    | VALID, 0 overlaps |
-| ibm10 | 1.0989         | 3149 s    | VALID, 0 overlaps |
-| ibm11 | 0.9133         | 2311 s    | VALID, 0 overlaps |
-| ibm12 | 1.3199         | 3260 s    | VALID, 0 overlaps |
-| ibm13 | 1.0010         | 2503 s    | VALID, 0 overlaps |
-| ibm14 | 1.2675         | 3305 s    | VALID, 0 overlaps |
-| ibm15 | 1.2291         | 3115 s    | VALID, 0 overlaps |
-| ibm16 | 1.2024         | 3305 s    | VALID, 0 overlaps |
-| ibm17 | 1.4535         | 3293 s    | VALID, 0 overlaps |
-| ibm18 | 1.3689         | 3296 s    | VALID, 0 overlaps |
-| **AVG** | **1.1172**   |           |                   |
+Measured with `./run.sh --all` on a 10-core Apple Silicon MacBook Pro
+under the locked environment in `run.sh` (OMP/MKL/BLAS all pinned to
+one thread, seed 42, `PLACER_TOTAL_BUDGET=3300`, single benchmark at
+a time). Each row is one deterministic-ish run of the placer —
+deterministic under seed but with ~0.002 run-to-run jitter from
+wall-clock-bound loops; see caveats.
+
+| Benchmark | Proxy cost | Wall time | Overlaps |
+|-----------|-----------:|----------:|---------:|
+| ibm01     | 0.8107     | 1926 s    | 0        |
+| ibm02     | 1.1002     | 1989 s    | 0        |
+| ibm03     | 0.9912     | 1667 s    | 0        |
+| ibm04     | 0.9889     | 2054 s    | 0        |
+| ibm06     | 1.1826     | 2367 s    | 0        |
+| ibm07     | 1.1277     | 2376 s    | 0        |
+| ibm08     | 1.1132     | 2789 s    | 0        |
+| ibm09     | 0.8238     | 2243 s    | 0        |
+| ibm10     | 1.0989     | 3149 s    | 0        |
+| ibm11     | 0.9133     | 2311 s    | 0        |
+| ibm12     | 1.3199     | 3260 s    | 0        |
+| ibm13     | 1.0010     | 2503 s    | 0        |
+| ibm14     | 1.2675     | 3305 s    | 0        |
+| ibm15     | 1.2291     | 3115 s    | 0        |
+| ibm16     | 1.2024     | 3305 s    | 0        |
+| ibm17     | 1.4535     | 3293 s    | 0        |
+| ibm18     | 1.3689     | 3296 s    | 0        |
+| **Mean**  | **1.1172** |           |          |
+
+All 17 placements satisfy the overlap constraint (zero overlaps above
+the 0.0040 threshold). ibm05 is not part of the 17-instance
+competition suite, consistent with the list in `COMPETITION.md`.
 
 Raw per-benchmark logs: `results_verified/ibm*.log`.
-Full summary with deltas: `results_verified/SUMMARY.md`.
+Tabular summary: `results_verified/SUMMARY.md`.
 
-ibm05 is intentionally excluded — it is not in the 17-benchmark IBM
-ICCAD04 set defined in `COMPETITION.md`.
-
-## Leaderboard comparison
-
-| Rank | Method          | Avg proxy  | vs vmallela_v2 |
-|------|-----------------|------------|----------------|
-| —    | **vmallela_v2** | **1.1172** | —              |
-| 1    | Cezar (ReFine)  | 1.2224     | **−8.6 %**     |
-| 2    | MTK DreamPlace++| 1.2818     | −12.9 %        |
-| 3    | RoRa            | 1.3241     | −15.6 %        |
-| 4    | vmallela v1     | 1.4156     | −21.1 %        |
-
-Delta is `(competitor − ours) / competitor`; positive means we cost less.
-
-## File map
+## File layout
 
 ```
 submissions/vmallela_v2/
-├── README.md                     ← You are here
-├── EXPERIMENTS.md                ← v1 → v118 exploration log
-├── placer.py                     ← The submission entry point
-│                                   (OptimalPlacer; TOTAL budget capped at 3300 s)
-├── run.sh                        ← Locked-env launcher (use this to reproduce)
-├── run_verified_sweep.sh         ← Serial 17-bench driver used to produce the headline
-├── _softmacro.py                 ← Soft-macro CD
-├── _fd_soft.py                   ← Force-directed soft attraction (net-centroid targets)
-├── _soft_lns.py                  ← Soft-macro LNS (destroy + repair)
-├── _per_net.py                   ← Per-net HPWL weighted-median pin stepping
-├── _soft_surrogate_v2.py         ← Stateful MLP-surrogate wrapper around soft CD
-├── _surrogate.py                 ← ProbeLogger + 2-layer MLP
-├── _moves.py                     ← LNS destroy-repair for hard macros
-├── results_verified/             ← Raw per-bench logs + SUMMARY.md (the evidence)
+├── README.md                        This file
+├── EXPERIMENTS.md                   Development log (120+ variants tried)
+├── placer.py                        OptimalPlacer entry point; budget hard-capped to 3300 s
+├── run.sh                           Locked-env launcher
+├── run_verified_sweep.sh            Serial 17-benchmark driver
+├── _softmacro.py                    Soft-macro coordinate descent
+├── _fd_soft.py                      Force-directed soft attraction
+├── _soft_lns.py                     Soft-macro large-neighborhood search
+├── _per_net.py                      Per-net weighted-median HPWL step
+├── _soft_surrogate_v2.py            MLP probe-ranking wrapper
+├── _surrogate.py                    ProbeLogger + 2-layer MLP definition
+├── _moves.py                        Hard-macro LNS destroy/repair
+├── results_verified/                Raw logs + summary for the reported run
 └── tests/
     ├── test_evaluator_equivalence.py
-    └── EQUIVALENCE.md            ← Proof IncrementalEvaluator == batch PlacementCost
+    └── EQUIVALENCE.md
 ```
 
-The submission is **`placer.py` + the `_*.py` modules it imports**.
-`placer.py` additionally loads `_load_plc`, `IncrementalEvaluator`,
-`_push_apart`, `_legalize`, `_refine_toward_initial`, `_coord_descent`,
-and `_cd_worker` from `submissions/vmallela/placer.py`. **Keep both
-submission directories present in the repo — v2 depends on v1.**
+`placer.py` imports `_load_plc`, `IncrementalEvaluator`,
+`_push_apart`, `_legalize`, `_refine_toward_initial`,
+`_coord_descent`, and `_cd_worker` from
+`submissions/vmallela/placer.py`; both directories must be present.
 
 ## Reproducing the result
 
 ```bash
-# All 17 IBM benchmarks (15 h wall clock on a 10-core Mac)
+# All 17 benchmarks, serially, at the reported settings
 ./submissions/vmallela_v2/run.sh --all
 
 # Single benchmark
 ./submissions/vmallela_v2/run.sh -b ibm01
 
-# Shorter budget
+# Override budget (still hard-capped at 3300 s internally)
 PLACER_TOTAL_BUDGET=1800 ./submissions/vmallela_v2/run.sh -b ibm07
 ```
 
-`run.sh` locks the reproducibility-relevant env:
-
-```bash
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export VECLIB_MAXIMUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
-export PYTHONHASHSEED=42
-export PLACER_TOTAL_BUDGET=${PLACER_TOTAL_BUDGET:-3300}
-export PLACER_PARALLEL_WORKERS=0
-```
-
-Expected per-benchmark results within **±0.002** of the table above.
-The placer hard-caps its own budget at 3300 s regardless of the env
-variable (see `OptimalPlacer._COMPETITION_CAP_SECONDS`), leaving
-300 s headroom below the 1-hour competition limit for the validator
-and cost evaluator that run after `place()` returns.
-
-## Key implementation details
-
-### Returning soft positions (the "free" 14%)
-
-v1's pipeline moves std-cell clusters via `plc.optimize_stdcells` as
-part of its cost evaluation, but only the hard-macro coordinates were
-preserved when v1 returned its final placement — `_set_placement`
-wrote back the hard array and let soft positions be whatever the
-benchmark had initially. v2 tracks both arrays end-to-end and returns
-them together. This required no algorithmic change, just plumbing.
-
-The asymmetry of the proxy cost makes soft placement dominant:
-`proxy = 1.0·wirelength + 0.5·density + 0.5·congestion`. Soft macros
-(stdcell clusters) are the bulk of the pin count, so they drive HPWL;
-they're also what routing has to push through, so they drive
-congestion. Hard macros mostly drive density (and a little HPWL).
-Moving a soft cluster by a few units can change the cost more than
-moving 20 hard macros.
-
-### Adaptive cycle scheduler
-
-Each soft-refinement cycle runs a fixed interleave (FD → surrogate CD →
-regular CD → LNS → hard polish), but the *duration* of each cycle is
-reactive. After a cycle completes, we compare the cost gain to two
-thresholds:
+`run.sh` exports the following and invokes the `evaluate` CLI:
 
 ```
-if gain < 5e-5:      cycle_duration *= 0.7
-elif gain > 0.01:    cycle_duration *= 1.1
+OMP_NUM_THREADS=1
+MKL_NUM_THREADS=1
+OPENBLAS_NUM_THREADS=1
+VECLIB_MAXIMUM_THREADS=1
+NUMEXPR_NUM_THREADS=1
+PYTHONHASHSEED=42
+PLACER_TOTAL_BUDGET=${PLACER_TOTAL_BUDGET:-3300}
+PLACER_PARALLEL_WORKERS=0
 ```
 
-Below a minimum (60 s) the cycle is frozen. After 4 consecutive cycles
-with gain below threshold, the whole phase exits. In practice this
-means easy benchmarks plateau-stop at 5-15 cycles and use only half
-their nominal budget; hard benchmarks (ibm17, ibm18) run 30+ cycles
-and use nearly all of it.
+Expected per-benchmark result within ±0.002 of the table above.
 
-### Per-net HPWL pin stepping (`_per_net.py`)
+## Caveats and limitations
 
-Coordinate descent probes positions on an integer lattice along 8
-directions. It's good at finding local minima *along axes* but can
-miss the continuous HPWL optimum when a net has pins spread at odd
-angles. The per-net HPWL pass complements CD:
+1. **Run-to-run jitter ~0.002.** The pipeline uses
+   `while time.time() - t0 < budget` loops in 13 call sites. The
+   number of inner iterations completed in a given cycle depends on
+   wall-clock speed and OS scheduling, so repeated runs from the
+   same seed drift on the last digit of the cost. Locking BLAS
+   thread counts (as `run.sh` does) tightens this but does not
+   eliminate it. A refactor to iteration-count budgets would yield
+   bit-reproducibility; it was out of scope for this submission.
 
-1. Rank nets by weight (descending).
-2. For each net, for each movable pin, compute the *weighted median*
-   of the other pins' positions on that net.
-3. Step the pin toward that median by a fractional amount.
-4. Accept only if the combined proxy cost improves (HPWL reduction can
-   cost density/congestion elsewhere).
-
-This runs inside the hard-CD polish step of each cycle, so its gains
-compound with CD's — it's not a terminal pass.
-
-### Stateful MLP surrogate (`_soft_surrogate_v2.py`)
-
-Soft-macro CD probes many candidate positions per macro; the cost is
-in evaluating each. The surrogate is a 2-layer MLP trained on
-`(features → did_this_probe_improve_cost)` pairs collected during
-regular CD cycles. It runs on MPS (Apple GPU) where available, CPU
-otherwise. Between cycles its weights persist — so the placer gets
-better at CD the longer it runs, instead of re-learning from scratch.
-
-Features (11-dim): current proxy cost, HPWL/density/congestion
-components, the macro's current position and size, the probe
-displacement, and a few bench-level normalizations. Gave a consistent
-~0.003 improvement in the A/B experiments (see `EXPERIMENTS.md`
-entry v19).
-
-### IncrementalEvaluator equivalence
-
-The entire pipeline rests on the incremental evaluator from v1 being
-numerically faithful to the batch `PlacementCost`. `tests/EQUIVALENCE.md`
-reports the result of `tests/test_evaluator_equivalence.py`: across
-ibm01 / ibm06 / ibm10, 100 random hard-macro moves each, the maximum
-observed absolute difference between `incr.get_proxy_cost()` and
-`compute_proxy_cost(current_placement, …)` is **2.75 × 10⁻⁷** —
-about 363× inside the 10⁻⁴ tolerance we care about, consistent with
-IEEE-754 summation-order noise and not growing with move count.
-
-## Honest caveats
-
-1. **Time-budget non-determinism (~0.002).** Every phase of the
-   pipeline runs "as many moves as fit in T seconds" via
-   `while time.time() - t0 < budget`. The number of moves completed in
-   a given cycle depends on wall-clock jitter (CPU clock boost, OS
-   scheduling, BLAS thread count), so repeated runs from the same seed
-   drift by ~0.002 on the headline cost. We locked `OMP_NUM_THREADS=1`
-   and friends in `run.sh` to pin BLAS determinism, but the
-   time-budget loops themselves are not iteration-count-bounded and
-   refactoring them to be iteration-count-bounded was out of scope
-   for this submission. The verified 1.1172 average has jitter on the
-   order of the last digit. Judges on different hardware at the same
-   1-hour budget should land within ±0.005.
-
-2. **Hardware caveat.** We measured on a 10-core Apple Silicon
-   MacBook Pro. Competition judges run on AMD EPYC 9655P (16 cores,
-   dedicated per-process) + RTX 6000 Ada 48 GB. The placer is pure
-   CPU — no CUDA, no kernels on the GPU beyond the MLP's MPS calls —
-   so per-core throughput on the judges' EPYC is typically ≥1.3×
-   better than M-series on NumPy hot loops. At the same 1-hour
-   budget, judges' runs should match or slightly improve ours.
+2. **Hardware.** Reported numbers are from a 10-core Apple Silicon
+   MacBook Pro. The competition harness runs on a 16-core AMD EPYC
+   9655P with per-process CPU affinity; under the same 1-hour
+   budget, that machine should reach equal or slightly better
+   numbers because the time-budgeted loops will complete more
+   iterations per unit wall-clock.
 
 3. **Budget cap.** `OptimalPlacer._COMPETITION_CAP_SECONDS = 3300`
-   hard-caps the placer's internal budget at 3300 s regardless of the
-   env variable. This leaves 300 s headroom below the competition's
-   3600 s hard timeout for the validator + cost evaluator that run
-   after `place()` returns. Verified: the longest run (ibm14, ibm16)
-   was 3305 s total, still under 3600 s.
+   enforces a hard ceiling of 3300 s on the placer's internal
+   budget, regardless of `PLACER_TOTAL_BUDGET`. This leaves 300 s
+   under the competition's 3600 s per-benchmark timeout for the
+   validator and cost computation that the harness runs after
+   `place()` returns.
 
-4. **Exploration results ≠ submission results.** During development
-   we ran ~120 variants with different seeds, budgets, and
-   interleavings. The best single number per benchmark across that
-   exploration (shown below) was 1.1533 — **worse** than this
-   submission's verified single-run 1.1172. That's because the
-   exploration runs happened under heavy CPU contention (multiple
-   benches in parallel on one machine); the verified sweep ran
-   serially with locked threading. Do not compare the exploration
-   numbers to competitor scores — the 1.1172 in this README is the
-   only number our pipeline actually produces at seed=42 under the
-   locked env.
+4. **NG45 + OpenROAD flow.** The harness script
+   `scripts/evaluate_with_orfs.py` exists but requires OpenROAD and
+   OpenROAD-flow-scripts (or Docker). Neither was available on the
+   measurement machine, so post-placement WNS/TNS/Area were not
+   produced locally. Those metrics are computed by the competition
+   harness for top-7 submissions.
 
-5. **No per-benchmark hardcoding.** `benchmark.name` is used only to
-   load the canonical `initial.plc` (via `_load_plc`) — there are no
-   `if benchmark.name == "ibmXX"` branches, no seed or budget tables
-   keyed by benchmark name. The algorithm is benchmark-agnostic and
-   should generalize to the hidden OpenROAD NG45 designs used in the
-   Grand Prize round, though we could not verify on NG45 locally
-   (no OpenROAD binary installed on this machine).
+5. **No per-benchmark specialization.** `benchmark.name` is passed
+   only to `_load_plc(…)` to load the canonical input file. There
+   are no conditional branches on benchmark name, no seed or budget
+   tables keyed by benchmark. The same code path runs on every
+   benchmark.
 
-6. **NG45 / OpenROAD unverified locally.** The harness in
-   `scripts/evaluate_with_orfs.py` exists but requires OpenROAD +
-   OpenROAD-flow-scripts or Docker. Neither is installed on this
-   machine. We did not produce WNS/TNS/Area numbers ourselves;
-   judges will measure those on their EPYC box for top-7 submissions.
+## Development log and exploration
 
-## Acknowledgments
+`EXPERIMENTS.md` contains the full development log — approximately
+120 variants, including many that underperformed and were discarded
+(simulated annealing with uphill moves, Nesterov momentum on the
+non-smooth objective, tabu search on softs, spectral initialization,
+Langevin smoothing, and others). The log is preserved for
+transparency about the search path, not for claim inflation: the
+best single-number-per-benchmark across all exploration runs was
+1.1533, slightly worse than the reported single-run 1.1172 from this
+submission's pipeline under the locked environment.
 
-- The IncrementalEvaluator from v1 (`submissions/vmallela/placer.py`)
-  is the foundation. Nothing in v2 is possible without the
-  float32/float64 type-promotion handling that matches PlacementCost
-  at grid-cell boundaries, which was the hard-won work of v1.
-- The soft-macro unlock was found by looking for what v1 left on the
-  table. The clue was that `plc.get_cost()` and
-  `compute_proxy_cost(…)` sometimes disagreed mid-run — tracing the
-  disagreement back to `_set_placement` discarding soft positions
-  made the fix obvious.
-- The adaptive cycle scheduler was the result of watching v1's cycle
-  trace and noticing that ~40% of cycles finished in half the
-  budget, then sat in a plateau loop wasting the rest.
-- The per-net HPWL idea came from reading the literature on analytical
-  placers (weighted-median minimizes HPWL on a net) and realizing that
-  the HPWL-only gradient step is a strict subset of the proxy-cost
-  gradient and can be applied locally per-net without global
-  re-placement.
-- The evaluator equivalence test was written to be the artifact we
-  could point at if anyone questioned whether the 300× incremental
-  speedup was numerically faithful. It passed with 363× headroom
-  inside the tolerance.
+## References and prior work
 
-See `EXPERIMENTS.md` for the full development log — 120+ variants
-including the ones that didn't work and why (Langevin smoothing init,
-quantum-amplitude init, tabu search on softs, Nesterov momentum, and
-~10 others that underperformed the baseline).
+- Coordinate descent for placement: a long literature starting from
+  TimberWolf (Sechen and Sangiovanni-Vincentelli, 1985).
+- HPWL weighted-median optimum per net: Kahng et al., *VLSI Physical
+  Design*; Tsay-Kuh ZERO formulation.
+- Smooth analytical placement: RePlAce (Cheng et al., TCAD 2019),
+  DREAMPlace (Lin et al., DAC 2019). These optimize smoothed HPWL +
+  density and are orthogonal to the approach here; the choice between
+  the two families trades global convergence for direct optimization
+  of the exact objective.
+- Reinforcement-learning macro placement: AlphaChip (Mirhoseini et
+  al., *Nature* 2021) and the surrounding literature. The present
+  work is a search-based baseline that does not use RL and does not
+  rely on a learned value function beyond the small MLP surrogate for
+  probe ranking.

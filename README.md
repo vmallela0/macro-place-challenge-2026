@@ -2,47 +2,49 @@
 
 Submissions to the Partcl/HRT Macro Placement Challenge.
 
-## Current best: `vmallela_v2`
+## Current: `vmallela_v2`
 
-**Verified single-run average: 1.1172 across 17 IBM ICCAD04 benchmarks.**
-All 17 VALID, zero overlaps, every run under the 1-hour cap. That is
-**−8.6 % under Cezar (ReFine, leaderboard #1 at 1.2224)**.
+A coordinate-descent macro placer with an incremental proxy-cost evaluator.
+Verified single-run average of **1.1172** across the 17 IBM ICCAD 2004
+benchmarks, all placements valid with zero overlaps, every run under the
+1-hour per-benchmark cap.
 
 - Code: [`submissions/vmallela_v2/placer.py`](submissions/vmallela_v2/placer.py)
-- Submission notes: [`submissions/vmallela_v2/README.md`](submissions/vmallela_v2/README.md)
-- Verified per-bench table: [`submissions/vmallela_v2/results_verified/SUMMARY.md`](submissions/vmallela_v2/results_verified/SUMMARY.md)
-- Evaluator equivalence proof: [`submissions/vmallela_v2/tests/EQUIVALENCE.md`](submissions/vmallela_v2/tests/EQUIVALENCE.md)
-- Experiment log: [`submissions/vmallela_v2/EXPERIMENTS.md`](submissions/vmallela_v2/EXPERIMENTS.md)
+- Full write-up: [`submissions/vmallela_v2/README.md`](submissions/vmallela_v2/README.md)
+- Per-benchmark table: [`submissions/vmallela_v2/results_verified/SUMMARY.md`](submissions/vmallela_v2/results_verified/SUMMARY.md)
+- Evaluator equivalence check: [`submissions/vmallela_v2/tests/EQUIVALENCE.md`](submissions/vmallela_v2/tests/EQUIVALENCE.md)
+- Development log: [`submissions/vmallela_v2/EXPERIMENTS.md`](submissions/vmallela_v2/EXPERIMENTS.md)
 
-Measurement: `./submissions/vmallela_v2/run.sh --all` at seed=42,
-`PLACER_TOTAL_BUDGET=3300`, `OMP_NUM_THREADS=1`, on a 10-core Apple Silicon
-MacBook Pro. Run-to-run jitter ~0.002 (time-budgeted loops are
-semantically — not bit- — reproducible).
+### Approach
 
-### Method
+The placer optimizes the exact ICCAD-style proxy cost
+(`1.0 · HPWL + 0.5 · density + 0.5 · congestion`) directly via local
+search, using an incremental evaluator to make per-move updates cheap
+enough for coordinate descent to be practical inside a 1-hour budget.
+v2 extends v1 by (i) propagating soft-macro (std-cell-cluster)
+positions through the return path, (ii) replacing fixed per-phase
+budgets with an adaptive cycle scheduler, and (iii) interleaving
+classical per-net weighted-median HPWL stepping with the coordinate
+descent. Full description and pipeline diagram in the submission
+README.
 
-v1's incremental-CD pipeline rebuilt around three unlocks:
-
-1. **Return soft-macro positions** from `_set_placement` (v1 was silently discarding optimized soft-macro positions — ~14 % of the total gain).
-2. **Adaptive cycle-budget scheduler** — shrink on plateau, grow on gain, stop after 4 consecutive plateau cycles.
-3. **Per-net HPWL optimization** interleaved with CD — step movable pins toward the weighted median of other pins on the same net.
-
-Plus a stateful MLP surrogate ranking CD probe candidates. No per-benchmark hardcoding — identical code path on every benchmark.
-
-### Reproduce
+### Reproduction
 
 ```bash
-./submissions/vmallela_v2/run.sh --all              # all 17 IBM benchmarks
-./submissions/vmallela_v2/run.sh -b ibm01           # single benchmark
+./submissions/vmallela_v2/run.sh --all    # all 17 IBM benchmarks (~15 h on 10 cores)
+./submissions/vmallela_v2/run.sh -b ibm01 # single benchmark
 ```
 
-Expected per-bench results within ±0.002 of the table in `results_verified/SUMMARY.md`.
-`vmallela_v2/placer.py` depends on `vmallela/placer.py` (for `IncrementalEvaluator`, push-apart, and legalizer) — keep both directories present in the repo.
+`vmallela_v2/placer.py` imports a handful of functions from
+`submissions/vmallela/placer.py` (the `IncrementalEvaluator`,
+push-apart, and legalizer). Both directories must be present.
 
 ## Previous: `vmallela` (v1)
 
-Score: **1.4159** — multi-restart CD optimizing the exact proxy cost.
-Code: [`submissions/vmallela/placer.py`](submissions/vmallela/placer.py)
-Submission notes: [`submissions/vmallela/README.md`](submissions/vmallela/README.md)
+Multi-restart coordinate descent with parallel workers, single-file
+implementation. Reported proxy-cost average: 1.4156.
 
-Original competition README: [`COMPETITION.md`](COMPETITION.md)
+- Code: [`submissions/vmallela/placer.py`](submissions/vmallela/placer.py)
+- Write-up: [`submissions/vmallela/README.md`](submissions/vmallela/README.md)
+
+Competition specification: [`COMPETITION.md`](COMPETITION.md).
