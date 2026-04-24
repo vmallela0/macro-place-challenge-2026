@@ -153,14 +153,50 @@ def cluster_translate_phase(pos_np, benchmark, incr_eval, max_time,
     return best_pos, best_cost
 
 
+def _pick_congestion_seed(incr_eval, movable, hotspot_frac=0.10):
+    """Return a movable hard-macro index whose blockage touches the top-
+    hotspot_frac congested cells, or None if no such macro exists.
+
+    Rationale: congestion is typically >50% of total proxy cost; moves
+    that don't touch the hotspot can only help HPWL/density, which are
+    the smaller components. Biasing the destroy-seed into the hotspot
+    focuses LNS on where the cost actually lives.
+    """
+    n_cells = incr_eval.n_cells
+    # Per-cell worst of (smoothed V + V-blockage, smoothed H + H-blockage).
+    # Matches the ABU formula used by _recompute_congestion_cost.
+    V_total = incr_eval.V_routing_smooth + incr_eval.V_macro_raw / incr_eval.grid_v_routes
+    H_total = incr_eval.H_routing_smooth + incr_eval.H_macro_raw / incr_eval.grid_h_routes
+    per_cell = np.maximum(V_total, H_total)
+    top_n = max(1, int(n_cells * hotspot_frac))
+    hot_cells = set(int(c) for c in np.argpartition(per_cell, -top_n)[-top_n:])
+
+    candidates = []
+    for m in range(len(movable)):
+        if not movable[m]:
+            continue
+        for flat, _, _ in incr_eval.macro_blockage_cache.get(m, []):
+            if flat in hot_cells:
+                candidates.append(m)
+                break
+    if not candidates:
+        return None
+    return candidates
+
+
 def lns_destroy_repair_phase(pos_np, benchmark, incr_eval, max_time,
-                             n_destroy=4, n_candidates=40, verbose=False):
+                             n_destroy=4, n_candidates=40,
+                             seed_selector="random", verbose=False):
     """Ruin-and-recreate: remove a connected subset, re-insert greedily.
 
     Novel move type: the subset's positions are re-chosen jointly in
     random order, each at the best-of-K candidate that's non-overlapping
     and minimizes current proxy cost. Creates coupled multi-macro moves
     beyond what CD or swaps can do.
+
+    seed_selector:
+      'random'     — uniform from movable (original behavior)
+      'congestion' — biased toward macros in the top-10%-congested cells
     """
     n_hard = benchmark.num_hard_macros
     sizes = benchmark.macro_sizes[:n_hard].numpy().astype(np.float64)
@@ -187,7 +223,14 @@ def lns_destroy_repair_phase(pos_np, benchmark, incr_eval, max_time,
     while time.time() - t0 < max_time:
         n_iter += 1
         # Choose a connected seed + neighbors as the "destroy set"
-        seed = int(rng.choice(movable_idx))
+        if seed_selector == "congestion":
+            hot_candidates = _pick_congestion_seed(incr_eval, movable)
+            if hot_candidates:
+                seed = int(rng.choice(hot_candidates))
+            else:
+                seed = int(rng.choice(movable_idx))
+        else:
+            seed = int(rng.choice(movable_idx))
         subset = [seed]
         visited = {seed}
         queue = [seed]

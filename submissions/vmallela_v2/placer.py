@@ -251,8 +251,50 @@ class OptimalPlacer:
                 plateau += 1
                 cycle_t = max(8, cycle_t * 0.7)
                 if plateau >= 4:
-                    print(f"  [plateau] stop at cycle {cycle}", flush=True)
-                    break
+                    # Escape-basin: spend remaining budget on aggressive LNS.
+                    # Rotation: large hard-LNS with congestion-biased seeds,
+                    # then large soft-LNS. If any escapes, reset plateau and
+                    # resume cycles. If none, terminate. Congestion-biased
+                    # seeds focus LNS on the cost component that dominates
+                    # (routing congestion is typically >50% of total proxy
+                    # cost).
+                    remaining = soft_deadline - (time.time() - t0)
+                    if remaining < 30:
+                        print(f"  [plateau] stop at cycle {cycle}", flush=True)
+                        break
+                    escape_budget = min(240, remaining * 0.5)
+                    hard_t = escape_budget * 0.5
+                    soft_t = escape_budget * 0.5
+                    print(f"  [escape] plateau at {best_cost:.6f}, budget {escape_budget:.0f}s "
+                          f"(hard-cong {hard_t:.0f}s + soft {soft_t:.0f}s)", flush=True)
+                    escaped = False
+                    try:
+                        p, c = lns_destroy_repair_phase(
+                            best_pos, benchmark, incr_eval,
+                            max_time=hard_t, n_destroy=20, n_candidates=60,
+                            seed_selector="congestion")
+                        if c < best_cost - 5e-5:
+                            best_cost, best_pos = c, p
+                            escaped = True
+                            print(f"  [escape.hard-cong] OK at {best_cost:.6f}", flush=True)
+                    except Exception as e:
+                        print(f"  [escape.hard-cong] err: {e}", flush=True)
+                    try:
+                        _, c = soft_lns_phase(
+                            best_pos, benchmark, incr_eval,
+                            max_time=soft_t, n_destroy=30, n_candidates=50)
+                        if c < best_cost - 5e-5:
+                            best_cost = c
+                            escaped = True
+                            print(f"  [escape.soft] OK at {best_cost:.6f}", flush=True)
+                    except Exception as e:
+                        print(f"  [escape.soft] err: {e}", flush=True)
+                    if escaped:
+                        plateau = 0
+                        cycle_t = max(30, cycle_t * 1.5)
+                    else:
+                        print(f"  [escape] no improvement, stop", flush=True)
+                        break
             else:
                 plateau = 0
                 if gain > 0.01:
