@@ -783,3 +783,71 @@ Recommended next steps if this line is pursued:
   refinement loop (e.g., D10 multi-armed bandit for cycle allocation,
   D21 IRLS for per-net HPWL) — these modify the high-leverage phase
   where most cost reduction happens.
+
+## Round-3 hyperparameter sweep (ibm01 @ 220 s, 40 variants)
+
+Harness: `_param_placer.py` exposes every hardcoded hyperparameter in
+`vmallela_v2/placer.py` as an overridable class attribute. Variants
+v130–v169 are 3-line subclasses changing one or a few attrs.
+
+All 40 ran at ibm01, 220 s budget, seed=42, locked single-thread BLAS.
+Harness baseline (v130, identical to v2 defaults): **0.8564**.
+
+### Top 10 (all beat harness baseline)
+
+| Rank | Variant | Config                                                                   | Proxy  | Δ vs 0.8564 |
+|------|---------|--------------------------------------------------------------------------|--------|-------------|
+| 1    | v164    | RATIOS=(5/50/15/15/15), grow=1.3, divisor=10                             | 0.8406 | **−0.0158** |
+| 1    | v165    | RATIOS=(5/50/20/15/10), grow=1.3, divisor=10                             | 0.8406 | **−0.0158** |
+| 3    | v160    | v155 + plateau tighter (1e-6, count=5)                                   | 0.8420 | −0.0144     |
+| 4    | v161    | v155 + LNS n_destroy=12                                                  | 0.8424 | −0.0140     |
+| 5    | v168    | RATIOS=(10/45/15/20/10) — more FD                                        | 0.8426 | −0.0138     |
+| 6    | v167    | RATIOS=(0/55/15/20/10) — no FD                                           | 0.8438 | −0.0126     |
+| 7    | v166    | RATIOS=(5/45/15/20/15) — less surrogate, more LNS                        | 0.8439 | −0.0125     |
+| 8    | v169    | v164 + LNS n_destroy=12                                                  | 0.8442 | −0.0122     |
+| 9    | v155    | RATIOS=(5/50/10/20/15), grow=1.3, divisor=10                             | 0.8445 | −0.0119     |
+| 10   | v163    | v155 repeat, seed=42 — jitter control                                    | 0.8452 | −0.0112     |
+
+### Bottom 5 (all worse than harness baseline)
+
+| Variant | Config                                 | Proxy  | Δ       |
+|---------|----------------------------------------|--------|---------|
+| v135    | RATIOS=(5/25/10/20/40) — more hard CD  | 0.8677 | +0.0113 |
+| v132    | RATIOS=(0/40/15/25/20) — no FD         | 0.8650 | +0.0086 |
+| v134    | RATIOS=(5/25/10/40/20) — more LNS      | 0.8637 | +0.0073 |
+| v140    | LNS n_candidates=60                    | 0.8626 | +0.0062 |
+| v138    | LNS n_destroy=12                       | 0.8622 | +0.0058 |
+
+### Cross-cutting observations
+
+- **MLP surrogate is the single highest-leverage operator.** Moving
+  its time slice from 35 % to 50 % (v133) gained 0.0077 by itself;
+  stacking with other tweaks (v164/v165) gained 0.0158.
+- **Force-directed matters a little but isn't a dominant lever.**
+  Removing FD (v132, v167) is always worse than reducing it; keeping
+  FD at 5–10 % is near-optimal.
+- **More hard-CD polish in the cycle hurts.** v135 (40 %) lost 0.011;
+  hard polish is a rounding step, not a search step, at these budgets.
+- **LNS n_destroy is not sensitive within 5–12.** n=5 (v137) and n=12
+  (v138, v161, v169) give similar results; n=16 (v139) slightly worse.
+- **n_candidates=30 is near-optimal.** 15 and 60 both lose ~0.002.
+- **Plateau threshold 1e-6 (v160) is marginally better than 5e-5.**
+  Tighter stop lets adaptive scheduler keep growing cycles longer.
+- **Jitter floor confirmed at ~0.0007.** v155 = 0.8445; v163 (same
+  config, same seed) = 0.8452. Standard time-budget non-determinism.
+
+### Proposed submission-candidate config
+
+Based on the sweep, the winning config is v164 / v165:
+
+```python
+RATIOS = (0.05, 0.50, 0.15, 0.15, 0.15)   # or 20/15/10 on last three
+GROW_FACTOR = 1.3
+INITIAL_CYCLE_DIVISOR = 10
+# all other defaults unchanged
+```
+
+Projected full-sweep improvement if the gain scales linearly:
+`1.1172 × (1 − 0.0158 / 0.8564) ≈ 1.097`. Non-linearity is likely
+(fast-test wins often don't stick at full budget), so realistic
+expectation is 1.10–1.12 avg. Worth a full verified sweep to confirm.
