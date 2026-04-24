@@ -1811,7 +1811,8 @@ def _macro_adjacency(benchmark):
 # Coordinate descent with actual proxy cost
 # ---------------------------------------------------------------------------
 
-def _coord_descent(pos_np, benchmark, plc_eval, max_time=3000, incr_eval=None):
+def _coord_descent(pos_np, benchmark, plc_eval, max_time=3000, incr_eval=None,
+                   sa_T0=None, sa_cooling=0.9995, sa_rng_seed=None):
     """Coordinate descent with incremental evaluator (300x faster than official).
 
     If incr_eval is provided, uses it for all evaluations (verified to < 1e-6 accuracy).
@@ -1825,6 +1826,17 @@ def _coord_descent(pos_np, benchmark, plc_eval, max_time=3000, incr_eval=None):
       - Macro-size-scaled deltas: larger macros take proportionally larger steps
       - Multi-pass: loop through full delta schedule until no improvement or time
       - Reserve 15% of time for swap phase
+
+    Optional simulated-annealing acceptance (probe loop only):
+      - sa_T0: initial temperature. When None (default) or <= 0, classic
+        greedy best-of-all-8 behavior is preserved exactly.
+      - sa_cooling: multiplicative per-ACCEPTED-MOVE cooling factor
+        (T *= sa_cooling after each accepted probe, NOT per probe).
+      - sa_rng_seed: optional seed for the SA RNG (None = unseeded).
+      - When SA is enabled, the inner best-of-8 is replaced with
+        random-order per-probe Metropolis acceptance (accept first probe
+        that passes Metropolis). A separate best_pos / best_cost tracker
+        records min-ever-seen; that is what is returned.
     """
     from macro_place.objective import compute_proxy_cost
 
@@ -1903,6 +1915,11 @@ def _coord_descent(pos_np, benchmark, plc_eval, max_time=3000, incr_eval=None):
     best_cost = current_cost
     t0 = time.time()
 
+    # Simulated-annealing state (only used when sa_T0 is not None and > 0).
+    sa_enabled = sa_T0 is not None and float(sa_T0) > 0.0
+    sa_T = float(sa_T0) if sa_enabled else 0.0
+    sa_rng = random.Random(sa_rng_seed) if sa_enabled else None
+
     active = set(movable_idx.tolist())
 
     dirs = [(1, 0), (-1, 0), (0, 1), (0, -1),
@@ -1936,40 +1953,87 @@ def _coord_descent(pos_np, benchmark, plc_eval, max_time=3000, incr_eval=None):
 
                 old_x, old_y = pos[i, 0], pos[i, 1]
 
-                # With 300x incremental eval, always use best-of-all-8
-                best_dir_cost = current_cost
-                best_dir_pos = None
+                if not sa_enabled:
+                    # Greedy: best-of-all-8 exhaustive direction search
+                    best_dir_cost = current_cost
+                    best_dir_pos = None
 
-                for ddx, ddy in dirs:
-                    nx = np.clip(old_x + scaled_delta * ddx, half_w[i], cw - half_w[i])
-                    ny = np.clip(old_y + scaled_delta * ddy, half_h[i], ch - half_h[i])
-                    if abs(nx - old_x) < 0.001 and abs(ny - old_y) < 0.001:
-                        continue
+                    for ddx, ddy in dirs:
+                        nx = np.clip(old_x + scaled_delta * ddx, half_w[i], cw - half_w[i])
+                        ny = np.clip(old_y + scaled_delta * ddy, half_h[i], ch - half_h[i])
+                        if abs(nx - old_x) < 0.001 and abs(ny - old_y) < 0.001:
+                            continue
 
-                    pos[i, 0] = nx
-                    pos[i, 1] = ny
+                        pos[i, 0] = nx
+                        pos[i, 1] = ny
 
-                    if _check_overlap(i):
-                        pos[i, 0] = old_x
-                        pos[i, 1] = old_y
-                        continue
+                        if _check_overlap(i):
+                            pos[i, 0] = old_x
+                            pos[i, 1] = old_y
+                            continue
 
-                    cost = _move_and_eval(i, nx, ny)
-                    if cost < best_dir_cost:
-                        best_dir_cost = cost
-                        best_dir_pos = (nx, ny)
+                        cost = _move_and_eval(i, nx, ny)
+                        if cost < best_dir_cost:
+                            best_dir_cost = cost
+                            best_dir_pos = (nx, ny)
 
-                    _undo_move_eval(i, old_x, old_y)
+                        _undo_move_eval(i, old_x, old_y)
 
-                if best_dir_pos is not None:
-                    _move_and_eval(i, best_dir_pos[0], best_dir_pos[1])
-                    _accept_move(i, best_dir_pos[0], best_dir_pos[1])
-                    current_cost = best_dir_cost
-                    next_active.add(i)
-                    pass_improved = True
-                    if best_dir_cost < best_cost:
-                        best_cost = best_dir_cost
-                        best_pos = pos.copy()
+                    if best_dir_pos is not None:
+                        _move_and_eval(i, best_dir_pos[0], best_dir_pos[1])
+                        _accept_move(i, best_dir_pos[0], best_dir_pos[1])
+                        current_cost = best_dir_cost
+                        next_active.add(i)
+                        pass_improved = True
+                        if best_dir_cost < best_cost:
+                            best_cost = best_dir_cost
+                            best_pos = pos.copy()
+                else:
+                    # SA: random-order per-probe Metropolis (first-accept).
+                    # T cools only on ACCEPTED moves; rejected probes don't
+                    # advance the schedule.
+                    shuffled = list(dirs)
+                    sa_rng.shuffle(shuffled)
+
+                    for ddx, ddy in shuffled:
+                        nx = np.clip(old_x + scaled_delta * ddx, half_w[i], cw - half_w[i])
+                        ny = np.clip(old_y + scaled_delta * ddy, half_h[i], ch - half_h[i])
+                        if abs(nx - old_x) < 0.001 and abs(ny - old_y) < 0.001:
+                            continue
+
+                        pos[i, 0] = nx
+                        pos[i, 1] = ny
+
+                        if _check_overlap(i):
+                            pos[i, 0] = old_x
+                            pos[i, 1] = old_y
+                            continue
+
+                        cost = _move_and_eval(i, nx, ny)
+                        delta_c = cost - current_cost
+
+                        if delta_c < 0.0:
+                            accept = True
+                        elif sa_T > 1e-18:
+                            try:
+                                accept = sa_rng.random() < math.exp(-delta_c / sa_T)
+                            except OverflowError:
+                                accept = False
+                        else:
+                            accept = False
+
+                        if accept:
+                            _accept_move(i, nx, ny)
+                            current_cost = cost
+                            next_active.add(i)
+                            pass_improved = True
+                            sa_T *= sa_cooling
+                            if cost < best_cost:
+                                best_cost = cost
+                                best_pos = pos.copy()
+                            break
+                        else:
+                            _undo_move_eval(i, old_x, old_y)
 
         # If no improvement in this full pass, stop looping
         if not pass_improved:

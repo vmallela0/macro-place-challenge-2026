@@ -72,6 +72,21 @@ class OptimalPlacer:
         self.PARALLEL_WORKERS = int(os.environ.get("PLACER_PARALLEL_WORKERS", 0))
         self.LEGALIZE_BUDGET = max(60, min(600, self.TOTAL_TIME_LIMIT // 5))
 
+        # Simulated-annealing hook for _coord_descent (optional).
+        #   PLACER_SA_T0:      float initial temperature. Unset / empty / <= 0 => greedy.
+        #   PLACER_SA_COOLING: float cooling factor per accepted move (default 0.9995).
+        def _parse_float(env_name, default):
+            raw = os.environ.get(env_name, "")
+            if raw is None or raw == "":
+                return default
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return default
+        _t0 = _parse_float("PLACER_SA_T0", None)
+        self.SA_T0 = _t0 if (_t0 is not None and _t0 > 0.0) else None
+        self.SA_COOLING = _parse_float("PLACER_SA_COOLING", 0.9995)
+
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         torch.manual_seed(self.seed)
         random.seed(self.seed)
@@ -143,7 +158,9 @@ class OptimalPlacer:
 
         cd1_budget = max(40, min(400, hard_deadline - (time.time() - t0) - 30))
         best_pos, best_cost = _coord_descent(
-            best_pos, benchmark, plc_cd, max_time=cd1_budget, incr_eval=incr_eval)
+            best_pos, benchmark, plc_cd, max_time=cd1_budget, incr_eval=incr_eval,
+            sa_T0=self.SA_T0, sa_cooling=self.SA_COOLING,
+            sa_rng_seed=(self.seed + 1 if self.SA_T0 is not None else None))
         print(f"  [cd1] cost={best_cost:.6f}", flush=True)
 
         # Per-net optimization (NEW in v4)
@@ -166,7 +183,9 @@ class OptimalPlacer:
             if c < best_cost: best_cost, best_pos = c, p
             cd_t = min(30, max(5, lns_t / 2))
             p, c = _coord_descent(best_pos, benchmark, plc_cd,
-                                  max_time=cd_t, incr_eval=incr_eval)
+                                  max_time=cd_t, incr_eval=incr_eval,
+                                  sa_T0=self.SA_T0, sa_cooling=self.SA_COOLING,
+                                  sa_rng_seed=(self.seed + 2 if self.SA_T0 is not None else None))
             if c < best_cost: best_cost, best_pos = c, p
             print(f"  [hard_lns] cost={best_cost:.6f}", flush=True)
 
@@ -244,14 +263,12 @@ class OptimalPlacer:
             except Exception: pass
             if time.time() - t0 > soft_deadline: break
 
-            # exp 0b bug-fix: this hard-polish call in the soft cycle used to
-            # read `_, c = ...`, discarding the returned best-hard-positions.
-            # If the polish found an improving hard move, best_cost updated
-            # but best_pos stayed at the previous hard state. Next cycle's
-            # operators called `sync_positions(best_pos)` which wiped those
-            # hard improvements back out. Capture the returned pos too.
+            # exp 0b bug-fix + exp 6 SA: capture returned pos AND thread SA params.
             p, c = _coord_descent(best_pos, benchmark, plc_cd,
-                                  max_time=cycle_t * 0.20, incr_eval=incr_eval)
+                                  max_time=cycle_t * 0.20, incr_eval=incr_eval,
+                                  sa_T0=self.SA_T0, sa_cooling=self.SA_COOLING,
+                                  sa_rng_seed=(self.seed + 1000 + cycle
+                                               if self.SA_T0 is not None else None))
             if c < best_cost:
                 best_cost, best_pos = c, p
 
