@@ -387,13 +387,15 @@ class IncrementalEvaluator:
                 self.density_cost = 0.0
             return
 
-        occupied = np.sort(self.grid_density[self.grid_density != 0.0])[::-1]
+        occupied = self.grid_density[self.grid_density != 0.0]
         cnt = self.density_cnt
         actual = min(cnt, len(occupied))
         if actual == 0:
             self.density_cost = 0.0
         else:
-            self.density_cost = 0.5 * float(occupied[:actual].sum() / cnt)
+            # Top `actual` via partition (O(n) vs np.sort O(n log n)).
+            top = np.partition(occupied, -actual)[-actual:] if actual < len(occupied) else occupied
+            self.density_cost = 0.5 * float(top.sum() / cnt)
 
     def _update_density_for_macro(self, macro_idx, old_x, old_y, new_x, new_y):
         """Incrementally update density when one macro moves."""
@@ -656,26 +658,42 @@ class IncrementalEvaluator:
         return entries
 
     def __smooth_routing_cong(self):
-        """plc_client_os.py L1608 — vectorized smoothing of V/H routing."""
+        """plc_client_os.py L1608 — fully vectorized smoothing via cumsum box filter.
+
+        Original formulation distributes V_norm[col]/cnt(col) to window
+        [col-sr, col+sr] (clamped). Equivalent receiver form: for each target k,
+        temp_V[k] = sum_{col in [k-sr, k+sr]} V_norm[col] / cnt(col). Precompute
+        W = V_norm/cnt, then box-sum via cumsum so the Python per-column loop
+        goes away. Same math; float64 rounding differs at ~1e-13, well under the
+        evaluator's 1e-6 equivalence budget.
+        """
         gc, gr, sr = self.grid_col, self.grid_row, self.smooth_range
         V_norm = (self.V_routing_raw / self.grid_v_routes).reshape(gr, gc)
         H_norm = (self.H_routing_raw / self.grid_h_routes).reshape(gr, gc)
 
-        # Smooth V horizontally: each cell distributes value/count to [col-sr, col+sr]
-        temp_V = np.zeros((gr, gc), dtype=np.float64)
-        for col in range(gc):
-            lp = max(0, col - sr)
-            rp = min(gc - 1, col + sr)
-            cnt = rp - lp + 1
-            temp_V[:, lp:rp + 1] += V_norm[:, col:col + 1] / cnt
+        # Per-column/row window size for each source position (clamped at edges).
+        col_idx = np.arange(gc)
+        cnt_col = np.minimum(gc - 1, col_idx + sr) - np.maximum(0, col_idx - sr) + 1
+        row_idx = np.arange(gr)
+        cnt_row = np.minimum(gr - 1, row_idx + sr) - np.maximum(0, row_idx - sr) + 1
 
-        # Smooth H vertically: each cell distributes value/count to [row-sr, row+sr]
-        temp_H = np.zeros((gr, gc), dtype=np.float64)
-        for row in range(gr):
-            lp = max(0, row - sr)
-            up = min(gr - 1, row + sr)
-            cnt = up - lp + 1
-            temp_H[lp:up + 1, :] += H_norm[row:row + 1, :] / cnt
+        # Box-sum window bounds (upper exclusive on cs_padded).
+        up_col = np.minimum(gc, col_idx + sr + 1)
+        lo_col = np.maximum(0, col_idx - sr)
+        up_row = np.minimum(gr, row_idx + sr + 1)
+        lo_row = np.maximum(0, row_idx - sr)
+
+        # V: box filter along columns (per-row cumsum).
+        W_V = V_norm / cnt_col[None, :]
+        cs = np.concatenate([np.zeros((gr, 1), dtype=np.float64),
+                             np.cumsum(W_V, axis=1)], axis=1)
+        temp_V = cs[:, up_col] - cs[:, lo_col]
+
+        # H: box filter along rows (per-column cumsum).
+        W_H = H_norm / cnt_row[:, None]
+        cs = np.concatenate([np.zeros((1, gc), dtype=np.float64),
+                             np.cumsum(W_H, axis=0)], axis=0)
+        temp_H = cs[up_row, :] - cs[lo_row, :]
 
         self.V_routing_smooth = temp_V.ravel()
         self.H_routing_smooth = temp_H.ravel()
@@ -690,11 +708,11 @@ class IncrementalEvaluator:
         V_total = self.V_routing_smooth + V_macro_norm
         H_total = self.H_routing_smooth + H_macro_norm
 
-        # ABU: top 5% of combined V+H
+        # ABU: top 5% of combined V+H. np.partition is O(n) vs np.sort O(n log n).
         combined = np.concatenate([V_total, H_total])
-        sorted_vals = np.sort(combined)[::-1]
         cnt = max(1, math.floor(len(combined) * 0.05))
-        self.congestion_cost = float(sorted_vals[:cnt].sum() / cnt)
+        top = np.partition(combined, -cnt)[-cnt:]
+        self.congestion_cost = float(top.sum() / cnt)
 
     def _route_net(self, net_id):
         """Route a single net, recording entries in cache."""
