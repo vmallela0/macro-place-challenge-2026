@@ -643,3 +643,143 @@ Baseline for comparison: v51/v80 at 220 s ≈ 0.8533 (jitter ±0.002).
 - **D21 IRLS** for the HPWL subproblem: iteratively-reweighted least-squares gives weighted-median convergence but exposes a smooth Hessian approximation for a larger step.
 
 No round-2 tests have been run yet; they would need another 3–5 ibm01 runs at 220 s plus minor code changes each.
+
+## Initial-placement variants (unexplored territory)
+
+The current pipeline has only one degree of freedom on the starting
+configuration: three push-apart damping settings (0.4 / 0.6 / 0.8)
+applied to the benchmark's provided `.plc` initial. The legalization
+tournament then picks between those three push outputs and the raw
+initial. All four seeds are perturbations of the same starting point.
+
+Classical placement has many other init strategies we have not tried.
+Each can simply be added as an extra seed to the tournament — if it
+wins, we gain; if it loses, the tournament keeps the current best and
+we lose nothing except the time to compute it.
+
+### IP1. Random init
+Mechanism: sample each hard-macro position uniformly on the canvas,
+feed to push-apart. Rationale: null-test — does the benchmark's
+initial actually help, or can the placer recover from cold? Confidence:
+low for quality, but the answer is a useful diagnostic.
+
+### IP2. Quadratic (CG) init
+Mechanism: build net Laplacian `L` (sparse, symmetric, PSD), solve
+`L x = b_x` and `L y = b_y` with conjugate gradient, where `b` encodes
+fixed-port positions (if any). Classical Kahng-Kennings /
+GORDIAN-style quadratic placement. Rationale: gives the HPWL-minimum
+of the quadratic relaxation — good starting point for downstream
+refinement, even if it packs macros too tightly for congestion.
+Confidence: medium.
+
+### IP3. Jacobi / centroid iteration
+Mechanism: `x_i ← Σ_j w_ij x_j / Σ_j w_ij` iterated to convergence.
+Rationale: fixed-point of the quadratic Laplacian solve, without
+needing CG. Converges in a few hundred iterations at O(pins / iter).
+Confidence: medium.
+
+### IP4. Min-cut recursive bisection (Breuer 1977)
+Mechanism: FM-bisect the netlist, assign halves to canvas halves,
+recurse. Rationale: classical connectivity-matched init. Confidence:
+medium but requires a FM implementation (~150 LOC).
+
+### IP5. Hilbert-curve ordered packing
+Mechanism: order macros along a Hilbert space-filling curve by
+attribute (size, connectivity), place in order along an interior
+Hilbert path. Rationale: deterministic, preserves local neighborhood
+under the curve's locality property. Confidence: low-medium.
+
+### IP6. Grid-packed init by size
+Mechanism: sort hard macros by size descending; pack on a regular
+grid largest-first. Rationale: gives overlap-free start for dense
+benchmarks — removes one push-apart step. Confidence: low.
+
+### IP7. Block-center init (stress test for push-apart)
+Mechanism: place every hard macro at the canvas center; push-apart
+disperses. Rationale: tests whether push-apart alone can produce a
+quality init from the worst-case starting point. Confidence: low but
+informative.
+
+### IP8. Ratio-cut spectral (non-numpy-eigh)
+Mechanism: compute the Fiedler vector via Lanczos iteration on
+`L_rw = I − D⁻¹ A`, project onto the canvas. Distinct from the
+previously-tried numpy eigh which failed on structured matrices.
+Rationale: Lanczos is more robust for sparse Laplacians. Confidence:
+low-medium.
+
+### IP9. Simulated-annealing warmup
+Mechanism: 30 s of high-T SA on the benchmark initial, then use the
+SA output as the tournament seed. Rationale: SA's uphill moves escape
+the initial's local basin; the cooled state is a "globally explored"
+warm start. Confidence: medium.
+
+### IP10. Multiple pushed-init seeds (simple extension)
+Mechanism: push-apart with more damping configurations — e.g., 8
+instead of 3. Rationale: cheapest possible expansion of the
+tournament. Confidence: low but trivial to test.
+
+### IP11. Force-directed pre-placement
+Mechanism: run force-directed (attract on nets, repel on macros) for
+a fixed iteration count without legalization; use the result as a
+seed. Rationale: FD finds reasonable layouts cheaply. Confidence:
+medium.
+
+### IP12. Analytical / Poisson-density (ePlace seed)
+Mechanism: one-step of the ePlace electrostatic update from the
+benchmark initial. Rationale: smooth density penalty gives a
+well-spread starting point. Confidence: medium but expensive (FFT).
+
+## Round-2 fast tests — initial placement (ibm01 @ 220 s)
+
+| Variant | Idea | ibm01 proxy | Δ vs baseline (0.8533) | Wall | Verdict |
+|---------|------|-------------|------------------------|------|---------|
+| v126 | IP1 random init (uniform on canvas) | 1.0966 | **+0.2433** | 212 s | Much worse — push-apart cannot recover from cold random in 220 s. |
+| v127 | IP7 center-collapsed init (all macros at canvas center + jitter) | 1.0778 | **+0.2245** | 214 s | Much worse — symmetric radial expansion helps slightly vs random, but still far from baseline. |
+| v128 | IP6 regular-grid init, largest macros first | 1.0906 | **+0.2373** | 213 s | Much worse — structured but not netlist-aware. |
+| v129 | IP10 8 push-apart damping configs (tournament expansion) | 0.8549 | +0.0016 | 326 s* | Tied (within jitter), wall unfair — the subclass double-ran the pipeline. |
+
+*v129 wall is 326 s due to subclass re-running the parent's place() after its own seed-selection; inside that, the effective placer budget was still 220 s, so the proxy comparison is still meaningful. Wall is not.
+
+### Takeaways from round 2
+
+1. **The benchmark's `.plc` initial is genuinely load-bearing (∼ 0.24 of the
+   cost at our fast-test budget).** Replacing it with any netlist-blind
+   starting point (random, center, grid) loses ~0.22–0.24 in 220 s.
+   The benchmark initial encodes prior work (e.g. RePlAce's output)
+   that the search pipeline cannot reproduce in 220 s.
+2. **Widening the push-apart-config tournament from 3 to 8 doesn't help.**
+   At ibm01 budgets, the existing 3 damping settings already span the
+   relevant basin entries; more configs just cost more legalize time.
+3. **The remaining init-placement idea worth trying is a netlist-aware
+   seed** — quadratic-CG (IP2), Jacobi centroid (IP3), or FM
+   bisection (IP4). All would require reading the netlist connectivity
+   (via the IncrementalEvaluator's `macro_nets` / `net_macros` dicts)
+   before building an init. Expected payoff: if we can produce a seed
+   of cost ≤ 1.0 (from netlist connectivity alone), it could match the
+   benchmark's initial and potentially improve on it in regions where
+   the benchmark init is suboptimal.
+
+### Pattern across rounds 1 and 2
+
+Seven ideas tested; zero clear wins over the v2 baseline at ibm01 @ 220 s.
+Two categories of explanation:
+1. **The v2 pipeline is already near-optimal at this budget.** The
+   remaining improvement headroom may be too small to detect at
+   220 s — it needs the full 3 300 s budget that produced the
+   verified 1.1172 average.
+2. **The benchmark initial + current pipeline forms a tightly coupled
+   system.** Variations that perturb one component independently
+   don't dominate because the pipeline has internal compensation
+   (tournament picks best, adaptive scheduler handles plateau).
+   To move the needle, we likely need a jointly-better initial + a
+   pipeline stage that exploits it.
+
+Recommended next steps if this line is pursued:
+- Implement IP2 (quadratic-CG init) as an **additional** tournament
+  seed, not a replacement for the benchmark init.
+- If IP2 seed wins the tournament on > 50 % of benchmarks, it's real
+  and should replace/augment the push-apart variants.
+- Otherwise, invest the effort in algorithmic improvements to the soft
+  refinement loop (e.g., D10 multi-armed bandit for cycle allocation,
+  D21 IRLS for per-net HPWL) — these modify the high-leverage phase
+  where most cost reduction happens.
