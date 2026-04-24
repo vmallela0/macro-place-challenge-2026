@@ -121,16 +121,33 @@ class OptimalPlacer:
                         return True
             return False
 
+        # exp-fast-tournament: optionally evaluate tournament candidates with
+        # the incremental evaluator (~50ms vs ~1.3s for compute_proxy_cost).
+        # 25× more candidates fit in LEGALIZE_BUDGET → much wider basin search.
+        # Equivalent to PlacementCost up to 1e-6, validated by the eq-test.
+        _fast_t = os.environ.get("PLACER_EXP_FAST_TOURNAMENT", "0") == "1"
+        _t_eval = None
+        if _fast_t:
+            _t_plc = _load_plc(benchmark.name)
+            _t_eval = IncrementalEvaluator(_t_plc, benchmark)
+
         def _try(pos_np):
             nonlocal best_pos, best_cost
             if _has_overlap(pos_np):
                 return
-            full = benchmark.macro_positions.clone()
-            full[:n_hard] = torch.tensor(pos_np, dtype=torch.float32)
-            r = compute_proxy_cost(full, benchmark, plc_eval)
-            if r["overlap_count"] == 0 and r["proxy_cost"] < best_cost:
-                best_cost = r["proxy_cost"]
-                best_pos = pos_np.copy()
+            if _fast_t and _t_eval is not None:
+                _t_eval.sync_positions(pos_np)
+                c = _t_eval.get_proxy_cost()
+                if c < best_cost:
+                    best_cost = c
+                    best_pos = pos_np.copy()
+            else:
+                full = benchmark.macro_positions.clone()
+                full[:n_hard] = torch.tensor(pos_np, dtype=torch.float32)
+                r = compute_proxy_cost(full, benchmark, plc_eval)
+                if r["overlap_count"] == 0 and r["proxy_cost"] < best_cost:
+                    best_cost = r["proxy_cost"]
+                    best_pos = pos_np.copy()
 
         seen = set()
         starts = [(p, f"push_{k}") for k, p in enumerate(pushed_positions)] + [(init_pos, "raw")]
