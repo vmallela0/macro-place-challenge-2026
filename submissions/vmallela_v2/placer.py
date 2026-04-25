@@ -83,7 +83,10 @@ class OptimalPlacer:
                 return float(raw)
             except (TypeError, ValueError):
                 return default
-        _t0 = _parse_float("PLACER_SA_T0", None)
+        # v4 winning defaults (validated via R1-R6 sweep on ibm01, confirmed via
+        # R8 full-17-bench sweep at 3300s × 1 seed → mean 1.0186). Env vars can
+        # still override for experiments; blank/unset/<=0 disables SA.
+        _t0 = _parse_float("PLACER_SA_T0", 0.00005)
         self.SA_T0 = _t0 if (_t0 is not None and _t0 > 0.0) else None
         self.SA_COOLING = _parse_float("PLACER_SA_COOLING", 0.9995)
 
@@ -342,8 +345,8 @@ class OptimalPlacer:
                           f"(hard-cong {hard_t:.0f}s + soft {soft_t:.0f}s)", flush=True)
                     escaped = False
                     try:
-                        # exp 14: parametrize escape destroy size + candidates.
-                        _esc_h_dest = int(os.environ.get("PLACER_ESC_HARD_DESTROY", 20))
+                        # v4 winning: hard escape destroy=80 (validated), cand=60.
+                        _esc_h_dest = int(os.environ.get("PLACER_ESC_HARD_DESTROY", 80))
                         _esc_h_cand = int(os.environ.get("PLACER_ESC_HARD_CAND", 60))
                         p, c = lns_destroy_repair_phase(
                             best_pos, benchmark, incr_eval,
