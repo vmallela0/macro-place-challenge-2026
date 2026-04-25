@@ -19,6 +19,28 @@ branch.
 | [`v5_cells_skip`](../../tree/v5_cells_skip) | — | Experimental: cells-unchanged skip optimization in `move_macro` (routing + smoothing are discrete in pin grid cells, so probes that don't cross cell boundaries can skip them). +8 % evaluator speed on CD-like workloads, equivalence to v4 verified at 3.57 × 10⁻⁷; **not** validated at full placer budget. |
 | [`optimized_v3`](../../tree/optimized_v3) | — | Interim staging branch used during development. No submission value. |
 
+## v5 sweep — in flight (started 2026-04-25 18:02 UTC)
+
+5 single-feature branches built off `optimized_v4`, plus a stacked `v5_combined`,
+sweeping on a 16-vCPU box at seed 42 / 3300 s budget / 8-way parallel.
+85 runs total, ETA ~10 h. Results land here as they complete.
+
+| Branch | Activated by | Hypothesis | Mean cost (17 benches) |
+|--------|--------------|------------|-----------------------:|
+| `v5_cells_skip_v4` | (default on) | Evaluator skips routing recompute when no pin's grid cell changed (~24 % of CD probes); 7-8 % per-probe speedup → more iterations per second | (running) |
+| `v5_escape_v2` | `PLACER_ESC_K_REGIONS=4` | Escape-basin LNS uses 4 dispersed congestion-weighted seeds → harder benches escape stronger local minima | (running) |
+| `v5_surrogate_struct` | `PLACER_SURR_STRUCTURED=1` | Soft surrogate uses 24 structured (8 dirs × 3 mags) candidates instead of 20 random radial | (running) |
+| `v5_warmstart` | `PLACER_WARMSTART=1` | LSE-HPWL + soft-repulsion analytical init added to the legalize tournament (60 s budget) | (running) |
+| `v5_combined` | all four above | Stack: cells-skip + escape-v2 + surrogate-struct + warmstart | (running) |
+| `v5_cluster` (local only) | `v5_combined` env + `PLACER_ESC_CLUSTER_FRAC=0.3` | Wires `cluster_translate_phase` (orphan code in `_moves.py` since v2) into the escape phase as a 3rd sub-attempt — addresses CD's blind spot for correlated multi-macro moves | sanity VALID @ 600s / ibm01; cluster path not yet exercised (escape didn't trigger at short budget) |
+
+`v5_combined_pp` (combined + 4 perturbed-seed parallel restarts) is dropped from
+this sweep — needs ≥32 cores to not oversubscribe the box.
+
+Wins/losses are gated at ±0.005 vs v4. Anything < 1.014 ties or beats v4's
+min-of-3 oracle and is a candidate for `optimized_v5`. Anything < 1.000 is the
+sub-1 stretch goal and would need multi-seed verification.
+
 ## What's on `optimized_v4` (the submission)
 
 Pulled from the branch's [`README.md`](../../blob/optimized_v4/README.md);
