@@ -27,6 +27,7 @@ BRANCHES=(
   "v5_surrogate_struct:v5_surrogate_struct:/tmp/wt_v5_surr:PLACER_SURR_STRUCTURED=1"
   "v5_warmstart:v5_warmstart:/tmp/wt_v5_warm:PLACER_WARMSTART=1"
   "v5_combined:v5_combined:/tmp/wt_v5_combined:PLACER_ESC_K_REGIONS=4 PLACER_SURR_STRUCTURED=1 PLACER_WARMSTART=1"
+  "v5_combined_pp:v5_combined:/tmp/wt_v5_combined:PLACER_ESC_K_REGIONS=4 PLACER_SURR_STRUCTURED=1 PLACER_WARMSTART=1 PLACER_PARALLEL_WORKERS=4"
 )
 BENCHES=(ibm01 ibm02 ibm03 ibm04 ibm06 ibm07 ibm08 ibm09 ibm10 ibm11 ibm12 ibm13 ibm14 ibm15 ibm16 ibm17 ibm18)
 

@@ -31,6 +31,7 @@ V5_BRANCHES = [
     "v5_surrogate_struct",
     "v5_warmstart",
     "v5_combined",
+    "v5_combined_pp",
 ]
 
 
