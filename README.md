@@ -28,7 +28,7 @@ sweeping on a 16-vCPU box at seed 42 / 3300 s budget / 8-way parallel.
 | Branch | Activated by | Hypothesis | Mean cost (17 benches) |
 |--------|--------------|------------|-----------------------:|
 | `v5_cells_skip_v4` | (default on) | Evaluator skips routing recompute when no pin's grid cell changed (~24 % of CD probes); 7-8 % per-probe speedup → more iterations per second | **17/17 ✅ mean 1.0046 (Δ = −0.0140 vs v4 Mac same-bench)** — below v4's min-of-3 oracle (1.0140); all 17 benches improved |
-| `v5_escape_v2` | `PLACER_ESC_K_REGIONS=4` | Escape-basin LNS uses 4 dispersed congestion-weighted seeds → harder benches escape stronger local minima | (running) |
+| `v5_escape_v2` | `PLACER_ESC_K_REGIONS=4` | Escape-basin LNS uses 4 dispersed congestion-weighted seeds → harder benches escape stronger local minima | **17/17 mean 1.0105** (Δ −0.008 vs v4-Mac, +0.006 *worse* than v5_cells_skip). Wins on ibm01/02/03/09 (small); regresses on every harder bench — splitting escape budget 4 ways gives too few destroys/region to actually escape. **Hypothesis falsified.** |
 | `v5_surrogate_struct` | `PLACER_SURR_STRUCTURED=1` | Soft surrogate uses 24 structured (8 dirs × 3 mags) candidates instead of 20 random radial | (running) |
 | `v5_warmstart` | `PLACER_WARMSTART=1` | LSE-HPWL + soft-repulsion analytical init added to the legalize tournament (60 s budget) | (running) |
 | `v5_combined` | all four above | Stack: cells-skip + escape-v2 + surrogate-struct + warmstart | (running) |

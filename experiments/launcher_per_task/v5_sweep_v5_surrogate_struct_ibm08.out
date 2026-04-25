@@ -1,0 +1,1 @@
+[wt-harness] exp=v5_surrogate_struct wt=/tmp/wt_v5_surr branch=v5_surrogate_struct@b2095a5 bench=ibm08 seed=42 budget=3300 notes='PLACER_SURR_STRUCTURED=1'
