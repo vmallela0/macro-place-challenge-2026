@@ -1,0 +1,1 @@
+[wt-harness] exp=v5_escape_v2 wt=/tmp/wt_v5_escape branch=v5_escape_v2@d7a3d63 bench=ibm16 seed=42 budget=3300 notes='PLACER_ESC_K_REGIONS=4'

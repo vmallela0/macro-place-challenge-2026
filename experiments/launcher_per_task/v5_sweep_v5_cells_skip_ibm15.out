@@ -1,0 +1,2 @@
+[wt-harness] exp=v5_cells_skip wt=/tmp/wt_v5_cells branch=v5_cells_skip_v4@f16a006 bench=ibm15 seed=42 budget=3300 notes=''
+[wt-harness] DONE exp=v5_cells_skip cost=1.0877 status=VALID wall=3272.7s
