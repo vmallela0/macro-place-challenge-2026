@@ -1,0 +1,75 @@
+================================================================================
+evaluate · OptimalPlacer  (submissions/vmallela_v2/placer.py)
+================================================================================
+
+  ibm08... #[INFO] Reading from external/MacroPlacement/Testcases/ICCAD04/ibm08/netlist.pb.txt
+[INFO] Retrieving Meta information from .plc comments
+#[PLACEMENT GRID] Col: 38, Row: 34
+#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96
+#[CONGESTION SMOOTH RANGE] Smooth Range: 2
+#[OVERLAP THRESHOLD] Threshold: 0.0040
+#[INFO] Reading from external/MacroPlacement/Testcases/ICCAD04/ibm08/netlist.pb.txt
+[INFO] Retrieving Meta information from .plc comments
+#[PLACEMENT GRID] Col: 38, Row: 34
+#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96
+#[CONGESTION SMOOTH RANGE] Smooth Range: 2
+#[OVERLAP THRESHOLD] Threshold: 0.0040
+#[INFO] Reading from external/MacroPlacement/Testcases/ICCAD04/ibm08/netlist.pb.txt
+[INFO] Retrieving Meta information from .plc comments
+#[PLACEMENT GRID] Col: 38, Row: 34
+#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96
+#[CONGESTION SMOOTH RANGE] Smooth Range: 2
+#[OVERLAP THRESHOLD] Threshold: 0.0040
+  [legalize] 602.4s cost=1.464095
+#[INFO] Reading from external/MacroPlacement/Testcases/ICCAD04/ibm08/netlist.pb.txt
+[INFO] Retrieving Meta information from .plc comments
+#[PLACEMENT GRID] Col: 38, Row: 34
+#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96
+#[CONGESTION SMOOTH RANGE] Smooth Range: 2
+#[OVERLAP THRESHOLD] Threshold: 0.0040
+  [cd1] cost=1.442565
+  [per_net] cost=1.203173
+  [hard_lns] cost=1.186009
+  [cycle_1] t=149.6 cost=1.087908
+  [cycle_2] t=60.0 cost=1.072914
+  [cycle_3] t=60.0 cost=1.067046
+  [cycle_4] t=60.0 cost=1.062423
+  [cycle_5] t=60.0 cost=1.059502
+  [cycle_6] t=60.0 cost=1.057680
+  [cycle_7] t=60.0 cost=1.056057
+  [cycle_8] t=60.0 cost=1.055248
+  [cycle_9] t=60.0 cost=1.055072
+  [cycle_10] t=60.0 cost=1.054677
+  [cycle_11] t=60.0 cost=1.054582
+  [cycle_12] t=60.0 cost=1.054426
+  [cycle_13] t=60.0 cost=1.054310
+  [cycle_14] t=60.0 cost=1.054262
+  [cycle_15] t=42.0 cost=1.054256
+  [cycle_16] t=29.4 cost=1.054256
+  [cycle_17] t=20.6 cost=1.054256
+  [escape] plateau at 1.054256, budget 240s (hard-cong 120s + soft 120s)
+  [escape.hard-cong] OK at 1.054097
+  [escape.soft] OK at 1.052360
+  [cycle_18] t=30.0 cost=1.051802
+  [cycle_19] t=30.0 cost=1.051528
+  [cycle_20] t=30.0 cost=1.051312
+  [cycle_21] t=30.0 cost=1.051208
+  [cycle_22] t=30.0 cost=1.051183
+  [cycle_23] t=21.0 cost=1.051183
+  [cycle_24] t=14.7 cost=1.051181
+  [cycle_25] t=10.3 cost=1.051181
+  [escape] plateau at 1.051181, budget 240s (hard-cong 120s + soft 120s)
+  [escape.hard-cong] OK at 1.050466
+  [escape.soft] OK at 1.050183
+  [cycle_26] t=30.0 cost=1.049978
+  [cycle_27] t=30.0 cost=1.049831
+  [cycle_28] t=30.0 cost=1.049825
+  [cycle_29] t=21.0 cost=1.049750
+  [cycle_30] t=21.0 cost=1.049709
+  [cycle_31] t=14.7 cost=1.049708
+  [cycle_32] t=10.3 cost=1.049708
+  [cycle_33] t=8.0 cost=1.049708
+  [escape] plateau at 1.049708, budget 158s (hard-cong 79s + soft 79s)
+  [escape] no improvement, stop
+  [TOTAL] 3138.5s cycles=33 final=1.049708
+proxy=1.0497  (wl=0.079 den=0.577 cong=1.365)  VALID  [3139.55s]
