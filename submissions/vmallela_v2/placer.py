@@ -348,11 +348,19 @@ class OptimalPlacer:
                         # v4 winning: hard escape destroy=80 (validated), cand=60.
                         _esc_h_dest = int(os.environ.get("PLACER_ESC_HARD_DESTROY", 80))
                         _esc_h_cand = int(os.environ.get("PLACER_ESC_HARD_CAND", 60))
+                        # v5 escape: K_REGIONS >= 2 enables multi-region dispersed-seed LNS.
+                        _esc_k = int(os.environ.get("PLACER_ESC_K_REGIONS", 1))
+                        _esc_hot = float(os.environ.get("PLACER_ESC_HOTSPOT_FRAC", 0.05))
+                        _esc_mind = float(os.environ.get("PLACER_ESC_MIN_DIST_FRAC", 0.25))
+                        _esc_seed_sel = "congestion-disp" if _esc_k > 1 else "congestion"
                         p, c = lns_destroy_repair_phase(
                             best_pos, benchmark, incr_eval,
                             max_time=hard_t,
                             n_destroy=_esc_h_dest, n_candidates=_esc_h_cand,
-                            seed_selector="congestion")
+                            seed_selector=_esc_seed_sel,
+                            k_regions=_esc_k,
+                            hotspot_frac=_esc_hot,
+                            min_dist_frac=_esc_mind)
                         if c < best_cost - 5e-5:
                             best_cost, best_pos = c, p
                             escaped = True
