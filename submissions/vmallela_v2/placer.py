@@ -55,6 +55,7 @@ from _soft_lns import soft_lns_phase
 from _per_net import per_net_optimize
 from _soft_surrogate_v2 import soft_cd_surrogate_v2, reset_surrogate_state
 from _moves import lns_destroy_repair_phase
+from _warmstart import analytical_warmstart
 
 
 class OptimalPlacer:
@@ -111,6 +112,24 @@ class OptimalPlacer:
         push_configs = [(300, 0.4), (500, 0.6), (800, 0.8)]
         pushed_positions = [_push_apart(init_pos, benchmark, max_iters=mi, damping=d)
                             for mi, d in push_configs]
+
+        # v5 analytical warm-start: LSE-HPWL + soft repulsion. Result is
+        # added as one more starting candidate to the legalize tournament.
+        # Env-gated PLACER_WARMSTART=1 enables (default off = v4 behavior).
+        warmstart_positions = []
+        if os.environ.get("PLACER_WARMSTART", "0") == "1":
+            try:
+                wt_budget = float(os.environ.get("PLACER_WARMSTART_BUDGET", 60.0))
+                wt_pos = analytical_warmstart(
+                    benchmark, plc, init_pos, max_time=wt_budget,
+                    verbose=os.environ.get("PLACER_WARMSTART_VERBOSE", "0") == "1")
+                # Push-apart the analytical solution to clean residual overlaps
+                # before handing to the legalize ring search.
+                wt_pos_pushed = _push_apart(wt_pos, benchmark, max_iters=400, damping=0.6)
+                warmstart_positions = [wt_pos_pushed]
+                print(f"  [warmstart] done, added 1 candidate to tournament", flush=True)
+            except Exception as e:
+                print(f"  [warmstart] err: {e}", flush=True)
 
         plc_eval = _load_plc(benchmark.name)
         best_pos = None
@@ -169,6 +188,7 @@ class OptimalPlacer:
 
         seen = set()
         starts = [(p, f"push_{k}") for k, p in enumerate(pushed_positions)] + [(init_pos, "raw")]
+        starts += [(p, f"warmstart_{k}") for k, p in enumerate(warmstart_positions)]
         for ot in range(30):
             if time.time() - t0 > self.LEGALIZE_BUDGET: break
             for sm in [0.05, 0.08, 0.12, 0.18]:
