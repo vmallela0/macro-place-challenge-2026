@@ -184,9 +184,69 @@ def _pick_congestion_seed(incr_eval, movable, hotspot_frac=0.10):
     return candidates
 
 
+def _pick_dispersed_congestion_seeds(incr_eval, movable, positions, K,
+                                     hotspot_frac=0.05, min_dist_frac=0.25):
+    """v2: pick up to K geographically-dispersed seeds, scored by INTEGRAL of
+    blockage in top-hotspot_frac congested cells (not just binary touch).
+
+    Greedy farthest-point dispersal: take highest-score seed first; for each
+    subsequent seed, take highest-score remaining macro at distance >=
+    min_dist_frac · canvas_diag from all already-picked seeds. Returns up to
+    K seeds, sorted by score desc. Empty list if no movable touches hotspots.
+    """
+    n_cells = incr_eval.n_cells
+    V_total = incr_eval.V_routing_smooth + incr_eval.V_macro_raw / incr_eval.grid_v_routes
+    H_total = incr_eval.H_routing_smooth + incr_eval.H_macro_raw / incr_eval.grid_h_routes
+    per_cell = np.maximum(V_total, H_total)
+    top_n = max(1, int(n_cells * hotspot_frac))
+    hot_threshold_idx = np.argpartition(per_cell, -top_n)[-top_n:]
+    hot_score = np.zeros(n_cells, dtype=np.float64)
+    hot_score[hot_threshold_idx] = per_cell[hot_threshold_idx]
+
+    # Continuous score per macro: sum of (V+H blockage amounts) into hot cells.
+    n = len(movable)
+    macro_score = np.zeros(n, dtype=np.float64)
+    for m in range(n):
+        if not movable[m]:
+            continue
+        s = 0.0
+        for flat, v_amt, h_amt in incr_eval.macro_blockage_cache.get(m, []):
+            if hot_score[flat] > 0.0:
+                s += hot_score[flat] * (v_amt + h_amt)
+        macro_score[m] = s
+
+    candidates = [m for m in range(n) if macro_score[m] > 0.0]
+    if not candidates:
+        return []
+    candidates.sort(key=lambda m: -macro_score[m])
+
+    cw = incr_eval.cw
+    ch = incr_eval.ch
+    diag = (cw * cw + ch * ch) ** 0.5
+    min_dist = diag * min_dist_frac
+    min_dist_sq = min_dist * min_dist
+
+    chosen = [candidates[0]]
+    for m in candidates[1:]:
+        if len(chosen) >= K:
+            break
+        mx, my = float(positions[m, 0]), float(positions[m, 1])
+        ok = True
+        for c in chosen:
+            cx, cy = float(positions[c, 0]), float(positions[c, 1])
+            if (mx - cx) ** 2 + (my - cy) ** 2 < min_dist_sq:
+                ok = False
+                break
+        if ok:
+            chosen.append(m)
+    return chosen
+
+
 def lns_destroy_repair_phase(pos_np, benchmark, incr_eval, max_time,
                              n_destroy=4, n_candidates=40,
-                             seed_selector="random", verbose=False):
+                             seed_selector="random", verbose=False,
+                             k_regions=1, hotspot_frac=0.05,
+                             min_dist_frac=0.25):
     """Ruin-and-recreate: remove a connected subset, re-insert greedily.
 
     Novel move type: the subset's positions are re-chosen jointly in
@@ -195,8 +255,15 @@ def lns_destroy_repair_phase(pos_np, benchmark, incr_eval, max_time,
     beyond what CD or swaps can do.
 
     seed_selector:
-      'random'     — uniform from movable (original behavior)
-      'congestion' — biased toward macros in the top-10%-congested cells
+      'random'           — uniform from movable (original behavior)
+      'congestion'       — biased toward macros in the top-10%-congested cells
+                           (binary touch). Single seed per iteration.
+      'congestion-disp'  — multi-region (v2): pick k_regions geographically-
+                           dispersed seeds, scored by integral of blockage
+                           in top-hotspot_frac cells. BFS budget is split
+                           evenly: each region gets ceil(n_destroy/k_regions)
+                           macros. Falls back to 'congestion' if <2 hot
+                           regions found.
     """
     n_hard = benchmark.num_hard_macros
     sizes = benchmark.macro_sizes[:n_hard].numpy().astype(np.float64)
@@ -223,31 +290,54 @@ def lns_destroy_repair_phase(pos_np, benchmark, incr_eval, max_time,
     while time.time() - t0 < max_time:
         n_iter += 1
         # Choose a connected seed + neighbors as the "destroy set"
-        if seed_selector == "congestion":
+        if seed_selector == "congestion-disp" and k_regions > 1:
+            seeds = _pick_dispersed_congestion_seeds(
+                incr_eval, movable, pos, k_regions,
+                hotspot_frac=hotspot_frac, min_dist_frac=min_dist_frac)
+            if len(seeds) < 2:
+                # Fallback to single-region congestion if dispersal failed.
+                hot_candidates = _pick_congestion_seed(incr_eval, movable)
+                if hot_candidates:
+                    seeds = [int(rng.choice(hot_candidates))]
+                else:
+                    seeds = [int(rng.choice(movable_idx))]
+        elif seed_selector == "congestion":
             hot_candidates = _pick_congestion_seed(incr_eval, movable)
             if hot_candidates:
-                seed = int(rng.choice(hot_candidates))
+                seeds = [int(rng.choice(hot_candidates))]
             else:
-                seed = int(rng.choice(movable_idx))
+                seeds = [int(rng.choice(movable_idx))]
         else:
-            seed = int(rng.choice(movable_idx))
-        subset = [seed]
-        visited = {seed}
-        queue = [seed]
-        while queue and len(subset) < n_destroy:
-            m = queue.pop(0)
-            nbrs = []
-            for nid in incr_eval.macro_nets[m]:
-                for m2 in incr_eval.net_macros[nid]:
-                    if 0 <= m2 < n_hard and movable[m2] and m2 not in visited:
-                        nbrs.append(m2)
-            rng.shuffle(nbrs)
-            for n2 in nbrs:
-                if len(subset) >= n_destroy:
-                    break
-                subset.append(n2)
-                visited.add(n2)
-                queue.append(n2)
+            seeds = [int(rng.choice(movable_idx))]
+
+        # Multi-seed BFS: each seed gets its own per-region budget; union forms
+        # the destroy set. Budget split: ceil(n_destroy / K) per region; loop
+        # round-robin so partial fills still spread.
+        per_region = max(1, (n_destroy + len(seeds) - 1) // len(seeds))
+        subset = []
+        visited = set()
+        for s in seeds:
+            if s in visited:
+                continue
+            subset.append(s)
+            visited.add(s)
+            queue = [s]
+            region_count = 1
+            while queue and region_count < per_region and len(subset) < n_destroy:
+                m = queue.pop(0)
+                nbrs = []
+                for nid in incr_eval.macro_nets[m]:
+                    for m2 in incr_eval.net_macros[nid]:
+                        if 0 <= m2 < n_hard and movable[m2] and m2 not in visited:
+                            nbrs.append(m2)
+                rng.shuffle(nbrs)
+                for n2 in nbrs:
+                    if region_count >= per_region or len(subset) >= n_destroy:
+                        break
+                    subset.append(n2)
+                    visited.add(n2)
+                    queue.append(n2)
+                    region_count += 1
         if len(subset) < 2:
             continue
 
