@@ -55,7 +55,7 @@ while IFS= read -r task; do
     active=$((active - 1))
   done
   IFS=' ' read -ra env_arr <<< "$envs"
-  bash "$REPO_ROOT/experiments/run_in_worktree.sh" "$exp_id" "$wt" "$bench" "$seed" "$BUDGET" "${env_arr[@]:-}" \
+  bash "$wt/experiments/run_in_worktree.sh" "$exp_id" "$wt" "$bench" "$seed" "$BUDGET" "${env_arr[@]:-}" \
     > "/tmp/phase1_${exp_id}_${bench}_s${seed}.out" 2>&1 &
   active=$((active + 1))
   launched=$((launched + 1))

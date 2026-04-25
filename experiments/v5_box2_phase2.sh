@@ -24,7 +24,7 @@ for SEED in "${SEEDS[@]}"; do
       wait -n; active=$((active - 1))
     done
     IFS=' ' read -ra env_arr <<< "$PP_ENVS"
-    bash "$REPO_ROOT/experiments/run_in_worktree.sh" v5_combined_pp_box2 "$WT" "$B" "$SEED" "$BUDGET" "${env_arr[@]:-}" \
+    bash "$WT/experiments/run_in_worktree.sh" v5_combined_pp_box2 "$WT" "$B" "$SEED" "$BUDGET" "${env_arr[@]:-}" \
       > "/tmp/phase2_pp_${B}_s${SEED}.out" 2>&1 &
     active=$((active + 1))
     echo "[phase2] launched pp $B s=$SEED (active=$active)"
