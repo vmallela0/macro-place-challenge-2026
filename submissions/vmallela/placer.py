@@ -241,6 +241,13 @@ class IncrementalEvaluator:
         # float32 to match PlacementCost pin position precision
         self.pin_x = np.zeros(self.n_pins, dtype=np.float32)
         self.pin_y = np.zeros(self.n_pins, dtype=np.float32)
+        # v5 cells-skip cache: per-pin grid cell (row, col). Used by
+        # move_macro to detect whether a probe keeps all of a macro's pins in
+        # the same grid cells (in which case routing is invariant). Kept in
+        # sync with pin_x/pin_y: _update_pins_for_macro refreshes entries for
+        # pins of the moved macro; _recompute_pin_positions populates all.
+        self.pin_gcell_row = np.zeros(self.n_pins, dtype=np.int32)
+        self.pin_gcell_col = np.zeros(self.n_pins, dtype=np.int32)
         self._recompute_pin_positions()
 
         # --- Compute initial costs ---
@@ -275,7 +282,8 @@ class IncrementalEvaluator:
         self._undo = None
 
     def _recompute_pin_positions(self):
-        """Recompute all pin positions from macro positions + offsets."""
+        """Recompute all pin positions from macro positions + offsets.
+        Also refreshes pin_gcell_row/col for all pins (v5 cells-skip cache)."""
         for i in range(self.n_pins):
             m = self.pin_macro[i]
             if m >= 0:
@@ -284,17 +292,34 @@ class IncrementalEvaluator:
             else:
                 self.pin_x[i] = self.pin_xoff[i]
                 self.pin_y[i] = self.pin_yoff[i]
+        # Refresh grid-cell cache for all pins. Uses the same math.floor +
+        # clamp logic as __get_grid_cell_location; vectorized for bulk refresh.
+        r = np.floor(self.pin_y / self.grid_height).astype(np.int32)
+        c = np.floor(self.pin_x / self.grid_width).astype(np.int32)
+        np.clip(r, 0, self.grid_row - 1, out=r)
+        np.clip(c, 0, self.grid_col - 1, out=c)
+        self.pin_gcell_row[:] = r
+        self.pin_gcell_col[:] = c
 
     def _update_pins_for_macro(self, macro_idx):
         """Update pin positions for all pins belonging to a specific macro.
         Vectorized via precomputed macro_pins reverse index. Preserves original
         semantics: float32 macro_pos + float64 pin_xoff → float64 sum cast to
-        float32 on store into pin_x (matches PlacementCost)."""
+        float32 on store into pin_x (matches PlacementCost).
+
+        Also refreshes pin_gcell_row/col for these pins (v5 cells-skip cache)."""
         mx, my = self.macro_pos[macro_idx]
         pins = self.macro_pins[macro_idx]
         if pins.size:
             self.pin_x[pins] = mx + self.pin_xoff[pins]
             self.pin_y[pins] = my + self.pin_yoff[pins]
+            # Vectorized grid-cell recompute for the moved macro's pins only.
+            r = np.floor(self.pin_y[pins] / self.grid_height).astype(np.int32)
+            c = np.floor(self.pin_x[pins] / self.grid_width).astype(np.int32)
+            np.clip(r, 0, self.grid_row - 1, out=r)
+            np.clip(c, 0, self.grid_col - 1, out=c)
+            self.pin_gcell_row[pins] = r
+            self.pin_gcell_col[pins] = c
 
     # --- Wirelength ---
 
@@ -705,9 +730,16 @@ class IncrementalEvaluator:
         self.V_routing_smooth = temp_V.ravel()
         self.H_routing_smooth = temp_H.ravel()
 
-    def _recompute_congestion_cost(self):
-        """Recompute congestion from raw arrays: normalize, smooth, combine, ABU."""
-        self.__smooth_routing_cong()
+    def _recompute_congestion_cost(self, skip_smooth=False):
+        """Recompute congestion from raw arrays: normalize, smooth, combine, ABU.
+
+        skip_smooth: if True, reuse the already-stored V/H_routing_smooth
+        (caller guarantees V/H_routing_raw didn't change, so smoothing would
+        yield identical output). V/H_macro_raw changes independently and is
+        not smoothed — it's added in raw form — so top-k still needs to run.
+        """
+        if not skip_smooth:
+            self.__smooth_routing_cong()
 
         V_macro_norm = self.V_macro_raw / self.grid_v_routes
         H_macro_norm = self.H_macro_raw / self.grid_h_routes
@@ -805,21 +837,35 @@ class IncrementalEvaluator:
         self._full_recompute_congestion()
 
     def move_macro(self, macro_idx, new_x, new_y):
-        """Move a hard macro, incrementally update costs, return new proxy cost."""
+        """Move a hard macro, incrementally update costs, return new proxy cost.
+
+        v5 cells-skip optimization: routing (V/H_routing_raw) and its
+        smoothing (V/H_routing_smooth) are DISCRETE functions of pin grid
+        cells — they are invariant under any move that keeps all of this
+        macro's pins in the same grid cells. Blockage (V/H_macro_raw), HPWL,
+        and density are CONTINUOUS in the macro's exact position and always
+        update.
+
+        So: always update pins / HPWL / density / blockage. If and only if
+        any pin's grid cell changed, also unroute+reroute the affected nets
+        and re-smooth. This cuts ~300μs off probes that keep cells invariant
+        (~40-55% of probes in practice).
+        """
         old_x, old_y = self.macro_pos[macro_idx, 0], self.macro_pos[macro_idx, 1]
 
-        # Save undo state
+        # --- Undo state that's always needed ---
         affected_nets = self.macro_nets[macro_idx]
         old_net_hpwl = {nid: self.net_hpwl[nid] for nid in affected_nets}
         old_total_hpwl = self.total_hpwl
         old_wl_cost = self.wirelength_cost
 
-        # Save affected pin positions (O(pins_per_macro) via reverse index)
         affected_pins = self.macro_pins[macro_idx]
         old_pin_x = self.pin_x[affected_pins].copy()
         old_pin_y = self.pin_y[affected_pins].copy()
+        old_pin_gcell_row = self.pin_gcell_row[affected_pins].copy()
+        old_pin_gcell_col = self.pin_gcell_col[affected_pins].copy()
 
-        # Save density state (affected cells)
+        # Density undo (affected cells only — sparse)
         w, h = self.macro_w[macro_idx], self.macro_h[macro_idx]
         old_density_cells = {}
         if w > 0 and h > 0:
@@ -830,73 +876,92 @@ class IncrementalEvaluator:
                     old_density_cells[cell_idx] = self.grid_density[cell_idx]
         old_density_cost = self.density_cost
 
-        # Save congestion state (full arrays — 57KB, fast to copy)
-        old_V_routing = self.V_routing_raw.copy()
-        old_H_routing = self.H_routing_raw.copy()
+        # Blockage undo (always — blockage is continuous in position)
         old_V_macro = self.V_macro_raw.copy()
         old_H_macro = self.H_macro_raw.copy()
-        old_V_smooth = self.V_routing_smooth.copy()
-        old_H_smooth = self.H_routing_smooth.copy()
-        old_cong_cost = self.congestion_cost
-        old_net_routing_cache = {nid: list(self.net_routing_cache[nid]) for nid in affected_nets}
         old_macro_blockage = list(self.macro_blockage_cache.get(macro_idx, []))
+        old_cong_cost = self.congestion_cost
+
+        # --- Apply position change + refresh pin cells cache ---
+        self.macro_pos[macro_idx, 0] = np.float32(new_x)
+        self.macro_pos[macro_idx, 1] = np.float32(new_y)
+        self._update_pins_for_macro(macro_idx)
+
+        # --- Determine: did any pin of this macro change grid cell? ---
+        if affected_pins.size:
+            cells_changed = (not np.array_equal(
+                                old_pin_gcell_row, self.pin_gcell_row[affected_pins])
+                           ) or (not np.array_equal(
+                                old_pin_gcell_col, self.pin_gcell_col[affected_pins]))
+        else:
+            # No pins on this macro ⇒ can't affect any net's routing
+            cells_changed = False
+
+        # --- Routing undo state (only save if routing will change) ---
+        if cells_changed:
+            old_V_routing = self.V_routing_raw.copy()
+            old_H_routing = self.H_routing_raw.copy()
+            old_V_smooth = self.V_routing_smooth.copy()
+            old_H_smooth = self.H_routing_smooth.copy()
+            old_net_routing_cache = {nid: list(self.net_routing_cache[nid])
+                                     for nid in affected_nets}
+        else:
+            old_V_routing = old_H_routing = None
+            old_V_smooth = old_H_smooth = None
+            old_net_routing_cache = None
 
         self._undo = {
             'macro_idx': macro_idx,
             'old_x': old_x, 'old_y': old_y,
+            'cells_changed': cells_changed,
             'old_net_hpwl': old_net_hpwl,
             'old_total_hpwl': old_total_hpwl,
             'old_wl_cost': old_wl_cost,
             'affected_pins': affected_pins,
             'old_pin_x': old_pin_x,
             'old_pin_y': old_pin_y,
+            'old_pin_gcell_row': old_pin_gcell_row,
+            'old_pin_gcell_col': old_pin_gcell_col,
             'old_density_cells': old_density_cells,
             'old_density_cost': old_density_cost,
-            'old_V_routing': old_V_routing,
-            'old_H_routing': old_H_routing,
             'old_V_macro': old_V_macro,
             'old_H_macro': old_H_macro,
+            'old_cong_cost': old_cong_cost,
+            'old_macro_blockage': old_macro_blockage,
+            # Routing undo (None if cells_changed is False)
+            'old_V_routing': old_V_routing,
+            'old_H_routing': old_H_routing,
             'old_V_smooth': old_V_smooth,
             'old_H_smooth': old_H_smooth,
-            'old_cong_cost': old_cong_cost,
             'old_net_routing_cache': old_net_routing_cache,
-            'old_macro_blockage': old_macro_blockage,
         }
 
-        # Apply move (float32 to match plc precision)
-        self.macro_pos[macro_idx, 0] = np.float32(new_x)
-        self.macro_pos[macro_idx, 1] = np.float32(new_y)
-        self._update_pins_for_macro(macro_idx)
-
-        # Incremental wirelength + density
+        # --- Incremental wirelength + density (always) ---
         self._update_wl_for_nets(affected_nets)
         self._update_density_for_macro(macro_idx, old_x, old_y, new_x, new_y)
 
-        # Incremental congestion
-        # 1. Remove old net routing for affected nets
-        for nid in affected_nets:
-            self._unroute_net(nid)
+        # --- Routing: only update if any pin grid cell changed ---
+        if cells_changed:
+            for nid in affected_nets:
+                self._unroute_net(nid)
+            for nid in affected_nets:
+                self._route_net(nid)
 
-        # 2. Remove old macro blockage (hard macros only)
+        # --- Macro blockage (always; continuous in position) ---
         if macro_idx < self.n_hard:
             for flat, v_amt, h_amt in self.macro_blockage_cache.get(macro_idx, []):
                 self.V_macro_raw[flat] -= v_amt
                 self.H_macro_raw[flat] -= h_amt
-
-        # 3. Re-route affected nets with new pin positions
-        for nid in affected_nets:
-            self._route_net(nid)
-
-        # 4. Add new macro blockage
-        if macro_idx < self.n_hard:
             w_f, h_f = float(self.macro_w[macro_idx]), float(self.macro_h[macro_idx])
             if w_f > 0 and h_f > 0:
                 entries = self.__macro_route_over_grid_cell(
                     self.macro_pos[macro_idx, 0], self.macro_pos[macro_idx, 1], w_f, h_f)
                 self.macro_blockage_cache[macro_idx] = entries
+            else:
+                self.macro_blockage_cache[macro_idx] = []
 
-        # 5. Re-smooth and recompute congestion cost
-        self._recompute_congestion_cost()
+        # --- Congestion cost (always); skip re-smoothing if routing unchanged ---
+        self._recompute_congestion_cost(skip_smooth=not cells_changed)
 
         return self.get_proxy_cost()
 
@@ -912,11 +977,13 @@ class IncrementalEvaluator:
         self.macro_pos[macro_idx, 0] = u['old_x']
         self.macro_pos[macro_idx, 1] = u['old_y']
 
-        # Restore pin positions (arrays aligned with 'affected_pins' index array)
+        # Restore pin positions + gcell cache (arrays aligned with 'affected_pins').
         pins = u['affected_pins']
         if pins.size:
             self.pin_x[pins] = u['old_pin_x']
             self.pin_y[pins] = u['old_pin_y']
+            self.pin_gcell_row[pins] = u['old_pin_gcell_row']
+            self.pin_gcell_col[pins] = u['old_pin_gcell_col']
 
         # Restore wirelength
         for nid, hpwl in u['old_net_hpwl'].items():
@@ -929,17 +996,21 @@ class IncrementalEvaluator:
             self.grid_density[cell_idx] = val
         self.density_cost = u['old_density_cost']
 
-        # Restore congestion (swap arrays for O(1))
-        self.V_routing_raw[:] = u['old_V_routing']
-        self.H_routing_raw[:] = u['old_H_routing']
+        # Blockage (always changed, always restore).
         self.V_macro_raw[:] = u['old_V_macro']
         self.H_macro_raw[:] = u['old_H_macro']
-        self.V_routing_smooth[:] = u['old_V_smooth']
-        self.H_routing_smooth[:] = u['old_H_smooth']
-        self.congestion_cost = u['old_cong_cost']
-        for nid, cache in u['old_net_routing_cache'].items():
-            self.net_routing_cache[nid] = cache
         self.macro_blockage_cache[macro_idx] = u['old_macro_blockage']
+
+        # Routing state: only restore if cells_changed (we saved it then).
+        if u['cells_changed']:
+            self.V_routing_raw[:] = u['old_V_routing']
+            self.H_routing_raw[:] = u['old_H_routing']
+            self.V_routing_smooth[:] = u['old_V_smooth']
+            self.H_routing_smooth[:] = u['old_H_smooth']
+            for nid, cache in u['old_net_routing_cache'].items():
+                self.net_routing_cache[nid] = cache
+
+        self.congestion_cost = u['old_cong_cost']
 
         self._undo = None
 
