@@ -54,7 +54,7 @@ from _fd_soft import fd_soft_place
 from _soft_lns import soft_lns_phase
 from _per_net import per_net_optimize
 from _soft_surrogate_v2 import soft_cd_surrogate_v2, reset_surrogate_state
-from _moves import lns_destroy_repair_phase
+from _moves import lns_destroy_repair_phase, cluster_translate_phase
 from _warmstart import analytical_warmstart
 
 
@@ -359,10 +359,17 @@ class OptimalPlacer:
                         print(f"  [plateau] stop at cycle {cycle}", flush=True)
                         break
                     escape_budget = min(240, remaining * 0.5)
-                    hard_t = escape_budget * 0.5
-                    soft_t = escape_budget * 0.5
+                    # v5_cluster: env-gated cluster-translate as 3rd escape sub-phase.
+                    # Default 0.0 → identical to v5_combined (hard 50%, soft 50%).
+                    _esc_cluster_frac = float(os.environ.get('PLACER_ESC_CLUSTER_FRAC', '0.0'))
+                    _esc_cluster_frac = max(0.0, min(0.5, _esc_cluster_frac))
+                    hard_t = escape_budget * (0.5 - _esc_cluster_frac / 2)
+                    soft_t = escape_budget * (0.5 - _esc_cluster_frac / 2)
+                    cluster_t = escape_budget * _esc_cluster_frac
                     print(f"  [escape] plateau at {best_cost:.6f}, budget {escape_budget:.0f}s "
-                          f"(hard-cong {hard_t:.0f}s + soft {soft_t:.0f}s)", flush=True)
+                          f"(hard-cong {hard_t:.0f}s + soft {soft_t:.0f}s"
+                          f"{f' + cluster {cluster_t:.0f}s' if cluster_t > 0 else ''})",
+                          flush=True)
                     escaped = False
                     try:
                         # v4 winning: hard escape destroy=80 (validated), cand=60.
@@ -400,6 +407,22 @@ class OptimalPlacer:
                             print(f"  [escape.soft] OK at {best_cost:.6f}", flush=True)
                     except Exception as e:
                         print(f"  [escape.soft] err: {e}", flush=True)
+                    if cluster_t > 0:
+                        try:
+                            _cl_size = int(os.environ.get('PLACER_CLUSTER_MAX_SIZE', 6))
+                            p, c = cluster_translate_phase(
+                                best_pos, benchmark, incr_eval,
+                                max_time=cluster_t,
+                                max_cluster_size=_cl_size,
+                                verbose=False)
+                            if c < best_cost - 5e-5:
+                                best_cost, best_pos = c, p
+                                escaped = True
+                                print(f"  [escape.cluster] OK at {best_cost:.6f}", flush=True)
+                            else:
+                                print(f"  [escape.cluster] no improvement", flush=True)
+                        except Exception as e:
+                            print(f"  [escape.cluster] err: {e}", flush=True)
                     if escaped:
                         plateau = 0
                         cycle_t = max(30, cycle_t * 1.5)
