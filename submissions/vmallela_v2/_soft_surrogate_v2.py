@@ -87,6 +87,18 @@ class SurrogateSoftCD:
                         best_cost = best_dir_c
 
         # Main surrogate-guided phase
+        # v5 structured candidates: 8 cardinal+diagonal directions × 3 magnitudes
+        # = 24 candidates per macro, replacing 20 random-radial probes. Same MLP,
+        # but denser direction-coverage probe set with shared feature batch.
+        # Env-gated: PLACER_SURR_STRUCTURED=1 enables (default 0 = v4 behavior).
+        import os as _os
+        _structured = _os.environ.get("PLACER_SURR_STRUCTURED", "0") == "1"
+        _struct_dirs = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
+                        (0.7, 0.7), (-0.7, 0.7), (0.7, -0.7), (-0.7, -0.7)]
+        _struct_mags = [0.5, 1.0, 2.0]
+        # Top-K verified: structured uses 3 (denser candidate pool); v4 uses verify_top_k.
+        _struct_topk = int(_os.environ.get("PLACER_SURR_TOPK", 3))
+
         n_main = 0
         while time.time() - t0 < max_time:
             improved = False
@@ -98,24 +110,35 @@ class SurrogateSoftCD:
 
                 cand_positions = []
                 cand_feats = []
-                for _ in range(cand_per_macro):
-                    r = rng.choice([0.12, 0.25, 0.5, 1.0, 2.0])
-                    theta = rng.uniform(0, 2 * np.pi)
-                    nx = float(max(0, min(cw, ox + r * np.cos(theta))))
-                    ny = float(max(0, min(ch, oy + r * np.sin(theta))))
-                    if abs(nx - ox) < 1e-4 and abs(ny - oy) < 1e-4:
-                        continue
-                    cand_positions.append((nx, ny))
-                    cand_feats.append(self.logger.build_features(incr_eval, i, ox, oy, nx, ny))
+                if _structured:
+                    for r in _struct_mags:
+                        for dx, dy in _struct_dirs:
+                            nx = float(max(0, min(cw, ox + r * dx)))
+                            ny = float(max(0, min(ch, oy + r * dy)))
+                            if abs(nx - ox) < 1e-4 and abs(ny - oy) < 1e-4:
+                                continue
+                            cand_positions.append((nx, ny))
+                            cand_feats.append(self.logger.build_features(incr_eval, i, ox, oy, nx, ny))
+                else:
+                    for _ in range(cand_per_macro):
+                        r = rng.choice([0.12, 0.25, 0.5, 1.0, 2.0])
+                        theta = rng.uniform(0, 2 * np.pi)
+                        nx = float(max(0, min(cw, ox + r * np.cos(theta))))
+                        ny = float(max(0, min(ch, oy + r * np.sin(theta))))
+                        if abs(nx - ox) < 1e-4 and abs(ny - oy) < 1e-4:
+                            continue
+                        cand_positions.append((nx, ny))
+                        cand_feats.append(self.logger.build_features(incr_eval, i, ox, oy, nx, ny))
 
                 if not cand_positions:
                     continue
 
+                _topk = _struct_topk if _structured else verify_top_k
                 if self.model is not None:
                     preds, order = surrogate_rank_candidates(self.model, np.array(cand_feats))
-                    top_indices = list(order[:verify_top_k])
+                    top_indices = list(order[:_topk])
                 else:
-                    top_indices = list(range(min(verify_top_k, len(cand_positions))))
+                    top_indices = list(range(min(_topk, len(cand_positions))))
 
                 best_c = current_cost
                 best_nx, best_ny = None, None
