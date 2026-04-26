@@ -18,8 +18,42 @@ the last 4 h gated by user's "4 h then push and shutdown" constraint).
   | 32-way (Phase 1 v1) | INVALID | n/t | n/t | n/t | n/t |
   | 8-way (ssv2)        | INVALID | n/t | n/t | n/t | n/t |
   | 5-way (ssv3)        | INVALID | VALID 1.139 | VALID 1.095 | INVALID | VALID (cycle 2) |
-  | 2-way (last shot)   | n/t   | n/t   | n/t   | running | running |
+  | 2-way (last shot)   | n/t   | n/t   | n/t   | INVALID 1.7392 (legalize 905s, 231 ovl) | VALID 1.3149 |
+  | 1-way patched (CAP=1500) | n/t   | n/t   | n/t   | INVALID 1.7392 (legalize 909s) | (not run) |
   | single-process      | works (escape_test ibm01 600s → 0.8071 VALID) | | | | |
+
+  **ibm17 is unsalvageable on box2 at any concurrency, even with the
+  LEGALIZE_BUDGET cap raised from 600 → 1500.** The cap raise lets the
+  tournament *try* longer but the iteration count is limited (30 ot ×
+  4 sm × 5 starts = 600 _legalize calls). All 600 combos fail to produce
+  an overlap-free placement on ibm17 from the (push_apart × 3 + init +
+  warmstart) starting set. Not a budget issue — it's a starting-point /
+  algorithm-coverage issue. Would need: more push_apart configurations,
+  a different legalize ring algorithm, or a different warmstart that
+  produces a near-legal solution.
+
+  ibm12 likely shows the same pattern. ibm15/16/18 work because their
+  legalize tournament finds a valid candidate within the iteration budget.
+
+### last_shot results (2-way v5_cluster, seed 42)
+
+  - ibm17: INVALID 1.7392 (legalize 905s, 231 overlaps)
+  - ibm18: VALID **1.3149** at wall 3348s — 47 SA cycles + 3 escape phases.
+    Box1 v5_cells_skip ibm18 = 1.2835. **Ours is 2.4% worse**, same
+    direction as ssv3 ibm15/ibm16 — config underperforms baseline on this
+    hardware.
+
+### Bottom-line score
+
+| metric | value |
+|--------|-------|
+| Best confirmed reproducible mean | **1.0046** (box1 v5_cells_skip seed 42) |
+| Box2 contributions | (–) cluster30_plateau2 ruled out as regression |
+|                    | (–) cluster_translate config 2-3% worse on ibm15/16/18 |
+|                    | (+) AVX-512 throttle bug diagnosed, workaround patch shipped |
+|                    | (+) Pure-Python flip optimizer (`flip_v2.py`) shipped, gains tiny on ICCAD04 |
+|                    | (+) `LEGALIZE_BUDGET` cap raise patch (`v5_box2_legalize_cap.patch`) — useful on Skylake-SP |
+| Sub-1.0 achieved   | **No** |
 
   The failure mode on hard benches is identical across concurrencies:
   `[legalize] Xs cost=inf → INVALID (N overlaps)`. Legalize tournament
