@@ -49,11 +49,29 @@ the last 4 h gated by user's "4 h then push and shutdown" constraint).
 |--------|-------|
 | Best confirmed reproducible mean | **1.0046** (box1 v5_cells_skip seed 42) |
 | Box2 contributions | (–) cluster30_plateau2 ruled out as regression |
-|                    | (–) cluster_translate config 2-3% worse on ibm15/16/18 |
+|                    | (–) cluster_translate config consistently 2-4% worse than v5_cells_skip on every hard bench we got VALID data for (ibm14/15/16/18) |
 |                    | (+) AVX-512 throttle bug diagnosed, workaround patch shipped |
 |                    | (+) Pure-Python flip optimizer (`flip_v2.py`) shipped, gains tiny on ICCAD04 |
 |                    | (+) `LEGALIZE_BUDGET` cap raise patch (`v5_box2_legalize_cap.patch`) — useful on Skylake-SP |
 | Sub-1.0 achieved   | **No** |
+
+### All VALID box2 cost values vs box1 v5_cells_skip baseline
+
+| bench | box2 (v5_cluster + variants) | box1 (v5_cells_skip s=42) | delta |
+|-------|------------------------------|---------------------------|-------|
+| ibm14 | 1.1504 (patched single-process) | 1.1162 | +3.06% |
+| ibm15 | 1.139, 1.120 (ssv3 5-way s=43,44) | 1.0877 | +3.0–4.7% |
+| ibm16 | 1.094, 1.094 (ssv3 5-way s=43,44) | 1.0583 | +3.3% |
+| ibm18 | 1.3149 (last_shot 2-way) | 1.2835 | +2.45% |
+| ibm12 | INVALID (every concurrency) | 1.1499 | n/a |
+| ibm17 | INVALID (every concurrency, even patched single-process) | 1.2767 | n/a |
+
+**Verdict on cluster_translate config**: on every bench where we got VALID
+data, it underperforms `v5_cells_skip` by 2–5%. The cluster-translate
+escape phase did fire (logged as `[escape.cluster] OK at X`) and did
+sometimes improve cost, but the *overall* trajectory of the placer with
+this config lands above the cells_skip default. Confirmed regression —
+do not ship.
 
   The failure mode on hard benches is identical across concurrencies:
   `[legalize] Xs cost=inf → INVALID (N overlaps)`. Legalize tournament
