@@ -1,0 +1,26 @@
+# v5_box2 placer patch: raise LEGALIZE_BUDGET cap.
+#
+# Motivation: Skylake-SP (Xeon Gold 6130) per-thread is ~3-5x slower than box1
+# (Zen 5) under any multi-process AVX-512 load. ibm12/ibm17 legalize tournament
+# needs 900-1100s wall to find a valid candidate; original cap = 600s makes
+# them deterministically INVALID at every concurrency tested (32-way / 8-way
+# / 5-way / 2-way).
+#
+# Patch: add PLACER_LEGALIZE_CAP env var, default 1500 (was hard-coded 600).
+# Apply against submissions/vmallela_v2/placer.py at line ~74.
+
+--- placer.py.orig
++++ placer.py
+@@ -71,7 +71,11 @@ class OptimalPlacer:
+         self.SOFT_PHASE_BUDGET = int(os.environ.get("PLACER_SOFT_BUDGET",
+                                                      self.TOTAL_TIME_LIMIT * 3 // 5))
+         self.PARALLEL_WORKERS = int(os.environ.get("PLACER_PARALLEL_WORKERS", 0))
+-        self.LEGALIZE_BUDGET = max(60, min(600, self.TOTAL_TIME_LIMIT // 5))
++        # Box2 patch: cap raised from 600 to PLACER_LEGALIZE_CAP (default 1500).
++        # Reason: Skylake-SP per-thread is slow enough that ibm12/17 legalize
++        # tournament needs ~900-1100s. Box1 (Zen 5) doesn't need this.
++        _legalize_cap = int(os.environ.get("PLACER_LEGALIZE_CAP", 1500))
++        self.LEGALIZE_BUDGET = max(60, min(_legalize_cap, self.TOTAL_TIME_LIMIT // 5))
+
+# Backwards compatible: PLACER_LEGALIZE_CAP defaults to 1500. To restore
+# original behavior, set PLACER_LEGALIZE_CAP=600.
