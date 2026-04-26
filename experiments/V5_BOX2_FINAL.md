@@ -73,6 +73,38 @@ sometimes improve cost, but the *overall* trajectory of the placer with
 this config lands above the cells_skip default. Confirmed regression —
 do not ship.
 
+## Chronological experiment log (every attempt this session)
+
+| time UTC | experiment | concurrency | budget | bench(es) | seed(s) | outcome |
+|----------|-----------|-------------|--------|-----------|---------|---------|
+| 22:21 | smoke_test ibm01 (v5_combined env) | single | 30s | ibm01 | 42 | ok cost=1.0385 INVALID (expected, budget too short) |
+| 22:21 | smoke_cluster ibm01 (cluster_translate verify) | single | 30s | ibm01 | 42 | ok cost=1.0385 INVALID (verifies cluster_translate doesn't crash) |
+| 22:27 | **Phase 1 v1**: paired multi-seed sweep (v5_combined+v5_cluster) | **32-way** | 3300s | all 17 | 42–46 | **BROKEN**. 4 INVALID rows produced (cost 1.3397/1.7392 deterministic fallback) before kill. Root cause: AVX-512 all-cores throttle on Xeon Gold 6130. |
+| 23:01 | avx2_test ibm10 (single-process diagnostic) | single | 600s | ibm10 | 42 | killed at 12 min, no log past `ibm10...` (legalize hung; see also patched_ibm17 finding — iter exhaustion) |
+| 23:14 | **escape_test ibm01** (validate placer works at all) | single | 600s | ibm01 | 42 | **VALID cost=0.8071** ← confirmed placer works at single-process |
+| 23:18 | concurrency_test ibm10 × 16 (16-way diagnostic) | 16-way | 300s | ibm10 | 50–67 | killed; all stuck in legalize past 5+ min (16-way also broken on hard benches) |
+| 23:26 | **Phase 1 v3**: 8-way v5_cluster ×4 seeds | 8-way | 3300s | all 17 | 42–45 | killed after launch when user pivoted to smart-search |
+| 23:30 | **smart-search v1**: 4-config × 3 hard × 2 seeds | 8-way | 3300s | ibm12/17/18 | 42,43 | killed when user accepted swap to smart-search v2 |
+| 23:44 | **smart-search ssv2 (v2)**: cluster30_plateau2 × 4 seeds × 5 hard | 8-way | 3300s | ibm12/15/16/17/18 | 42–45 | **BROKEN**. 8-way still triggers throttle. ibm12 INVALID at legalize 718s |
+| 00:00 | **smart-search ssv3 (v3)**: same config × 3 seeds | **5-way** | 3300s | ibm12/15/16/17/18 | 42,43,44 | partial: ibm12/17 INVALID at every seed; ibm15/16/18 produced VALID but 2-5% worse than box1 v5_cells_skip |
+| 01:14 | flip_optimizer.py (slow, PlacementCost-based) | single | n/a | ibm01 | n/a | killed at 12 min — too slow (60+ min/bench) |
+| 01:19 | flip_v2.py (pure-Python HPWL evaluator) | single | n/a | ibm01,ibm17 | n/a | works fast (<1s/pass); HPWL reductions tiny (0.06–0.19% on TILOS baselines) |
+| 01:24 | **flip_v2 on all 17 ICCAD04 TILOS initials** | parallel single | n/a | all 17 | n/a | works; **mean HPWL reduction +0.55%** (best ibm08 +2.34%, worst ibm18 +0.07%). Saved per-bench logs to `flipped_logs/`. Proxy reduction <0.001 absolute — too small for sub-1.0 unlock. |
+| 01:31 | **last_shot**: 2-way v5_cluster ibm17+ibm18 | 2-way | 3300s | ibm17,ibm18 | 42 | ibm17 INVALID (legalize 905s), ibm18 **VALID 1.3149** (vs box1 1.2835, +2.4%) |
+| 02:08 | (paused for upstream sync — orientation flip news) | — | — | — | — | confirmed orientation flips allowed via orientations.pt sidecar; flip_v2 already shipped |
+| 02:27 | **patched_ibm17**: single-process LEGALIZE_CAP=1500 patch | single | 3300s | ibm17 | 42 | **INVALID** — legalize 909s cost=inf. Cap raise didn't help; iteration count (30×4×5=600 _legalize calls) exhausted with no valid candidate. ibm17 fundamentally unsalvageable from current placer's starting points on this hardware. |
+| 02:44 | **patched_ibm14**: single-process LEGALIZE_CAP=1500 | single | 3300s | ibm14 | 42 | **VALID 1.1504** (vs box1 v5_cells_skip 1.1162, +3.06% worse). Same regression pattern as ibm15/16/18. |
+
+### Things I did NOT try (and why)
+
+- **Single-process sequential 17-bench sweep**: 17 × 55 min = 15.6 h, far over any time budget.
+- **2-way ibm12 + ibm17 in parallel**: would re-trigger AVX-512 throttle (we have data showing 2-way breaks ibm17 alone).
+- **v5_cells_skip on box2 at multi-seed**: would just duplicate box1's results without producing new info, since cells_skip on box2 single-process likely produces ~same per-bench costs as box1.
+- **Different placer starting points (patched push_apart, alt warmstart)**: would require code change to placer.py's `pushed_positions` set. No time to design + verify safely.
+- **`gradient_step_phase()` orphan code wire-up**: explore agent flagged this as a "next cluster_translate-style unlock" but wiring an untested function in 2.5h was too risky.
+- **NG45 designs (ariane133, nvdla, mempool_tile)**: would benefit much more from orientation flips (large SRAM blocks vs ICCAD04's small gate primitives). Out of scope this session.
+- **Increasing `_COMPETITION_CAP_SECONDS` past 3300**: would invalidate competition submissions; not a real option.
+
   The failure mode on hard benches is identical across concurrencies:
   `[legalize] Xs cost=inf → INVALID (N overlaps)`. Legalize tournament
   cannot find a valid candidate within its 660 s budget cap because each
