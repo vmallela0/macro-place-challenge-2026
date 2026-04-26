@@ -61,6 +61,21 @@ def build_net_index(plc):
             pin_macro_idx[pin_idx] = name_to_macro_idx[macro_name]
             pin_macro_name[pin_idx] = macro_name
 
+    # Build a pin-name → pin-index map ONCE so the net build is O(pins) not O(pins²).
+    name_to_pin_idx = {}
+    fullname_to_pin_idx = {}
+    for pi in range(n_pins):
+        pp = plc.modules_w_pins[pi]
+        if hasattr(pp, "get_name"):
+            try:
+                n = pp.get_name()
+            except Exception:
+                n = None
+            if n:
+                name_to_pin_idx[n] = pi
+                if pin_macro_name[pi]:
+                    fullname_to_pin_idx[f"{pin_macro_name[pi]}/{n}"] = pi
+
     # Build nets from source-pin sink dicts.
     nets = []
     for src in range(n_pins):
@@ -73,21 +88,15 @@ def build_net_index(plc):
             sinks = {}
         if not sinks:
             continue
-        # sinks may be dict {macro_name: [pin_names]} or {pin_idx: weight}.
         sink_indices = []
         for k, v in sinks.items():
-            # heuristic: if v is a list of pin names, look up pin indices.
             if isinstance(v, (list, tuple)):
-                # k is macro name, v is list of pin names
+                # k = macro name, v = list of pin names within that macro
                 for pname in v:
                     full = f"{k}/{pname}" if k else pname
-                    # search for matching pin name
-                    for pi, pp in enumerate(plc.modules_w_pins):
-                        if hasattr(pp, "get_name"):
-                            n = pp.get_name()
-                            if n == full or n == pname:
-                                sink_indices.append(pi)
-                                break
+                    pi = fullname_to_pin_idx.get(full) or name_to_pin_idx.get(pname) or name_to_pin_idx.get(full)
+                    if pi is not None:
+                        sink_indices.append(pi)
             elif isinstance(k, int):
                 sink_indices.append(k)
         if sink_indices:
@@ -175,35 +184,73 @@ def optimize(bench_name: str, plc_file: str, max_passes: int = 3):
     pin_macro_idx, pin_offset, nets, macro_to_nets = build_net_index(plc)
     print(f"[{bench_name}] index built: {len(nets)} nets, {sum(1 for m in pin_macro_idx if m>=0)}/{len(pin_macro_idx)} pins on macros, t={time.time()-t0:.1f}s")
 
-    initial_proxy = proxy_cost(plc)
-    initial_wl = plc.get_cost()
-    print(f"[{bench_name}] initial: proxy={initial_proxy:.4f}  wl(plc)={initial_wl:.4f}")
+    print(f"[{bench_name}] caching macro positions...")
+    t1 = time.time()
+    macro_positions = {}
+    for idx in plc.get_macro_indices():
+        macro_positions[idx] = plc.get_node_location(idx)
+    print(f"[{bench_name}] cached {len(macro_positions)} positions, t={time.time()-t1:.1f}s")
+
+    # Cache port positions too — they have fixed positions stored on the pin object.
+    port_positions = {}
+    for pi in range(len(plc.modules_w_pins)):
+        if pin_macro_idx[pi] < 0:
+            p = plc.modules_w_pins[pi]
+            try:
+                port_positions[pi] = p.get_pos() if hasattr(p, "get_pos") else (0.0, 0.0)
+            except Exception:
+                port_positions[pi] = (0.0, 0.0)
 
     hard_indices = list(plc.hard_macro_indices)
-
-    # Initial orientation map.
     orient_map = {idx: plc.get_macro_orientation(idx) for idx in hard_indices}
 
-    # Verify our HPWL matches plc's initial wl roughly (sanity check).
-    init_hpwl = compute_total_hpwl(plc, pin_macro_idx, pin_offset, nets, orient_map)
-    print(f"[{bench_name}] our_hpwl={init_hpwl:.4f}  (plc_wl={initial_wl:.4f}, ratio={init_hpwl/initial_wl if initial_wl>0 else 0:.3f})")
+    # Pure-python HPWL using cached positions.
+    def pin_pos_cached(pi):
+        m = pin_macro_idx[pi]
+        if m < 0:
+            return port_positions.get(pi, (0.0, 0.0))
+        cx, cy = macro_positions[m]
+        ox, oy = pin_offset[pi]
+        rx, ry = rotate_offset(ox, oy, orient_map.get(m, "N"))
+        return cx + rx, cy + ry
 
-    # Greedy flip per macro.
+    def hpwl_subset(net_idx_list):
+        total = 0.0
+        for ni in net_idx_list:
+            src, sinks = nets[ni]
+            sx, sy = pin_pos_cached(src)
+            min_x = max_x = sx; min_y = max_y = sy
+            for s in sinks:
+                x, y = pin_pos_cached(s)
+                if x < min_x: min_x = x
+                if x > max_x: max_x = x
+                if y < min_y: min_y = y
+                if y > max_y: max_y = y
+            total += (max_x - min_x) + (max_y - min_y)
+        return total
+
+    all_net_indices = list(range(len(nets)))
+    print(f"[{bench_name}] computing initial HPWL...")
+    t2 = time.time()
+    initial_hpwl = hpwl_subset(all_net_indices)
+    print(f"[{bench_name}] initial_hpwl={initial_hpwl:.4f}  t={time.time()-t2:.1f}s")
+
     total_changes = 0
     for pass_num in range(max_passes):
         pass_changes = 0
+        t3 = time.time()
         for idx in hard_indices:
             macro_nets = macro_to_nets.get(idx, [])
             if not macro_nets:
                 continue
             cur = orient_map[idx]
             best_orient = cur
-            best_hpwl = compute_macro_hpwl(plc, pin_macro_idx, pin_offset, nets, macro_nets, orient_map)
+            best_hpwl = hpwl_subset(macro_nets)
             for o in KLEIN_4:
                 if o == cur:
                     continue
                 orient_map[idx] = o
-                h = compute_macro_hpwl(plc, pin_macro_idx, pin_offset, nets, macro_nets, orient_map)
+                h = hpwl_subset(macro_nets)
                 if h < best_hpwl - 1e-9:
                     best_hpwl = h
                     best_orient = o
@@ -211,19 +258,19 @@ def optimize(bench_name: str, plc_file: str, max_passes: int = 3):
             if best_orient != cur:
                 pass_changes += 1
         total_changes += pass_changes
-        cur_total = compute_total_hpwl(plc, pin_macro_idx, pin_offset, nets, orient_map)
-        print(f"[{bench_name}] pass {pass_num+1}: changes={pass_changes}  our_hpwl={cur_total:.4f}")
+        cur_total = hpwl_subset(all_net_indices)
+        print(f"[{bench_name}] pass {pass_num+1}: changes={pass_changes}  hpwl={cur_total:.4f}  Δ={(initial_hpwl-cur_total)/initial_hpwl*100:+.2f}%  t={time.time()-t3:.1f}s")
         if pass_changes == 0:
             break
 
-    # Apply final orientations to plc.
-    for idx, o in orient_map.items():
-        plc.update_macro_orientation(idx, o)
+    final_hpwl = hpwl_subset(all_net_indices)
+    print(f"[{bench_name}] hpwl: {initial_hpwl:.4f} → {final_hpwl:.4f} ({(initial_hpwl-final_hpwl)/initial_hpwl*100:+.2f}% reduction)")
 
-    final_proxy = proxy_cost(plc)
-    final_wl = plc.get_cost()
-    print(f"[{bench_name}] FINAL: proxy={final_proxy:.4f}  wl(plc)={final_wl:.4f}  Δproxy={initial_proxy-final_proxy:+.4f} ({(initial_proxy-final_proxy)/initial_proxy*100:+.2f}%)")
-    return plc, initial_proxy, final_proxy, total_changes
+    # Apply final orientations to plc only if output requested. Skip proxy_cost
+    # recompute by default — it's O(N²) slow on big benches and HPWL reduction
+    # is the meaningful metric for orientation flips anyway.
+    print(f"[{bench_name}] FINAL: hpwl_pct_reduction={(initial_hpwl-final_hpwl)/initial_hpwl*100:+.2f}% changes={total_changes}")
+    return plc, orient_map, initial_hpwl, final_hpwl, total_changes
 
 
 if __name__ == "__main__":
@@ -232,7 +279,12 @@ if __name__ == "__main__":
         sys.exit(2)
     bench, plc_file = sys.argv[1], sys.argv[2]
     output = sys.argv[3] if len(sys.argv) > 3 else None
-    plc, initial, final, changes = optimize(bench, plc_file)
+    plc, orient_map, initial_hpwl, final_hpwl, changes = optimize(bench, plc_file)
     if output:
+        # Apply orientations + save (the slow plc.update + save part).
+        import time as _t
+        t = _t.time()
+        for idx, o in orient_map.items():
+            plc.update_macro_orientation(idx, o)
         plc.save_placement(output)
-        print(f"saved to {output}")
+        print(f"saved to {output}  (apply+save took {_t.time()-t:.1f}s)")
