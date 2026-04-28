@@ -7,20 +7,21 @@ Algorithm
     → hard CD → per-net step → hard LNS → soft cycles → escape basin) at a
     different RNG seed.
 3.  One worker (the "GPU worker") swaps the hard-CD step for `gpu_mass_cd`
-    backed by `MLXBatchEvaluator` — exact HPWL+density (matches PlacementCost
+    backed by `TorchBatchEvaluator` — exact HPWL+density (matches PlacementCost
     to <=1e-7) plus an approximate frozen-routing congestion (~6e-3 ranking
-    error, validated on CPU on commit). The GPU eval delivers ~250k
-    proposal-scores per second on Apple M5 Pro, vs ~3.7k on the CPU
-    IncrementalEvaluator.
+    error, validated on CPU on commit). Cross-macro batched: one GPU dispatch
+    per delta level covers all movable macros × K candidates each.
 4.  After all workers finish, take the lowest-cost overlap-free result.
 
 Why this maps to the grader machine
 -----------------------------------
-The competition grader is a 16-core AMD EPYC 9655P + RTX 6000 Ada. The
-n_workers default of 8 leaves 8 cores for the OS + grader overhead. The GPU
-side is currently MLX/Metal — an x86+CUDA grader will fall back transparently
-to the CPU v4 path on the GPU worker via the try/except fallback in
-`_portfolio._gpu_cd_wrapper`.
+Grader: 16-core AMD EPYC 9655P + 100 GB RAM + NVIDIA RTX 6000 Ada 48 GB
+(per `COMPETITION.md`). `TorchBatchEvaluator` auto-selects ``cuda`` on the
+grader (~91 TFLOPS FP32) and ``mps`` on M-series Macs (~7.4 TFLOPS via
+torch.MPS). The default `PLACER_V6_WORKERS=8` saturates 8 cores per
+benchmark and leaves 8 for the OS + grader harness + GPU driver. The MLX
+backend (`_mlx_eval.py`) is kept for reference but no longer in the
+submission path.
 """
 from __future__ import annotations
 import os

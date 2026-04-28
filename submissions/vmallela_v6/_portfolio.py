@@ -9,9 +9,11 @@ in `submissions/vmallela_v2/run.sh`). Per the v4 HANDOFF.md, multi-worker
 portfolio is the highest-EV unspent lever (-0.005 to -0.015 estimated). This
 file wires it.
 
-We also mix in one GPU-augmented worker that uses MLXBatchEvaluator for an
-extra hard-CD phase. The MLX context is per-process; this isolates the GPU
-client so that GPU exceptions on one worker don't take down the others.
+We also mix in one GPU-augmented worker that uses TorchBatchEvaluator for an
+extra hard-CD phase. The torch context is per-process; this isolates the GPU
+client so that GPU exceptions on one worker don't take down the others. Backend
+is auto-selected (cuda > mps > cpu), so the same code runs on the grader's
+RTX 6000 Ada (CUDA) and the M5 Pro dev box (MPS).
 """
 from __future__ import annotations
 import os
@@ -66,7 +68,7 @@ def _worker_v4_with_seed(args):
     if use_gpu:
         try:
             from _gpu_cd import gpu_mass_cd
-            from _mlx_eval import MLXBatchEvaluator
+            from _torch_eval import TorchBatchEvaluator
             # Access v1 evaluator+_coord_descent through the v2 placer's module
             # references and patch the hard-CD function. We add a wrapper that
             # tries gpu_mass_cd first, then falls back to the original CPU CD
@@ -86,13 +88,13 @@ def _worker_v4_with_seed(args):
                                        max_time=max_time,
                                        sa_T0=sa_T0, sa_cooling=sa_cooling,
                                        sa_rng_seed=sa_rng_seed)
-                    gpu = MLXBatchEvaluator(incr_eval, benchmark)
+                    gpu = TorchBatchEvaluator(incr_eval, benchmark)
                     gpu_budget = max_time * 0.7
                     cpu_budget = max_time - gpu_budget - 1.0
                     pos1, _c = gpu_mass_cd(
                         pos_np.copy(), benchmark, plc_eval,
                         incr_eval=incr_eval, gpu_eval=gpu,
-                        max_time=gpu_budget, K=384,
+                        max_time=gpu_budget, K=32,
                         sa_T0=sa_T0, sa_cooling=sa_cooling,
                         seed=(sa_rng_seed or 0))
                     if cpu_budget <= 1.0:
