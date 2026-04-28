@@ -81,22 +81,48 @@ def _bfs_destroy_set(seed, incr_eval, movable, n_hard, n_destroy, rng):
 
 
 def _generate_shared_candidates(destroy_set, pos_np, incr_eval, n_hard,
-                                K, half_w, half_h, cw, ch, rng):
-    """Produce K shared candidate positions across the canvas.
+                                K, half_w, half_h, cw, ch, rng,
+                                sizes=None, jitter_sigma_frac=1.5):
+    """Produce K shared candidate positions clustered around the destroy
+    set's current positions and net-centroids, where free space is most
+    likely to exist.
 
-    Composition (heuristic; total = K):
-      - n_destroy positions: each macro's *current* position (so Hungarian
-        can choose to keep it).
-      - K_centroid: net-centroid of each destroy-set macro plus jitter.
-      - K_uniform: uniform random over canvas.
+    Composition (total = K):
+      - n_destroy: each destroy-macro's *current* position (definitely
+        feasible).
+      - K_jitter: small-jitter candidates around each destroy-macro's
+        current position (sigma proportional to that macro's size).
+      - K_centroid: net-centroid of each destroy-macro plus jitter.
+
+    We deliberately drop uniform-canvas candidates: on dense benchmarks
+    (ibm10/12/14, hundreds of fixed macros), uniform candidates are almost
+    always overlapping a fixed macro and force Hungarian into +inf entries.
+    Clustering near destroy-set positions guarantees most candidates are
+    feasible, since the destroy-set members were already feasible.
     """
     n_destroy = len(destroy_set)
     cands = []
-    # 1) current positions of destroy set (so "keep" is a valid choice).
+    # 1) Current positions (keep is always feasible).
     for m in destroy_set:
         cands.append((float(pos_np[m, 0]), float(pos_np[m, 1])))
-    # 2) Net-centroid jittered candidates per destroy-set macro.
-    K_centroid_per = max(2, (K // 4) // max(1, n_destroy))
+
+    # 2) Per-destroy-macro small-jitter candidates.
+    # Total budget for this section: ~ 60% of K.
+    K_jitter_per = max(4, int((0.6 * K) // max(1, n_destroy)))
+    for m in destroy_set:
+        if sizes is not None:
+            sigma = float(jitter_sigma_frac * max(sizes[m, 0], sizes[m, 1]))
+        else:
+            sigma = jitter_sigma_frac * 0.5
+        cx0 = float(pos_np[m, 0])
+        cy0 = float(pos_np[m, 1])
+        for _ in range(K_jitter_per):
+            jx = rng.normal(0.0, sigma)
+            jy = rng.normal(0.0, sigma)
+            cands.append((cx0 + jx, cy0 + jy))
+
+    # 3) Net-centroid candidates + jitter.
+    K_centroid_per = max(2, (K - len(cands)) // max(1, n_destroy))
     for m in destroy_set:
         cx_sum = cy_sum = 0.0
         cnt = 0
@@ -114,9 +140,16 @@ def _generate_shared_candidates(destroy_set, pos_np, incr_eval, n_hard,
             jx = rng.uniform(-1.5, 1.5)
             jy = rng.uniform(-1.5, 1.5)
             cands.append((cx_sum + jx, cy_sum + jy))
-    # 3) Uniform-random candidates filling the rest.
+
+    # 4) Top up with more small-jitter (in case earlier sections under-filled).
     while len(cands) < K:
-        cands.append((rng.uniform(0.0, cw), rng.uniform(0.0, ch)))
+        m = destroy_set[rng.randint(0, n_destroy)]
+        sigma = (float(jitter_sigma_frac * max(sizes[m, 0], sizes[m, 1]))
+                 if sizes is not None else jitter_sigma_frac * 0.5)
+        cx0 = float(pos_np[m, 0])
+        cy0 = float(pos_np[m, 1])
+        cands.append((cx0 + rng.normal(0.0, sigma),
+                      cy0 + rng.normal(0.0, sigma)))
     cands = cands[:K]
     return np.asarray(cands, dtype=np.float32)
 
@@ -178,10 +211,12 @@ def hungarian_lns_phase(pos_np, benchmark, incr_eval, gpu_eval, max_time,
         if n_d < 2:
             continue
 
-        # 2. Generate shared K candidate positions.
+        # 2. Generate shared K candidate positions (clustered around the
+        #    destroy set, where free space is most likely).
         candidates = _generate_shared_candidates(
             destroy_set, pos, incr_eval, n_hard, K,
-            half_w, half_h, cw, ch, rng)
+            half_w, half_h, cw, ch, rng,
+            sizes=sizes, jitter_sigma_frac=1.5)
         # Clip to per-macro canvas: since each row uses a different macro's
         # half-extent, we can't pre-clip uniformly. We'll filter infeasible
         # (out-of-canvas) entries by setting their cost matrix entry to +inf
@@ -207,17 +242,42 @@ def hungarian_lns_phase(pos_np, benchmark, incr_eval, gpu_eval, max_time,
         # Mark out-of-canvas entries as +inf so Hungarian skips them.
         C[~in_canvas] = 1e9
 
+        # Mask candidates that overlap any NON-destroy macro for each row.
+        # For each row i: candidate j is feasible iff macro destroy_set[i]
+        # at candidate j doesn't overlap any non-destroy macro.
+        non_destroy_mask = np.ones(n_hard, dtype=bool)
+        non_destroy_mask[m_arr] = False
+        non_destroy_pos = pos[non_destroy_mask]   # (F, 2)
+        non_destroy_w = sizes[non_destroy_mask, 0]
+        non_destroy_h = sizes[non_destroy_mask, 1]
+        for i, mi in enumerate(destroy_set):
+            sx = (sizes[mi, 0] + non_destroy_w) / 2.0 + gap   # (F,)
+            sy = (sizes[mi, 1] + non_destroy_h) / 2.0 + gap   # (F,)
+            # Vectorized over candidates: compute |cand_x[j] - non_destroy_pos[f, 0]|
+            # and check overlap. Shape: (K, F)
+            ddx = np.abs(cand_x[:, None] - non_destroy_pos[None, :, 0])
+            ddy = np.abs(cand_y[:, None] - non_destroy_pos[None, :, 1])
+            ov = (ddx < sx[None, :]) & (ddy < sy[None, :])  # (K, F)
+            infeasible_j = ov.any(axis=1)                     # (K,)
+            C[i, infeasible_j] = 1e9
+
         # 4. Solve linear sum assignment.
         try:
             row_idx, col_idx = linear_sum_assignment(C)
         except ValueError:
             continue  # no feasible assignment
 
-        # row_idx is just np.arange(n_d); col_idx[i] is chosen candidate index
+        # If Hungarian had to use +inf entries (all candidates infeasible
+        # for some row), the assignment is unusable.
+        chosen_costs = C[row_idx, col_idx]
+        if (chosen_costs >= 1e8).any():
+            n_infeasible += 1
+            continue
+
         chosen = candidates[col_idx]  # (n_d, 2)
 
-        # 5. Joint feasibility + commit.
-        # First, check no two destroy macros overlap each other at chosen positions.
+        # 5. Joint within-destroy feasibility check (non-destroy already
+        # handled in the cost matrix above).
         overlap_within = False
         for i in range(n_d):
             xi, yi = chosen[i, 0], chosen[i, 1]
@@ -231,25 +291,6 @@ def hungarian_lns_phase(pos_np, benchmark, incr_eval, gpu_eval, max_time,
             if overlap_within:
                 break
         if overlap_within:
-            n_infeasible += 1
-            continue
-
-        # Check no chosen position overlaps a non-destroy-set macro.
-        destroy_set_arr = np.asarray(destroy_set)
-        non_destroy_mask = np.ones(n_hard, dtype=bool)
-        non_destroy_mask[destroy_set_arr] = False
-        overlap_outside = False
-        for i in range(n_d):
-            mi = destroy_set[i]
-            xi, yi = chosen[i, 0], chosen[i, 1]
-            ddx = np.abs(xi - pos[non_destroy_mask, 0])
-            ddy = np.abs(yi - pos[non_destroy_mask, 1])
-            sx = (sizes[mi, 0] + sizes[non_destroy_mask, 0]) / 2 + gap
-            sy = (sizes[mi, 1] + sizes[non_destroy_mask, 1]) / 2 + gap
-            if ((ddx < sx) & (ddy < sy)).any():
-                overlap_outside = True
-                break
-        if overlap_outside:
             n_infeasible += 1
             continue
 

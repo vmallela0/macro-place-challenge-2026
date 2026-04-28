@@ -114,6 +114,13 @@ def _worker_v4_with_seed(args):
 
             v1._coord_descent = _gpu_cd_wrapper
             mod._coord_descent = _gpu_cd_wrapper
+
+            # T1.2 (Hungarian LNS repair) was explored and killed by smoke
+            # test — see _hungarian_lns.py docstring and EXPERIMENTS.md.
+            # On ibm10 at 300s, v4 greedy LNS reached 1.272 while Hungarian
+            # reached 1.298 (96% infeasibility on dense layouts). v4 LNS is
+            # retained on every worker (CPU and GPU). The Hungarian module
+            # ships for reference / future revival on sparse benchmarks.
         except Exception as e:
             print(f"{log_prefix}  GPU init err: {e}, no-GPU fallback", flush=True)
             use_gpu = False

@@ -73,7 +73,34 @@ Three substantive additions:
    the critical correctness property: the GPU's frozen-routing congestion
    approximation can never poison the placement.
 
-3. **Multi-process portfolio** (`_portfolio.py`, ~150 lines). Spawns N
+3. **Hungarian LNS repair** — **explored and killed by smoke test**.
+   Implementation lives at `_hungarian_lns.py` for reference. Replaces v4's
+   greedy random-best-of-K reinsertion with min-cost-bipartite-matching
+   over an `n_destroy x K` GPU-computed cost matrix solved via
+   `scipy.optimize.linear_sum_assignment`. On dense benchmarks (ibm10 with
+   778 fixed macros / 8 destroyed), 96% of Hungarian solutions are
+   infeasible — uniform-random and net-centroid candidates almost always
+   overlap a fixed macro, leaving no feasible candidate set for the
+   assignment.
+
+   **300s A/B on ibm10 (init 1.336748)**:
+   - v4 greedy LNS: **1.272240** (12112 iters, 140 accepts, ~1% infeasible)
+   - Hungarian LNS: **1.297937** (13796 iters, 67 accepts, **96% infeasible**)
+   - Δ = +0.026 (v4 wins by 0.026)
+
+   The plan's smoke-test bar was Hungarian wins by ≥0.003. Result misses
+   the bar by ~1000%. Per the plan's stop condition ("smoke test fails by
+   >50% → kill"), T1.2 is killed.
+
+   Why it failed: Hungarian's separable-cost approximation breaks down on
+   dense layouts where macros interact strongly, AND the candidate-pool
+   construction is structurally hard when free space between fixed macros
+   is small. Sparse benchmarks (ibm15-18, where free space is abundant)
+   may still benefit — but the v6 submission keeps v4 greedy LNS on every
+   worker. Future work: try Hungarian on **soft macros** (no overlap
+   constraint → all candidates feasible by definition).
+
+4. **Multi-process portfolio** (`_portfolio.py`, ~150 lines). Spawns N
    worker processes (default 8), each running the full v4 pipeline at a
    different RNG seed. One worker swaps in `gpu_mass_cd` for the hard-CD
    phase via a try/except wrapper — non-Apple-Silicon graders fall back
