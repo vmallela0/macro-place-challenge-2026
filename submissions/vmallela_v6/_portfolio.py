@@ -145,7 +145,11 @@ def _worker_v4_with_seed(args):
 
 def run_portfolio(bench_path: str, *, total_budget: int = 3300,
                   n_workers: int = 8, gpu_workers: int = 1,
-                  base_seed: int = 42, log_prefix: str = ""):
+                  base_seed: int = 42, log_prefix: str = "",
+                  apply_consensus: bool = True,
+                  consensus_refine_budget: int = 180,
+                  consensus_k_best: int = 16,
+                  consensus_trim_frac: float = 0.2):
     """Run a multi-process portfolio of placer workers.
 
     Parameters
@@ -162,6 +166,17 @@ def run_portfolio(bench_path: str, *, total_budget: int = 3300,
         Remaining workers use the pure-CPU v4 pipeline.
     base_seed : int
         First worker uses base_seed, second uses base_seed+1, etc.
+    apply_consensus : if True, after the portfolio finishes, compute a
+        trimmed-mean consensus warm-start across the top `consensus_k_best`
+        valid placements, push-apart + legalize + refine, and return the
+        better of (consensus-refined, portfolio-min). T3.4. Robust against
+        per-seed pathologies that score well on the proxy but pathologically
+        on OpenROAD (Tier-2 of the competition).
+    consensus_refine_budget : seconds for the post-consensus CD refinement.
+        Should be 5-10% of total_budget.
+    consensus_k_best : how many top portfolio placements to consensus.
+        Effective k is min(k_best, n_valid_workers).
+    consensus_trim_frac : trimmed-mean trim fraction (top+bottom).
     """
     n_cpu_workers = max(0, n_workers - gpu_workers)
     args = []
@@ -209,6 +224,60 @@ def run_portfolio(bench_path: str, *, total_budget: int = 3300,
         best = results[0]
     pos_bytes, shape, dtype_str, cost, overlaps, t, seed, used_gpu = best
     pos_np = np.frombuffer(pos_bytes, dtype=np.dtype(dtype_str)).reshape(shape).copy()
-    print(f"{log_prefix}portfolio: BEST seed={seed} cost={cost:.6f} "
+    print(f"{log_prefix}portfolio: BEST(min) seed={seed} cost={cost:.6f} "
           f"overlaps={overlaps} elapsed={elapsed:.0f}s", flush=True)
+
+    # ---- T3.4 consensus warm-start (optional) ----
+    if apply_consensus:
+        valid_results = []
+        for r in results:
+            (b, sh, dt, c, ov, _t, _s, _g) = r
+            if ov != 0:
+                continue
+            arr = np.frombuffer(b, dtype=np.dtype(dt)).reshape(sh).copy()
+            valid_results.append((arr, c))
+        if len(valid_results) >= 2:
+            try:
+                from macro_place.benchmark import Benchmark as _B
+                from _consensus import consensus_warm_start
+                bench = _B.load(bench_path)
+                # Need a placer module for v1 helpers.
+                import importlib.util
+                ROOT = Path(bench_path).resolve().parents[3]
+                spec = importlib.util.spec_from_file_location(
+                    "_v2_for_consensus",
+                    str(ROOT / "submissions" / "vmallela_v2" / "placer.py"))
+                mod_c = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod_c)
+                plc_for_consensus = mod_c._load_plc(bench.name)
+                placements_only = [p for p, _ in valid_results]
+                costs_only = [c for _, c in valid_results]
+                cons_pos, cons_cost, source = consensus_warm_start(
+                    placements_only, costs_only, bench, plc_for_consensus,
+                    k_best=consensus_k_best,
+                    trim_frac=consensus_trim_frac,
+                    refine_max_time=consensus_refine_budget,
+                    use_gpu_refine=True,
+                    verbose=True)
+                # Validate cons_pos is overlap-free via the same official
+                # PlacementCost path used elsewhere.
+                from macro_place.objective import compute_proxy_cost
+                cons_full = torch.tensor(cons_pos)
+                if cons_full.shape[0] < bench.macro_positions.shape[0]:
+                    full = bench.macro_positions.clone()
+                    full[:cons_full.shape[0]] = cons_full
+                    cons_full = full
+                r2 = compute_proxy_cost(cons_full, bench, plc_for_consensus)
+                cons_cost_check = float(r2["proxy_cost"])
+                cons_overlaps = int(r2["overlap_count"])
+                print(f"{log_prefix}consensus[{source}]: cost={cons_cost_check:.6f} "
+                      f"overlaps={cons_overlaps}", flush=True)
+                if cons_overlaps == 0 and cons_cost_check < cost - 1e-7:
+                    print(f"{log_prefix}portfolio: CONSENSUS WIN "
+                          f"({cons_cost_check:.6f} vs min={cost:.6f})",
+                          flush=True)
+                    return cons_full, cons_cost_check, cons_overlaps, -1
+            except Exception as e:
+                print(f"{log_prefix}consensus err: {e} — falling back "
+                      f"to portfolio min", flush=True)
     return torch.tensor(pos_np), cost, overlaps, seed

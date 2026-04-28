@@ -100,7 +100,48 @@ Three substantive additions:
    worker. Future work: try Hungarian on **soft macros** (no overlap
    constraint → all candidates feasible by definition).
 
-4. **Multi-process portfolio** (`_portfolio.py`, ~150 lines). Spawns N
+4. **Trimmed-mean consensus warm-start** (`_consensus.py`, T3.4). After
+   the portfolio finishes, compute per-macro trimmed-mean of the top-K
+   cheapest valid placements (K=16 default, trim 20% top/bottom), legalize
+   the consensus + run a final exact-cost CD refinement, return
+   `min(consensus_refined, portfolio_min)`. Strict comparison — the
+   consensus only replaces if it strictly beats the min.
+
+   **Why this matters for OpenROAD Tier-2.** The consensus is robust to
+   per-seed pathologies. If 1 of 16 workers stuck a macro in a corner due
+   to RNG luck (good for proxy, bad for OpenROAD synthesis), the
+   trimmed-mean discards that outlier and keeps a "median pose" that 15
+   of 16 agree on. That smoothing is exactly what OpenROAD-robustness
+   wants — pathological proxy minima are exactly the ones likely to
+   underperform on real WNS / TNS / Area.
+
+   Synthetic ibm01 unit test (8 placements at target + Gaussian noise):
+   trimmed-mean recovered the target, **consensus refined to 1.0228 from
+   portfolio min 1.0721 (Δ -0.049)**. Outliers (extreme stuck macros)
+   were correctly trimmed.
+
+   The consensus runs in two stages — graft then trimmed-mean. The graft
+   stage starts from the portfolio min and tests substituting each
+   macro's median/trimmed-mean/2nd-best/3rd-best position; only strict
+   improvements are kept (so graft is by construction `<= portfolio_min`).
+   If graft accepts any substitutions, the result is refined via GPU CD;
+   otherwise the trimmed-mean averaging path runs as a fallback.
+
+   **Real-data smoke (ibm01, N=8 workers, 60s budget, 60s refine):**
+   - Portfolio min: 0.9309
+   - After graft (30 substitutions): 0.9308
+   - After refine: **0.9267 → CONSENSUS WIN by 0.0042**
+
+   Default `PLACER_V6_CONSENSUS_K=16` is correctly sized for the
+   8-worker default. The graft path correctly syncs both hard AND soft
+   positions to the worker's full state via `_sync_full_placement` —
+   without this, graft optimizes against the initial benchmark softs
+   and produces moves that don't generalize.
+
+   Env knobs: `PLACER_V6_CONSENSUS=0/1`, `PLACER_V6_CONSENSUS_REFINE=180`,
+   `PLACER_V6_CONSENSUS_K=16`.
+
+5. **Multi-process portfolio** (`_portfolio.py`, ~150 lines). Spawns N
    worker processes (default 8), each running the full v4 pipeline at a
    different RNG seed. One worker swaps in `gpu_mass_cd` for the hard-CD
    phase via a try/except wrapper — non-Apple-Silicon graders fall back

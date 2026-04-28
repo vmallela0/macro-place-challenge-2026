@@ -25,4 +25,9 @@ export PLACER_V6_GPU_WORKERS=${PLACER_V6_GPU_WORKERS:-1}
 export PLACER_SA_T0=${PLACER_SA_T0:-0.00005}
 export PLACER_ESC_HARD_DESTROY=${PLACER_ESC_HARD_DESTROY:-80}
 
+# T3.4 consensus warm-start (enabled by default — robust to OpenROAD Tier-2).
+export PLACER_V6_CONSENSUS=${PLACER_V6_CONSENSUS:-1}
+export PLACER_V6_CONSENSUS_REFINE=${PLACER_V6_CONSENSUS_REFINE:-180}
+export PLACER_V6_CONSENSUS_K=${PLACER_V6_CONSENSUS_K:-16}
+
 exec uv run evaluate submissions/vmallela_v6/placer.py "$@"

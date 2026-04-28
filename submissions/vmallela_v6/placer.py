@@ -73,6 +73,12 @@ class OptimalPlacer:
         # Each worker takes the full budget (they run in parallel).
         per_worker_budget = self.TOTAL_TIME_LIMIT
 
+        apply_consensus = os.environ.get("PLACER_V6_CONSENSUS", "1") == "1"
+        consensus_refine_budget = int(os.environ.get(
+            "PLACER_V6_CONSENSUS_REFINE", "180"))
+        consensus_k_best = int(os.environ.get(
+            "PLACER_V6_CONSENSUS_K", "16"))
+
         # Late import to avoid pulling in mp at module load time.
         from _portfolio import run_portfolio
         log_prefix = "  "
@@ -83,6 +89,9 @@ class OptimalPlacer:
             gpu_workers=self.GPU_WORKERS,
             base_seed=self.seed,
             log_prefix=log_prefix,
+            apply_consensus=apply_consensus,
+            consensus_refine_budget=consensus_refine_budget,
+            consensus_k_best=consensus_k_best,
         )
         if overlaps != 0:
             # Defensive: caller validates again, but if every worker came back
