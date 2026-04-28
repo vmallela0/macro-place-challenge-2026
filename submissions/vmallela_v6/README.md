@@ -57,10 +57,16 @@ Three substantive additions:
    density of v4's pure 8-direction lattice. Optional Metropolis acceptance
    (PLACER_SA_T0) matches v4's simulated annealing.
 
-   **ibm01 single-seed 60s smoke test**: GPU CD = **1.0165**, CPU CD = **1.0234**
-   → **GPU wins by 0.0069** (target was GPU ≤ 1.019). Cross-macro batching
-   was the structural fix — the previous single-macro batched version lost
-   to CPU CD by 0.005, this version wins by 0.007.
+   **ibm01 single-seed 60s smoke test**: GPU CD reaches **1.0165**, CPU CD
+   reaches **1.0205** → **GPU wins by 0.0040** (target was GPU ≤ 1.019).
+   The cross-over at ~17 s is the key visual story: CPU CD plateaus on its
+   8-direction lattice basin while GPU CD's Gaussian + uniform proposals
+   keep finding improvements past where CPU stops:
+
+   ![v6-gpu vs CPU CD on ibm01](../../assets/v6_gpu_vs_cpu_ibm01.png)
+
+   Cross-macro batching was the structural fix — the previous single-macro
+   batched version lost to CPU CD by 0.005; this version wins by 0.004.
 
    The acceptance is strict against the CPU-exact proxy_cost — the GPU only
    ranks; rejected candidates incur no cost beyond the GPU score. This is
