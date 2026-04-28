@@ -1,0 +1,205 @@
+"""Multi-process portfolio runner.
+
+Runs N independent placer workers in parallel via `multiprocessing`, each
+with a different seed. Returns the best (min proxy_cost) result across all
+workers, validated.
+
+The core idea: v4 leaves 17 cores idle on a 16-core grader (PARALLEL_WORKERS=0
+in `submissions/vmallela_v2/run.sh`). Per the v4 HANDOFF.md, multi-worker
+portfolio is the highest-EV unspent lever (-0.005 to -0.015 estimated). This
+file wires it.
+
+We also mix in one GPU-augmented worker that uses MLXBatchEvaluator for an
+extra hard-CD phase. The MLX context is per-process; this isolates the GPU
+client so that GPU exceptions on one worker don't take down the others.
+"""
+from __future__ import annotations
+import os
+import sys
+import time
+import math
+import multiprocessing as mp
+from pathlib import Path
+import numpy as np
+import torch
+
+
+def _worker_v4_with_seed(args):
+    """A worker that runs the full v4 pipeline (push-apart → legalize →
+    hard CD → soft cycles → escape basin) for one benchmark with a given
+    seed. Returns the (best_pos_bytes, n_hard, best_cost) tuple.
+
+    Runs in a subprocess.  Reloads everything from scratch — no shared
+    state.  Caps its own time at `time_budget` seconds.
+    """
+    (bench_path, time_budget, seed, use_gpu, log_prefix) = args
+    # Restrict child-process BLAS threads to 1 to avoid contention.
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["PLACER_TOTAL_BUDGET"] = str(time_budget)
+
+    # Late imports (so subprocess gets clean state).
+    from pathlib import Path as _Path
+    ROOT = _Path(bench_path).resolve().parents[3]
+    sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(ROOT / "submissions" / "vmallela"))
+    sys.path.insert(0, str(ROOT / "submissions" / "vmallela_v2"))
+    sys.path.insert(0, str(ROOT / "submissions" / "vmallela_v6"))
+
+    import importlib.util
+    # Use the v2 placer (= v4 logic) as the workhorse; only the hard-CD
+    # phase gets a GPU swap when use_gpu=True.
+    spec = importlib.util.spec_from_file_location(
+        "_v2_placer", str(ROOT / "submissions" / "vmallela_v2" / "placer.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    OptimalPlacer = mod.OptimalPlacer
+
+    from macro_place.benchmark import Benchmark
+    from macro_place.objective import compute_proxy_cost
+
+    # If GPU worker, swap _coord_descent at module level for the hard CD path.
+    if use_gpu:
+        try:
+            from _gpu_cd import gpu_mass_cd
+            from _mlx_eval import MLXBatchEvaluator
+            # Access v1 evaluator+_coord_descent through the v2 placer's module
+            # references and patch the hard-CD function. We add a wrapper that
+            # tries gpu_mass_cd first, then falls back to the original CPU CD
+            # for the same time budget if the GPU path raises.
+            v1 = mod._mod  # exec_module re-imported v1 placer at module load
+            orig_cd = v1._coord_descent
+
+            def _gpu_cd_wrapper(pos_np, benchmark, plc_eval, max_time=3000,
+                                incr_eval=None, sa_T0=None, sa_cooling=0.9995,
+                                sa_rng_seed=None):
+                # Use GPU for the bulk; fall back to CPU CD for fine-tuning
+                # in the last 25% of the budget (small deltas are where the
+                # CPU lattice still wins).
+                try:
+                    if incr_eval is None:
+                        return orig_cd(pos_np, benchmark, plc_eval,
+                                       max_time=max_time,
+                                       sa_T0=sa_T0, sa_cooling=sa_cooling,
+                                       sa_rng_seed=sa_rng_seed)
+                    gpu = MLXBatchEvaluator(incr_eval, benchmark)
+                    gpu_budget = max_time * 0.7
+                    cpu_budget = max_time - gpu_budget - 1.0
+                    pos1, _c = gpu_mass_cd(
+                        pos_np.copy(), benchmark, plc_eval,
+                        incr_eval=incr_eval, gpu_eval=gpu,
+                        max_time=gpu_budget, K=384,
+                        sa_T0=sa_T0, sa_cooling=sa_cooling,
+                        seed=(sa_rng_seed or 0))
+                    if cpu_budget <= 1.0:
+                        return pos1, _c
+                    return orig_cd(pos1, benchmark, plc_eval,
+                                   max_time=cpu_budget,
+                                   incr_eval=incr_eval,
+                                   sa_T0=sa_T0, sa_cooling=sa_cooling,
+                                   sa_rng_seed=sa_rng_seed)
+                except Exception as e:
+                    print(f"{log_prefix}  GPU path err: {e}, fallback to CPU",
+                          flush=True)
+                    return orig_cd(pos_np, benchmark, plc_eval,
+                                   max_time=max_time, incr_eval=incr_eval,
+                                   sa_T0=sa_T0, sa_cooling=sa_cooling,
+                                   sa_rng_seed=sa_rng_seed)
+
+            v1._coord_descent = _gpu_cd_wrapper
+            mod._coord_descent = _gpu_cd_wrapper
+        except Exception as e:
+            print(f"{log_prefix}  GPU init err: {e}, no-GPU fallback", flush=True)
+            use_gpu = False
+
+    bench = Benchmark.load(bench_path)
+    placer = OptimalPlacer(seed=seed)
+    t0 = time.time()
+    placement = placer.place(bench)
+    elapsed = time.time() - t0
+
+    # Validate proxy cost via official PlacementCost (matches grader).
+    plc = mod._load_plc(bench.name)
+    r = compute_proxy_cost(placement, bench, plc)
+    cost = float(r["proxy_cost"])
+    overlaps = int(r["overlap_count"])
+
+    # Convert to bytes for IPC return.
+    np_pos = placement.cpu().numpy()
+    return (np_pos.tobytes(), np_pos.shape, np_pos.dtype.str,
+            cost, overlaps, elapsed, seed, use_gpu)
+
+
+def run_portfolio(bench_path: str, *, total_budget: int = 3300,
+                  n_workers: int = 8, gpu_workers: int = 1,
+                  base_seed: int = 42, log_prefix: str = ""):
+    """Run a multi-process portfolio of placer workers.
+
+    Parameters
+    ----------
+    bench_path : str
+        Path to the .pt benchmark file.
+    total_budget : int
+        Wall-clock seconds available for the WHOLE portfolio. Each worker
+        gets the full `total_budget` (workers run in parallel).
+    n_workers : int
+        Total number of worker processes.
+    gpu_workers : int
+        Of the n_workers, how many use the GPU-augmented hard-CD phase.
+        Remaining workers use the pure-CPU v4 pipeline.
+    base_seed : int
+        First worker uses base_seed, second uses base_seed+1, etc.
+    """
+    n_cpu_workers = max(0, n_workers - gpu_workers)
+    args = []
+    for w in range(n_workers):
+        seed = base_seed + w
+        use_gpu = w < gpu_workers
+        prefix = f"{log_prefix}[w{w}{'G' if use_gpu else 'C'}-s{seed}]"
+        args.append((bench_path, total_budget, seed, use_gpu, prefix))
+
+    print(f"{log_prefix}portfolio: {n_workers} workers "
+          f"({gpu_workers} GPU + {n_cpu_workers} CPU), seeds "
+          f"{base_seed}..{base_seed + n_workers - 1}, budget "
+          f"{total_budget}s", flush=True)
+
+    t0 = time.time()
+    results = []
+    if n_workers == 1:
+        # Inline run for debugging
+        results = [_worker_v4_with_seed(args[0])]
+    else:
+        # Use 'spawn' to ensure clean process state for MLX/torch.
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(n_workers) as pool:
+            results = pool.map(_worker_v4_with_seed, args)
+    elapsed = time.time() - t0
+
+    # Pick best valid (overlap-free) by cost.
+    best = None
+    for r in results:
+        pos_bytes, shape, dtype_str, cost, overlaps, t, seed, used_gpu = r
+        tag = "GPU" if used_gpu else "CPU"
+        ok = "VALID" if overlaps == 0 else f"INVALID({overlaps})"
+        print(f"{log_prefix}  worker seed={seed} {tag}: cost={cost:.6f} "
+              f"{ok} time={t:.0f}s", flush=True)
+        if overlaps != 0:
+            continue
+        if best is None or cost < best[3]:
+            best = r
+
+    if best is None:
+        print(f"{log_prefix}portfolio: NO VALID workers (all overlaps)",
+              flush=True)
+        # Return the lowest-cost overall (even if invalid) as a fallback.
+        results.sort(key=lambda r: r[3])
+        best = results[0]
+    pos_bytes, shape, dtype_str, cost, overlaps, t, seed, used_gpu = best
+    pos_np = np.frombuffer(pos_bytes, dtype=np.dtype(dtype_str)).reshape(shape).copy()
+    print(f"{log_prefix}portfolio: BEST seed={seed} cost={cost:.6f} "
+          f"overlaps={overlaps} elapsed={elapsed:.0f}s", flush=True)
+    return torch.tensor(pos_np), cost, overlaps, seed
