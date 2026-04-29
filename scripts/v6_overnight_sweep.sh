@@ -118,11 +118,39 @@ for b in $BENCHES; do
 done
 
 echo "" >> "$OUT/sweep.log"
-echo "v6 sweep finished: $(date)" >> "$OUT/sweep.log"
+echo "v6 main sweep finished: $(date)" >> "$OUT/sweep.log"
 echo "results CSV: $OUT/results.csv" >> "$OUT/sweep.log"
 
-# Post-process: build markdown table and update v6 README.
+# Post-process step 1: build markdown table and update v6 README.
 .venv/bin/python scripts/v6_results_to_readme.py "$OUT/results.csv" \
   >> "$OUT/sweep.log" 2>&1
+
+# Post-process step 2: render diagnostic convergence GIFs for any
+# benchmark whose final proxy >= 1.0. These show push-apart -> legalize
+# -> CD with snapshots so we can see WHERE the placer is getting stuck
+# on the hard benches. Lighter than the full pipeline (single CPU
+# worker, 60s CD budget, no consensus/LNS) — diagnostic only, NOT used
+# for the reported score.
+echo "" >> "$OUT/sweep.log"
+echo "=== diagnostic GIFs for hard benches (proxy >= 1.0) ===" \
+  | tee -a "$OUT/sweep.log"
+GIF_BUDGET=${GIF_BUDGET:-60}
+HARD_BENCHES=$(awk -F',' 'NR > 1 && $2 != "NA" && $2 + 0 >= 1.0 {print $1}' \
+                "$OUT/results.csv")
+if [ -z "$HARD_BENCHES" ]; then
+  echo "  (no benches >= 1.0 — skipping diagnostic GIFs)" \
+    | tee -a "$OUT/sweep.log"
+else
+  for hb in $HARD_BENCHES; do
+    echo "  $hb: rendering diagnostic gif (${GIF_BUDGET}s CD budget)..." \
+      | tee -a "$OUT/sweep.log"
+    .venv/bin/python scripts/make_v6_gif.py "$hb" "$GIF_BUDGET" \
+      "$OUT/${hb}.gif" >> "$OUT/sweep.log" 2>&1 || \
+      echo "    gif $OUT/${hb}.gif failed" | tee -a "$OUT/sweep.log"
+    .venv/bin/python scripts/make_v6_gif.py "$hb" "$GIF_BUDGET" \
+      "assets/v6_${hb}.gif" >> "$OUT/sweep.log" 2>&1 || \
+      echo "    gif assets/v6_${hb}.gif failed" | tee -a "$OUT/sweep.log"
+  done
+fi
 
 echo "DONE" >> "$OUT/sweep.log"
