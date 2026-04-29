@@ -1,34 +1,50 @@
-# Overnight v6 sweep — status
+# Overnight v6 sweep — status (2nd run, with determinism fixes + viz)
 
-**Started:** 2026-04-28 01:35:03 PDT
-**Sweep PID:** 32680
-**Caffeinate PID:** 26116 (keeps Mac awake)
-**Results dir:** `/tmp/v6_overnight_20260428_013503/`
+**Scheduled start:** 2026-04-28 **19:10:00 PDT** (delayed kickoff)
+**Kickoff wrapper PID:** 22100 (sleeps until 19:10 then exec's the sweep)
+**Caffeinate:** spawned by the kickoff wrapper at start time (no manual mgmt needed)
+**Results dir:** `/tmp/v6_overnight_<TIMESTAMP>/` — created at start time
 
-## What's running
+**Previous run (1st sweep):** completed; results at
+`/tmp/v6_overnight_20260428_013503/`. 1.0196 mean over 17 IBM benches.
+Superseded by this run, which has the determinism fixes (BLAS pin via
+threadpoolctl + cuDNN deterministic) and per-bench placement plots.
+
+## What's running (or about to run)
 
 ```
-17 benches × PLACER_TOTAL_BUDGET=1800s × 8-worker portfolio (1 GPU + 7 CPU)
-  + consensus warm-start (graft, refine 120s)
-  per-bench hard timeout: 2700s
-  expected per-bench wall-clock: ~32 min
-  expected total: ~9 hours → completes ~10:35 AM
+Kickoff wrapper (PID 22100) is asleep until 19:10:00 PDT, then it spawns:
+
+  17 benches × PLACER_TOTAL_BUDGET=1800s × 8-worker portfolio (1 GPU + 7 CPU)
+    + consensus warm-start (graft, refine 120s)
+    + per-bench placement plot to assets/v6_<bench>.png + run-dir
+    per-bench hard timeout: 2700s
+    expected per-bench wall-clock: ~32 min
+    expected total sweep: ~9 hours → completes ~04:30 AM next day
 ```
+
+NEW vs the 1st run:
+  - Determinism fixes (threadpoolctl runtime BLAS pin, cuDNN deterministic,
+    CUDA RNG seed, env setdefault at module top) so same code on grader
+    won't see the v2-style 27% reproducibility gap.
+  - Per-bench static placement plot (red rectangles for hard macros,
+    blue dots for soft cluster centroids, canvas border, title with
+    proxy/wl/den/cong/overlaps). Same style as assets/ibm01_v4.png.
 
 ## How to check progress
 
 ```bash
-# Top-level log (one line per bench start/end + summary):
-tail -f /tmp/v6_overnight_20260428_013503/sweep.log
+# Until 19:10, the kickoff wrapper is just sleeping:
+cat /tmp/v6_delayed.log
+ps -p 22100   # kickoff wrapper
 
-# Live CSV (appended after each bench finishes):
-cat /tmp/v6_overnight_20260428_013503/results.csv
+# After 19:10, the actual sweep starts. Find its dir:
+ls -td /tmp/v6_overnight_* | head -1
 
-# Detailed per-bench log:
-tail -f /tmp/v6_overnight_20260428_013503/ibm01.log
-
-# Verify sweep still alive:
-ps -p 32680
+# Then:
+tail -f /tmp/v6_overnight_<TIMESTAMP>/sweep.log   # high-level
+cat /tmp/v6_overnight_<TIMESTAMP>/results.csv      # CSV (live)
+ls /tmp/v6_overnight_<TIMESTAMP>/*.png             # generated plots
 ```
 
 ## What happens when it finishes

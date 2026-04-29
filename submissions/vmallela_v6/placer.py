@@ -158,4 +158,19 @@ class OptimalPlacer:
         else:
             print(f"  [v6] DONE: cost={best_cost:.6f} seed={best_seed} "
                   f"overlaps=0", flush=True)
+
+        # Optional: serialize the final placement to disk for offline
+        # visualization (set PLACER_V6_SAVE_PLACEMENT to a path template
+        # like "/tmp/run/{name}.npy"). No-op when the env is unset, so this
+        # never affects grader runs.
+        save_template = os.environ.get("PLACER_V6_SAVE_PLACEMENT")
+        if save_template:
+            try:
+                save_path = save_template.format(name=benchmark.name)
+                Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+                np.save(save_path, result_pos.detach().cpu().numpy())
+                print(f"  [v6] saved placement to {save_path}", flush=True)
+            except Exception as e:
+                print(f"  [v6] WARNING: failed to save placement: {e}",
+                      flush=True)
         return result_pos

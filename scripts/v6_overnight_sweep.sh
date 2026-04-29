@@ -38,6 +38,9 @@ export PLACER_V6_CONSENSUS_REFINE=120
 export PLACER_V6_CONSENSUS_K=16
 export PLACER_SA_T0=0.00005
 export PLACER_ESC_HARD_DESTROY=80
+# Save the final placement per bench so the post-bench plotter can render
+# a static visualization. Placements go in $OUT/<bench>.npy.
+export PLACER_V6_SAVE_PLACEMENT="$OUT/{name}.npy"
 
 BENCHES="ibm01 ibm02 ibm03 ibm04 ibm06 ibm07 ibm08 ibm09 ibm10 ibm11 ibm12 ibm13 ibm14 ibm15 ibm16 ibm17 ibm18"
 
@@ -99,6 +102,19 @@ for b in $BENCHES; do
   echo "${b},${proxy:-NA},${wl:-NA},${den:-NA},${cong:-NA},${overlaps:-NA},${elapsed},${rc},$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >> "$OUT/results.csv"
   echo "  proxy=${proxy:-NA} overlaps=${overlaps:-NA}" | tee -a "$OUT/sweep.log"
+
+  # Render placement visualization. Goes to BOTH the run dir (archived
+  # alongside the .npy) and assets/ (committed to the repo).
+  if [ -f "$OUT/${b}.npy" ]; then
+    .venv/bin/python scripts/v6_placement_plot.py "$b" "$OUT/${b}.npy" \
+      "$OUT/${b}.png" >> "$OUT/sweep.log" 2>&1 || \
+      echo "  plot $OUT/${b}.png failed" | tee -a "$OUT/sweep.log"
+    .venv/bin/python scripts/v6_placement_plot.py "$b" "$OUT/${b}.npy" \
+      "assets/v6_${b}.png" >> "$OUT/sweep.log" 2>&1 || \
+      echo "  plot assets/v6_${b}.png failed" | tee -a "$OUT/sweep.log"
+  else
+    echo "  (no .npy saved for ${b}; skipping plot)" | tee -a "$OUT/sweep.log"
+  fi
 done
 
 echo "" >> "$OUT/sweep.log"
