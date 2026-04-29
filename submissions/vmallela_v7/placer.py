@@ -242,6 +242,82 @@ class OptimalPlacer:
             except Exception as e:
                 print(f"  [v7] laplacian err: {e}", flush=True)
 
+        # ── Phase 4.5: Adam polish on the smooth surrogate ─────────────
+        # Vectorized LSE-HPWL + CVaR top-K density/congestion via
+        # cell-window scatter, with GradNorm component balancing.
+        # Strict-improvement gate via the official PlacementCost.
+        # Off by default; PLACER_V7_ADAM=1 enables it.
+        if (os.environ.get("PLACER_V7_ADAM", "0") == "1"
+                and overlaps == 0):
+            adam_steps = int(os.environ.get("PLACER_V7_ADAM_STEPS", "200"))
+            adam_lr_frac = float(os.environ.get(
+                "PLACER_V7_ADAM_LR_FRAC", "0.02"))
+            adam_soft_only = (os.environ.get(
+                "PLACER_V7_ADAM_SOFT_ONLY", "1") == "1")
+            adam_inertia = float(os.environ.get(
+                "PLACER_V7_ADAM_INERTIA", "1.0"))
+            try:
+                from _smooth_proxy import adam_warm_start
+                # Build a fresh IncrementalEvaluator synced to current pos.
+                import importlib.util as _ilu
+                v1_spec = _ilu.spec_from_file_location(
+                    "_v1_v7_adam",
+                    str(_HERE.parent / "vmallela" / "placer.py"))
+                v1 = _ilu.module_from_spec(v1_spec)
+                v1_spec.loader.exec_module(v1)
+                bench_for_eval = Benchmark.load(bench_path)
+                plc = v1._load_plc(bench_for_eval.name)
+                incr = v1.IncrementalEvaluator(plc, bench_for_eval)
+                full_np = portfolio_pos.cpu().numpy()
+                n_hard = bench_for_eval.num_hard_macros
+                incr.sync_positions(full_np[:n_hard])
+                incr.macro_pos[n_hard:] = full_np[n_hard:].astype(
+                    incr.macro_pos.dtype)
+                incr._recompute_pin_positions()
+                incr._full_recompute_wl()
+                incr._full_recompute_density()
+                incr._full_recompute_congestion()
+
+                t_adam_start = time.time()
+                pos_adam, history = adam_warm_start(
+                    incr, bench_for_eval,
+                    n_steps=adam_steps,
+                    lr_frac_canvas=adam_lr_frac,
+                    proximal_weight_frac=adam_inertia,
+                    soft_only=adam_soft_only,
+                    enable_density=True,
+                    enable_congestion=True,
+                    window_margin_cells=4,
+                    snapshot_every=25,
+                    verbose=False,
+                )
+                adam_tensor = torch.tensor(pos_adam, dtype=torch.float32)
+                # Validate via official PlacementCost.
+                r = compute_proxy_cost(adam_tensor, bench_for_eval, plc)
+                adam_cost = float(r["proxy_cost"])
+                adam_overlaps = int(r["overlap_count"])
+                print(f"  [v7] adam: {adam_steps} steps in "
+                      f"{time.time()-t_adam_start:.1f}s; surrogate-loss "
+                      f"{history['loss'][0]:.4f} → {history['loss'][-1]:.4f}; "
+                      f"exact-proxy {portfolio_cost:.6f} → {adam_cost:.6f} "
+                      f"overlaps={adam_overlaps}", flush=True)
+                if (adam_overlaps == 0
+                        and adam_cost < portfolio_cost - 1e-7):
+                    print(f"  [v7] ADAM WIN: {adam_cost:.6f} < "
+                          f"{portfolio_cost:.6f} "
+                          f"(Δ {portfolio_cost-adam_cost:+.4f})",
+                          flush=True)
+                    portfolio_cost = adam_cost
+                    portfolio_pos = adam_tensor
+                    overlaps = adam_overlaps
+                else:
+                    print(f"  [v7] adam: rejected (no improvement or "
+                          f"overlaps); keeping post-Laplacian "
+                          f"({portfolio_cost:.6f})", flush=True)
+            except Exception as e:
+                print(f"  [v7] adam err: {type(e).__name__}: {e}; "
+                      f"keeping post-Laplacian", flush=True)
+
         # Phase 5: basin-hopping on hard benches only (cost >= 1.0).
         # Each hop perturbs the current best by σ * canvas, runs a
         # SINGLE-WORKER reduced-budget pipeline, keeps if better.
