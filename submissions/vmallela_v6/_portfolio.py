@@ -35,7 +35,11 @@ def _worker_v4_with_seed(args):
     state.  Caps its own time at `time_budget` seconds.
     """
     (bench_path, time_budget, seed, use_gpu, log_prefix) = args
-    # Restrict child-process BLAS threads to 1 to avoid contention.
+    # Restrict child-process BLAS threads to 1 to avoid contention. Critical
+    # for hardware-portable reproducibility — multi-thread BLAS introduces
+    # non-deterministic FP reduction order which compounds through wall-
+    # clock-bound loops into different placement basins. We set these BEFORE
+    # any numpy/torch import so backends pick them up at init time.
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -43,6 +47,8 @@ def _worker_v4_with_seed(args):
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
     os.environ["PYTHONHASHSEED"] = str(seed)
     os.environ["PLACER_TOTAL_BUDGET"] = str(time_budget)
+    # CUBLAS workspace config required for deterministic CUDA matmul.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
     # Late imports (so subprocess gets clean state).
     from pathlib import Path as _Path
@@ -67,6 +73,24 @@ def _worker_v4_with_seed(args):
     # If GPU worker, swap _coord_descent at module level for the hard CD path.
     if use_gpu:
         try:
+            # Lock down torch/CUDA determinism BEFORE any GPU op runs.
+            # Default cuDNN behavior selects algorithms non-deterministically
+            # at runtime ("benchmark mode") which makes a placer's output
+            # depend on which algorithm cuDNN happened to pick. Force the
+            # deterministic path; seed CUDA RNG explicitly (torch.manual_seed
+            # only seeds CPU, not CUDA).
+            import torch as _torch
+            try:
+                _torch.manual_seed(seed)
+                if _torch.cuda.is_available():
+                    _torch.cuda.manual_seed_all(seed)
+                    _torch.backends.cudnn.deterministic = True
+                    _torch.backends.cudnn.benchmark = False
+                _torch.use_deterministic_algorithms(True, warn_only=True)
+            except Exception as _e:
+                print(f"{log_prefix}  determinism setup warning: {_e}",
+                      flush=True)
+
             from _gpu_cd import gpu_mass_cd
             from _torch_eval import TorchBatchEvaluator
             # Access v1 evaluator+_coord_descent through the v2 placer's module

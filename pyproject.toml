@@ -33,6 +33,10 @@ dependencies = [
     "matplotlib>=3.5.0",
     "tqdm>=4.65.0",
     "absl-py>=1.0.0",
+    "scipy>=1.10.0",          # used by submissions/vmallela_v6/_hungarian_lns.py
+    "threadpoolctl>=3.0.0",   # runtime BLAS thread pin for hardware-portable
+                              # determinism (submissions/vmallela_v6/placer.py
+                              # calls threadpool_limits(1) at module import).
 ]
 
 [project.optional-dependencies]
