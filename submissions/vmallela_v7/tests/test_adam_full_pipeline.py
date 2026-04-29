@@ -37,22 +37,25 @@ def _build_incr_eval(name="ibm01"):
 
 
 def test_50_steps_under_30s_ibm01():
-    incr, _, _ = _build_incr_eval("ibm01")
+    incr, bench, _ = _build_incr_eval("ibm01")
     print(f"  ibm01: n_total={incr.macro_pos.shape[0]} "
           f"n_pins={int(incr.pin_macro.shape[0])} "
           f"n_nets={int(incr.net_weight.shape[0])} "
           f"n_cells={incr.n_cells}", flush=True)
     t0 = time.time()
     pos_final, history = adam_warm_start(
-        incr, None,
-        n_steps=50,
+        incr, bench,                  # bench needed for exact-cost validation
+        n_steps=100,
         lr_frac_canvas=0.02,
         proximal_weight_frac=1.0,
         soft_only=True,
         enable_density=True,
         enable_congestion=True,
         window_margin_cells=4,
-        snapshot_every=25,
+        snapshot_every=10,            # Fix C: refresh windows every 10 steps
+        validate_every=25,            # Fix C: best-of-Adam line search
+        k_dens_frac=0.10,
+        k_cong_frac=0.05,             # Fix C: aligned with exact proxy
         verbose=True,
     )
     elapsed = time.time() - t0

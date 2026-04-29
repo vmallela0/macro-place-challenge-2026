@@ -49,15 +49,23 @@ export PLACER_V7_BASIN_HOPS=0
 export PLACER_V7_BASIN_HOP_AUTO=999.0     # never auto-trigger
 export PLACER_V7_BASIN_HOP_RESERVE=0      # no reserve; portfolio uses full budget
 
-# v7 Adam Phase 4.5 ON. 300 steps, segmented α (density 10%, congestion 2%).
-# soft_only=1: hards held proximal (T3 lever available via SOFT_ONLY=0 + INERTIA).
+# v7 Adam Phase 4.5 ON. Path C+ (post smooth-vs-exact divergence post-mortem):
+# - 100 steps (surrogate plateau hits step 25-50; beyond that the smooth↔exact
+#   gap widens — cf. ibm01 trajectory had +38% exact-proxy regression at step 300).
+# - α-aligned with the exact proxy (K_d 10%, K_c 5%) — segmented "sniper" α=2%
+#   was driving the top-2% down while lifting the 3-5% tier (objective mismatch).
+# - Window refresh every 10 steps (was 25) — 50ms tensor op, keeps density grad
+#   fresh as macros drift.
+# - Validate exact cost every 25 steps; track best-of-Adam (line search behavior).
 export PLACER_V7_ADAM=1
-export PLACER_V7_ADAM_STEPS=300
+export PLACER_V7_ADAM_STEPS=100
 export PLACER_V7_ADAM_LR_FRAC=0.02
 export PLACER_V7_ADAM_SOFT_ONLY=1
 export PLACER_V7_ADAM_INERTIA=1.0
 export PLACER_V7_K_DENS_FRAC=0.10
-export PLACER_V7_K_CONG_FRAC=0.02
+export PLACER_V7_K_CONG_FRAC=0.05
+export PLACER_V7_ADAM_SNAPSHOT_EVERY=10
+export PLACER_V7_ADAM_VALIDATE_EVERY=25
 
 export PLACER_V6_SAVE_PLACEMENT="$OUT/{name}.npy"
 

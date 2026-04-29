@@ -548,16 +548,17 @@ def build_pin_to_net(net_starts: torch.Tensor) -> torch.Tensor:
 def adam_warm_start(
     incr_eval, benchmark,
     *,
-    n_steps: int = 500,
+    n_steps: int = 100,
     lr_frac_canvas: float = 0.02,
     proximal_weight_frac: float = 1.0,
     soft_only: bool = True,
     enable_density: bool = True,
     enable_congestion: bool = True,
     window_margin_cells: int = 4,
-    snapshot_every: int = 50,
-    k_dens_frac: float = 0.10,
-    k_cong_frac: float = 0.02,
+    snapshot_every: int = 10,
+    validate_every: int = 25,
+    k_dens_frac: float = 0.05,
+    k_cong_frac: float = 0.05,
     verbose: bool = False,
 ) -> tuple[np.ndarray, dict]:
     """Run Adam on the smooth surrogate (LSE-HPWL + CVaR top-K density +
@@ -715,8 +716,45 @@ def adam_warm_start(
               f"g_cong={g_cong:.3e}  →  w=({w_hpwl:.3f}, {w_dens:.3f}, "
               f"{w_cong:.3f})", flush=True)
 
+    # ── Best-of-Adam tracking (exact-proxy line search) ────────────
+    # The smooth surrogate diverges from the exact proxy after enough
+    # steps (cf. ibm01 trajectory: surrogate -69 %, exact +38 %).
+    # Periodically validate exact cost; keep the best position seen.
+    # `validate_every == 0` disables validation entirely.
+    best_pos_np = macro_pos.detach().cpu().numpy().astype(np.float64).copy()
+    best_exact_cost = None       # populated at first validation
+    best_exact_step = 0
+    plc_for_validate = None
+    if validate_every > 0 and benchmark is not None:
+        try:
+            from macro_place.objective import compute_proxy_cost as _cpc
+            from placer import _load_plc as _v1_load_plc
+            plc_for_validate = _v1_load_plc(benchmark.name)
+
+            def _validate_exact(pos_tensor: torch.Tensor):
+                """Return (proxy_cost, overlap_count) using the official
+                PlacementCost. Caller passes a torch tensor; we run the
+                proxy on a fresh copy.
+                """
+                t_cpu = pos_tensor.detach().cpu().to(torch.float32)
+                r = _cpc(t_cpu, benchmark, plc_for_validate)
+                return float(r["proxy_cost"]), int(r["overlap_count"])
+
+            # Validate the starting point so we always have a baseline.
+            best_exact_cost, _start_ov = _validate_exact(macro_pos)
+            if verbose:
+                print(f"    [adam/validate] step 0: exact-cost "
+                      f"{best_exact_cost:.6f}", flush=True)
+        except Exception as e:
+            if verbose:
+                print(f"    [adam/validate] disabled ({type(e).__name__}: "
+                      f"{e})", flush=True)
+            plc_for_validate = None
+
     for step in range(n_steps):
-        # Re-snapshot the cell windows periodically.
+        # Re-snapshot the cell windows periodically (default every 10
+        # steps — cheap O(n_total · K_max) tensor op, ~50 ms on MPS for
+        # ibm15-scale; keeps density/cong gradients fresh as macros drift).
         if (enable_density or enable_congestion) and (step % snapshot_every == 0) and step > 0:
             cell_idx, K_max = build_window_indices(
                 macro_pos.detach(), macro_w, macro_h,
@@ -758,9 +796,37 @@ def adam_warm_start(
                   f"cng={(cong.item() if enable_congestion else 0.0):.4f} "
                   f"({time.time()-t0:.1f}s)", flush=True)
 
-    pos_final = macro_pos.detach().cpu().numpy().astype(np.float64)
+        # Periodic exact-cost validation. Track best-so-far.
+        if (plc_for_validate is not None
+                and validate_every > 0
+                and (step + 1) % validate_every == 0):
+            exact_cost, exact_ov = _validate_exact(macro_pos)
+            if verbose:
+                print(f"    [adam/validate] step {step+1}: "
+                      f"exact-cost {exact_cost:.6f} ov={exact_ov} "
+                      f"(best {best_exact_cost:.6f} @ step {best_exact_step})",
+                      flush=True)
+            if exact_ov == 0 and exact_cost < best_exact_cost - 1e-7:
+                best_exact_cost = exact_cost
+                best_exact_step = step + 1
+                best_pos_np = macro_pos.detach().cpu().numpy().astype(
+                    np.float64).copy()
+
     if verbose:
-        print(f"  [adam] {n_steps} steps in {time.time()-t0:.1f}s; "
-              f"loss {history['loss'][0]:.6f} -> {history['loss'][-1]:.6f}",
-              flush=True)
-    return pos_final, history
+        msg = f"  [adam] {n_steps} steps in {time.time()-t0:.1f}s; " \
+              f"surrogate-loss {history['loss'][0]:.6f} -> " \
+              f"{history['loss'][-1]:.6f}"
+        if plc_for_validate is not None:
+            msg += (f"; best exact-cost {best_exact_cost:.6f} "
+                    f"@ step {best_exact_step}")
+        print(msg, flush=True)
+
+    # If validation was disabled (no benchmark), best_pos_np was never
+    # updated from the initial snapshot — overwrite with the actual final
+    # position so callers always get the Adam-optimized result.
+    if plc_for_validate is None:
+        best_pos_np = macro_pos.detach().cpu().numpy().astype(np.float64)
+
+    history["best_exact_cost"] = best_exact_cost
+    history["best_exact_step"] = best_exact_step
+    return best_pos_np, history

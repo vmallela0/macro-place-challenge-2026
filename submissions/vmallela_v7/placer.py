@@ -249,23 +249,32 @@ class OptimalPlacer:
         # Off by default; PLACER_V7_ADAM=1 enables it.
         if (os.environ.get("PLACER_V7_ADAM", "0") == "1"
                 and overlaps == 0):
-            # Default 300: 50 Adam steps cost ~1.85s on ibm01 (MPS), so 300
-            # ≈ 11 s — fits comfortably in the 450 s reserve. Cosine-annealed
-            # lr means later steps make small corrections; beyond ~300 the
-            # marginal step is in the noise. Bigger lever for next iteration
-            # is τ-annealing (LSE sharpness schedule), not raw step count.
-            adam_steps = int(os.environ.get("PLACER_V7_ADAM_STEPS", "300"))
+            # Default 100: smooth surrogate plateau hits ~step 25-50, and
+            # the smooth↔exact gap widens after that (cf. the ibm01
+            # divergence post-mortem). Best-of-Adam tracking + validate-
+            # every-25 captures the best exact-cost point we've seen.
+            adam_steps = int(os.environ.get("PLACER_V7_ADAM_STEPS", "100"))
             adam_lr_frac = float(os.environ.get(
                 "PLACER_V7_ADAM_LR_FRAC", "0.02"))
             adam_soft_only = (os.environ.get(
                 "PLACER_V7_ADAM_SOFT_ONLY", "1") == "1")
             adam_inertia = float(os.environ.get(
                 "PLACER_V7_ADAM_INERTIA", "1.0"))
-            # Segmented α: density top-10%, congestion top-2% (sniper).
+            # α-aligned with exact proxy (top-K_d at 10 % of n_cells in the
+            # exact proxy; top-K_c at 5 % of 2·n_cells in the exact proxy).
+            # Using the same α as the scorer keeps the surrogate's
+            # gradient pointed at the same cells the scorer cares about.
+            # The earlier 2 % "sniper" configuration drove the top-2 % down
+            # but lifted the 3-5 % tier (objective mismatch).
             k_dens_frac = float(os.environ.get(
                 "PLACER_V7_K_DENS_FRAC", "0.10"))
             k_cong_frac = float(os.environ.get(
-                "PLACER_V7_K_CONG_FRAC", "0.02"))
+                "PLACER_V7_K_CONG_FRAC", "0.05"))
+            # Window refresh + best-of-Adam validation cadence.
+            adam_snapshot_every = int(os.environ.get(
+                "PLACER_V7_ADAM_SNAPSHOT_EVERY", "10"))
+            adam_validate_every = int(os.environ.get(
+                "PLACER_V7_ADAM_VALIDATE_EVERY", "25"))
             try:
                 from _smooth_proxy import adam_warm_start
                 # Build a fresh IncrementalEvaluator synced to current pos.
@@ -298,10 +307,11 @@ class OptimalPlacer:
                     enable_density=True,
                     enable_congestion=True,
                     window_margin_cells=4,
-                    snapshot_every=25,
+                    snapshot_every=adam_snapshot_every,
+                    validate_every=adam_validate_every,
                     k_dens_frac=k_dens_frac,
                     k_cong_frac=k_cong_frac,
-                    verbose=True,    # log per-step HPWL/density/cong trajectories
+                    verbose=True,
                 )
                 adam_tensor = torch.tensor(pos_adam, dtype=torch.float32)
                 # Validate via official PlacementCost.
