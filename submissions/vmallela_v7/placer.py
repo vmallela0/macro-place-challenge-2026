@@ -278,6 +278,21 @@ class OptimalPlacer:
         else:
             print(f"  [v7] DONE: cost={portfolio_cost:.6f} overlaps=0 "
                   f"({time.time()-t0:.1f}s)", flush=True)
+
+        # Persist the FINAL post-Laplacian/post-basin-hop placement for
+        # offline plotting. Mirrors v6's PLACER_V6_SAVE_PLACEMENT contract
+        # so scripts/v7_overnight_sweep.sh can render PNGs and GIFs from
+        # the same .npy artifacts.
+        save_template = os.environ.get("PLACER_V6_SAVE_PLACEMENT")
+        if save_template:
+            try:
+                save_path = save_template.format(name=benchmark.name)
+                Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+                np.save(save_path, portfolio_pos.detach().cpu().numpy())
+                print(f"  [v7] saved placement to {save_path}", flush=True)
+            except Exception as e:
+                print(f"  [v7] WARNING: failed to save placement: {e}",
+                      flush=True)
         return portfolio_pos
 
     def _basin_hop_loop(self, current_pos, current_cost, bench_path,

@@ -23,11 +23,14 @@ each lift is in the v6 README's "Honest analysis" section.
        in the v6 diagnostic GIFs.
                   ↓
     3. Adam smooth surrogate    (scaffolded; Phase 0 init)
-       LSE-HPWL + CVaR top-K density / congestion. CVaR
-       reformulation (Rockafellar-Uryasev) makes top-K averages
-       globally smooth. Currently HPWL-only; full density / cong
-       gradient with cell-window truncation deferred. Disabled
-       by default in v7.
+       LSE-HPWL + CVaR top-K density / congestion. Cell-window
+       truncation is implemented (`_cell_window.py`); density &
+       congestion gradients now flow end-to-end with CVaR exactly
+       equal to the top-K mean at t* (numerically verified, see
+       `tests/test_cell_window_math.py`). Disabled by default in
+       v7 because the HPWL inner loop is still a Python `for net`
+       (~5 min for 50 steps on ibm01 with 5993 nets). Vectorizing
+       via segment_logsumexp is ~30 min more work; deferred.
 ```
 
 ## The math, validated
@@ -77,9 +80,13 @@ refine → Laplacian soft-resolve → CD → per-net → hard LNS. Each hop
 costs ~300 s wall-clock at default budget, so 3 hops add ~15 min on
 top of the main 30-min portfolio.
 
-$\sigma$ schedule: $\sigma_0 = 0.30 \cdot $ canvas_diag, cool factor
+$\sigma$ schedule: $\sigma_0 = 0.10 \cdot $ canvas_diag, cool factor
 $0.6$ per hop. Hard macros perturbed at $0.25 \sigma$ to keep
-legalize feasible.
+legalize feasible. (The original Wales-Doye 0.30·D default was tested
+on ibm15 — too aggressive: $\sigma = 28.7$ on a 96×96 canvas pushed
+softs outside any reachable basin within the 300 s budget, hop 1
+landed at 1.867 vs 1.137 baseline → rejected. Tuning down to 0.10·D
+keeps each hop within ≈ 1–2 cell widths of the current basin.)
 
 **Auto-trigger:** basin-hopping fires when (a) main portfolio result
 is $\geq 1.00$, (b) at least 1 hop's worth of time remains, (c) result
@@ -120,15 +127,27 @@ standard smoothings — both are *approximations* that don't preserve
 the top-K optimum exactly. CVaR preserves the exact top-K optimum
 while being smooth.
 
-**Status in v7:** scaffolded but density / congestion gradient is
-**zeroed** in the surrogate for the initial release. The full
-implementation requires cell-window truncation (re-snapshot the
-window every K Adam steps) since the cell-index map is non-smooth.
-That's another 1–2 days. The Laplacian piece does most of what Adam
-on HPWL-only would do (closed-form vs gradient descent toward the
-same local minimum), so the marginal value of HPWL-only Adam is
-small. The CVaR density / congestion piece is where the novel lift
-would come from — deferred to v8.
+**Status in v7:** scaffolded with **density / congestion gradient
+now flowing** through cell-window truncation (`_cell_window.py`).
+The window is re-snapshotted every $K = 10$ Adam steps; between
+snapshots the cell-index map is held fixed and the smoothed
+softplus rectangle-overlap remains differentiable. CVaR-vs-top-K
+exact equivalence is numerically verified at $\mu = 1000$
+(`test_cvar_equals_topk_at_optimum`: diff < 0.05 on a random 100-cell
+density vector). Density and blockage gradients pass autograd
+finiteness checks.
+
+**Why disabled by default in v7:** the HPWL surrogate inner loop is
+still a Python `for net in nets:` — at ibm01 with 5993 nets and
+$\tau = 100$, 50 Adam steps take ~5 minutes vs ~5 seconds for the
+Laplacian closed-form. Vectorizing via PyTorch `segment_logsumexp`
+(scatter-reduce(amax) for the max-shift, then segment_sum_exp) is
+~30 min of additional work and would bring the surrogate to
+parity with v6 GPU CD's per-step cost. Deferred to v8 because the
+Laplacian piece already captures most of the HPWL-only basin
+shaping for the soft-resolve case. The novel lift comes from
+CVaR-driven density/congestion shaping, which now works
+math-correctly but at unusable speed.
 
 ## Pipeline, end-to-end
 
@@ -147,7 +166,7 @@ Phase 2: Laplacian soft-resolve on the portfolio result
 
 Phase 3: AUTO basin-hopping if post-Laplacian cost ≥ 1.0
          each hop: perturb → reduced single-worker pipeline → strict accept
-         up to 3 hops at 300s each; σ cools 0.30·D → 0.04·D
+         up to 3 hops at 300s each; σ cools 0.10·D → 0.036·D
    → "post-basin cost" (≤ post-Laplacian cost)
 
 Return: best of {portfolio, Laplacian, basin-hop} (always overlap-free).
@@ -174,7 +193,7 @@ PLACER_V7_LAPLACIAN_BUDGET_FRAC=0.04
 PLACER_V7_BASIN_HOPS=0              # 0=auto (only on hard benches), N=force
 PLACER_V7_BASIN_HOP_BUDGET=300      # seconds per basin hop
 PLACER_V7_BASIN_HOP_AUTO=1.00       # auto-fire threshold (post-Laplacian cost)
-PLACER_V7_BASIN_SIGMA0=0.30         # initial perturb σ as fraction of canvas_diag
+PLACER_V7_BASIN_SIGMA0=0.10         # initial perturb σ as fraction of canvas_diag
 ```
 
 ## Honest expectations
@@ -201,24 +220,46 @@ genuinely novel optimization piece. Estimated 1–2 more days of work.
 
 ```
 submissions/vmallela_v7/
-├── README.md                  this file
-├── placer.py                  OptimalPlacer entry; orchestrates v6 →
-│                              Laplacian → basin-hop
-├── run.sh                     locked-env launcher
-├── _soft_laplacian.py         clique-model Laplacian + line-search refine
-├── _basin_hop.py              outer-loop wrapper (algorithm + math docs)
-└── _smooth_proxy.py           Adam + CVaR scaffolding (HPWL-only active)
+├── README.md                       this file
+├── placer.py                       OptimalPlacer entry; orchestrates v6 →
+│                                   Laplacian → basin-hop
+├── run.sh                          locked-env launcher
+├── _soft_laplacian.py              clique-model Laplacian + line-search refine
+├── _basin_hop.py                   outer-loop wrapper (algorithm + math docs)
+├── _smooth_proxy.py                Adam + CVaR scaffolding (disabled by default)
+├── _cell_window.py                 per-macro window indices for tractable
+│                                   density/congestion gradients
+└── tests/test_cell_window_math.py  6 math validations (CVaR exactness,
+                                    softplus → ReLU, lse → max,
+                                    autograd finiteness)
 ```
 
 ## Validation
 
-The Laplacian construction passes:
-- $\| L - L^T \|_F < 10^{-13}$ (symmetric)
-- 5 smallest eigenvalues $\geq 0$ (PSD)
+**Laplacian construction** (numerical):
+- $\| L - L^T \|_F = 1.5 \times 10^{-14}$ (symmetric to machine ε)
+- 5 smallest eigenvalues $\geq 0$ (PSD; one near-zero translation mode)
 - CG residual $< 10^{-3}$ at default tolerance
-- Improves cost by $\geq 0.05$ on ibm01 from legalize+refine state
+- Improves cost by $\Delta = -0.072$ on ibm01 from legalize+refine state
+  in 1.4 s (1.0559 → 0.9838)
 
-Basin-hopping math is canonical (Wales 1999); no new claim.
+**Cell-window math** (`tests/test_cell_window_math.py`, all 6 pass):
+- `test_window_includes_footprint`: every cell touched by a macro's
+  rectangular footprint is in its window (no false negatives at margin 2)
+- `test_softplus_converges_to_relu`: $\| \mathrm{softplus}_{100} - \mathrm{ReLU}\|_\infty < 10^{-2}$
+- `test_lse_converges_to_max`: $|\mathrm{LSE}_{200} - \max| < 0.05$
+- `test_cvar_equals_topk_at_optimum`: at $\mu = 1000$ and
+  $t^* = \rho_{(n-K)}$, $\mathrm{CVaR}_\mu = $ top-K mean exactly to
+  4 decimal places (4.7286 vs 4.7286, $\Delta < 5\times 10^{-5}$)
+- `test_density_gradient_flows`: autograd through
+  `smooth_density_grid` produces finite gradients
+- `test_blockage_gradient_flows`: autograd through
+  `smooth_macro_blockage` produces finite gradients
 
-CVaR equivalence (top-K = CVaR at optimum) is a textbook result
-(Rockafellar-Uryasev 2000); we apply it to placement.
+**Basin-hopping** math is canonical (Wales 1999); no new claim.
+The σ-tuning was the only empirical decision (validated on ibm15;
+0.30·D rejected, 0.10·D in production).
+
+**CVaR equivalence** (top-K = CVaR at $t^* = \rho_{(n-K)}$) is a
+textbook result (Rockafellar-Uryasev 2000); we apply it to placement
+density/congestion top-K terms, which is the novel piece.
