@@ -556,6 +556,8 @@ def adam_warm_start(
     enable_congestion: bool = True,
     window_margin_cells: int = 4,
     snapshot_every: int = 50,
+    k_dens_frac: float = 0.10,
+    k_cong_frac: float = 0.02,
     verbose: bool = False,
 ) -> tuple[np.ndarray, dict]:
     """Run Adam on the smooth surrogate (LSE-HPWL + CVaR top-K density +
@@ -609,8 +611,14 @@ def adam_warm_start(
     H_smooth = torch.tensor(np.asarray(incr_eval.H_routing_smooth), dtype=torch.float32, device=device)
     proximal_anchor = macro_pos_init.clone().detach()
 
-    K_d = max(1, math.floor(incr_eval.n_cells * 0.1))
-    K_c = max(1, math.floor(2 * incr_eval.n_cells * 0.05))
+    # Segmented α — density and congestion get separate top-K targets.
+    # Defaults: K_d = 10% n_cells (matches exact-proxy density top-K),
+    #           K_c = 2% × 2·n_cells (sniper rifle on bottleneck edges,
+    #           tighter than the exact-proxy's top-5%; the gradient
+    #           focuses on the narrow channels rather than averaging
+    #           across the warm-but-not-broken cells).
+    K_d = max(1, math.floor(incr_eval.n_cells * k_dens_frac))
+    K_c = max(1, math.floor(2 * incr_eval.n_cells * k_cong_frac))
 
     lr = lr_frac_canvas * canvas_diag
     proximal_weight = proximal_weight_frac / (canvas_diag ** 2)
@@ -743,7 +751,7 @@ def adam_warm_start(
         history["hpwl"].append(float(hpwl.item()))
         history["density"].append(float(dens.item()) if enable_density else 0.0)
         history["cong"].append(float(cong.item()) if enable_congestion else 0.0)
-        if verbose and (step % 100 == 0 or step == n_steps - 1):
+        if verbose and (step % 25 == 0 or step == n_steps - 1):
             print(f"    [adam] step {step}: loss={loss.item():.6f} "
                   f"HPWL={hpwl.item():.4f} "
                   f"den={(dens.item() if enable_density else 0.0):.4f} "

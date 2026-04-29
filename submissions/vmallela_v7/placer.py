@@ -261,6 +261,11 @@ class OptimalPlacer:
                 "PLACER_V7_ADAM_SOFT_ONLY", "1") == "1")
             adam_inertia = float(os.environ.get(
                 "PLACER_V7_ADAM_INERTIA", "1.0"))
+            # Segmented α: density top-10%, congestion top-2% (sniper).
+            k_dens_frac = float(os.environ.get(
+                "PLACER_V7_K_DENS_FRAC", "0.10"))
+            k_cong_frac = float(os.environ.get(
+                "PLACER_V7_K_CONG_FRAC", "0.02"))
             try:
                 from _smooth_proxy import adam_warm_start
                 # Build a fresh IncrementalEvaluator synced to current pos.
@@ -294,7 +299,9 @@ class OptimalPlacer:
                     enable_congestion=True,
                     window_margin_cells=4,
                     snapshot_every=25,
-                    verbose=False,
+                    k_dens_frac=k_dens_frac,
+                    k_cong_frac=k_cong_frac,
+                    verbose=True,    # log per-step HPWL/density/cong trajectories
                 )
                 adam_tensor = torch.tensor(pos_adam, dtype=torch.float32)
                 # Validate via official PlacementCost.
