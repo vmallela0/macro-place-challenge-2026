@@ -275,6 +275,20 @@ class OptimalPlacer:
                 "PLACER_V7_ADAM_SNAPSHOT_EVERY", "10"))
             adam_validate_every = int(os.environ.get(
                 "PLACER_V7_ADAM_VALIDATE_EVERY", "25"))
+            # Honest-surrogate fail-safe modes:
+            #   Mode A (HPWL+density only):  PLACER_V7_ADAM_ENABLE_CONG=0
+            #     The congestion surrogate is "proxy of a proxy" — V_routing
+            #     is frozen at the pre-Adam state and divides by grid_v_routes
+            #     instead of vrouting_alloc. Adam happily drives surrogate
+            #     congestion down while exact congestion gets worse. Disabling
+            #     it removes the lying gradient.
+            #   Mode B (HPWL only):  ADAM_ENABLE_CONG=0 + ADAM_ENABLE_DENS=0
+            #     Smooth refinement of the Laplacian solve only. The
+            #     "nuclear" honest option.
+            adam_enable_dens = (os.environ.get(
+                "PLACER_V7_ADAM_ENABLE_DENS", "1") == "1")
+            adam_enable_cong = (os.environ.get(
+                "PLACER_V7_ADAM_ENABLE_CONG", "1") == "1")
             try:
                 from _smooth_proxy import adam_warm_start
                 # Build a fresh IncrementalEvaluator synced to current pos.
@@ -304,8 +318,8 @@ class OptimalPlacer:
                     lr_frac_canvas=adam_lr_frac,
                     proximal_weight_frac=adam_inertia,
                     soft_only=adam_soft_only,
-                    enable_density=True,
-                    enable_congestion=True,
+                    enable_density=adam_enable_dens,
+                    enable_congestion=adam_enable_cong,
                     window_margin_cells=4,
                     snapshot_every=adam_snapshot_every,
                     validate_every=adam_validate_every,
