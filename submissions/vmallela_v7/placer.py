@@ -121,8 +121,12 @@ class OptimalPlacer:
         self.LAPLACIAN_PASSES = int(os.environ.get(
             "PLACER_V7_LAPLACIAN_PASSES", "2"))
         self.BASIN_HOP_N = int(os.environ.get("PLACER_V7_BASIN_HOPS", "0"))
+        # 0.10·canvas_diag is gentle enough to stay close to the
+        # current basin while still moving softs by ~1-2 cell widths.
+        # 0.30 (the original Wales-Doye default) is too aggressive for
+        # a placement objective with steep basin walls.
         self.BASIN_HOP_SIGMA0 = float(os.environ.get(
-            "PLACER_V7_BASIN_SIGMA0", "0.30"))
+            "PLACER_V7_BASIN_SIGMA0", "0.10"))
         self.LAPLACIAN_FRACTION = float(os.environ.get(
             "PLACER_V7_LAPLACIAN_BUDGET_FRAC", "0.04"))
 

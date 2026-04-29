@@ -240,6 +240,8 @@ def smooth_proxy_for_v7(
     proximal_weight: float = 0.0,
     hard_only_proximal: bool = True,
     n_hard: int = 0,
+    cell_idx_density: torch.Tensor = None,    # (n_total, K_max) int (-1 pad)
+    cell_idx_cong: torch.Tensor = None,       # (n_total, K_max) int (-1 pad)
 ):
     """Smooth surrogate of the exact proxy. Differentiable in macro_pos,
     t_density, t_cong. All other arguments are constants (detached).
@@ -294,44 +296,40 @@ def smooth_proxy_for_v7(
         hpwl_total = hpwl_total + net_weight[i] * (bbox_x + bbox_y)
     hpwl_norm = hpwl_total / ((cw + ch) * net_cnt)
 
-    # ── Density grid via softplus rectangle-overlap ─────────────────
-    # For each macro m, footprint cells are determined by floor of
-    # corner positions. A smooth surrogate is:
-    #   density_c = (1 / cell_area) · Σ_m softplus_μ(x_overlap) · softplus_μ(y_overlap)
-    # over a tile of cells around the macro center.
-    #
-    # For Adam we want gradient flow w.r.t. macro_pos. The cell index
-    # map (which cells the footprint covers) IS NOT differentiable —
-    # it's an integer-floor function. We handle this with a "soft
-    # window": for each macro, we evaluate softplus overlap with EVERY
-    # cell in a window of size ⌈max_w/grid_w⌉+2 × ⌈max_h/grid_h⌉+2 around
-    # its current center. Cells outside this window contribute zero
-    # (their softplus is essentially zero).
-    #
-    # The window's identity is fixed by the macro's STARTING position
-    # (snapshot) — moving the macro within the window produces a smooth
-    # gradient. Moving outside the window requires re-snapshotting
-    # (which we do every K Adam steps).
-
-    # For the prototype we'll skip the windowing and compute a (n_total,
-    # n_cells) overlap matrix. Memory: n_total · n_cells · 4 bytes.
-    # For ibm17 (~6500 macros, 30k cells) → 800 MB. Too much.
-    #
-    # Workable simplification: compute density over a COARSE grid first
-    # for Adam gradient flow, then snap to fine grid post-Adam. Or only
-    # compute soft macros' contribution to density (since they dominate
-    # in the sparse benches we're targeting).
-    #
-    # For now: ZERO out the density term in the surrogate (treat as
-    # constant). HPWL gradient + congestion gradient drive the
-    # optimization, density is checked at the snap-to-exact step.
-    # This is a deliberately conservative simplification for the
-    # initial smoke test.
-    density_smooth = torch.zeros((), device=device, dtype=macro_pos.dtype)
+    # ── Density grid via softplus rectangle-overlap (windowed) ──────
+    # See _cell_window.py for the full math derivation. Windowed for
+    # tractability: for each macro, evaluate overlap only in cells
+    # within `margin_cells` of the footprint. Re-snapshot every K Adam
+    # steps. See docstring of `cell_idx_density` parameter.
+    if cell_idx_density is None:
+        density_smooth = torch.zeros((), device=device, dtype=macro_pos.dtype)
+    else:
+        from _cell_window import smooth_density_grid
+        rho = smooth_density_grid(
+            macro_pos, macro_w, macro_h, cell_idx_density,
+            grid_col, grid_row, grid_w, grid_h,
+            n_cells=grid_col * grid_row, cell_area=cell_area, mu=mu_softplus)
+        density_smooth = cvar_smooth(rho.unsqueeze(0), K_density,
+                                      t_density, mu=mu_softplus).squeeze()
 
     # ── Congestion via macro-blockage softplus + frozen routing ─────
-    # Same windowing argument; same simplification for prototype.
-    cong_smooth = torch.zeros((), device=device, dtype=macro_pos.dtype)
+    # V_total = V_routing_smooth (frozen) + V_macro(macro_pos)/grid_v_routes
+    # H_total similarly. CVaR top-5% over (V_total ∪ H_total).
+    if cell_idx_cong is None:
+        cong_smooth = torch.zeros((), device=device, dtype=macro_pos.dtype)
+    else:
+        from _cell_window import smooth_macro_blockage
+        V_macro, H_macro = smooth_macro_blockage(
+            macro_pos, macro_w, macro_h, cell_idx_cong,
+            grid_col, grid_row, grid_w, grid_h,
+            n_cells=grid_col * grid_row,
+            vrouting_alloc=vrouting_alloc,
+            hrouting_alloc=hrouting_alloc, mu=mu_softplus)
+        V_total = V_smooth_frozen + V_macro / grid_v_routes
+        H_total = H_smooth_frozen + H_macro / grid_h_routes
+        combined = torch.cat([V_total, H_total], dim=0)
+        cong_smooth = cvar_smooth(combined.unsqueeze(0), K_cong,
+                                   t_cong, mu=mu_softplus).squeeze()
 
     # ── Proximal regularization ────────────────────────────────────
     proximal = torch.zeros((), device=device, dtype=macro_pos.dtype)
@@ -356,18 +354,34 @@ def adam_warm_start(
     lr_frac_canvas: float = 0.02,
     proximal_weight_frac: float = 1.0,
     soft_only: bool = True,
+    enable_density: bool = True,
+    enable_congestion: bool = True,
+    window_margin_cells: int = 4,
+    snapshot_every: int = 50,
     verbose: bool = False,
 ) -> tuple[np.ndarray, dict]:
-    """Run Adam on the smooth HPWL surrogate (with proximal anchor on
-    hards) starting from incr_eval's current placement. Returns the
-    optimized full (n_total, 2) placement.
+    """Run Adam on the smooth surrogate (LSE-HPWL + CVaR top-K density +
+    CVaR top-K congestion) starting from incr_eval's current placement.
+    Returns the optimized full (n_total, 2) placement.
 
-    NOTE: prototype version. Density and congestion are treated as
-    constants (pinned to their current values) — the optimizer follows
-    only the HPWL gradient. This is a pragmatic v0 that we can iterate
-    on. Even HPWL-only Adam should give a meaningful warm-start since
-    HPWL is ~10 % of cost AND drives congestion / density indirectly
-    through soft-cell positioning.
+    Density / congestion gradients use cell-window truncation (see
+    _cell_window.py). Windows re-snapshot every `snapshot_every` Adam
+    steps so macros that drift outside their initial window get a fresh
+    one.
+
+    Parameters
+    ----------
+    n_steps : Adam steps total
+    lr_frac_canvas : Adam learning rate as fraction of canvas_diag
+    enable_density : if True, include CVaR density in the surrogate
+    enable_congestion : if True, include CVaR congestion (with frozen
+        per-net routing demand from incr_eval, only macro-blockage
+        contribution is differentiable)
+    window_margin_cells : margin around each macro footprint for the
+        density/cong window (4 = ~5-cell buffer in each direction)
+    snapshot_every : re-build cell windows every this many Adam steps.
+        Smaller = more accurate but more expensive (window construction
+        is O(n_total · K)).
     """
     device = _select_device()
     n_total = incr_eval.macro_pos.shape[0]
@@ -407,9 +421,28 @@ def adam_warm_start(
     opt = torch.optim.Adam([macro_pos, t_density, t_cong], lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_steps)
 
-    history = {"loss": [], "hpwl": []}
+    from _cell_window import build_window_indices
+    cell_idx_d = None
+    cell_idx_c = None
+
+    history = {"loss": [], "hpwl": [], "density": [], "cong": []}
     t0 = time.time()
     for step in range(n_steps):
+        # Re-snapshot the cell windows periodically.
+        if (enable_density or enable_congestion) and (step % snapshot_every == 0):
+            cell_idx, K_max = build_window_indices(
+                macro_pos.detach(), macro_w, macro_h,
+                grid_col=incr_eval.grid_col, grid_row=incr_eval.grid_row,
+                grid_w=incr_eval.grid_width, grid_h=incr_eval.grid_height,
+                margin_cells=window_margin_cells)
+            if enable_density:
+                cell_idx_d = cell_idx
+            if enable_congestion:
+                cell_idx_c = cell_idx
+            if verbose and step == 0:
+                print(f"    [adam] cell window K_max = {K_max} "
+                      f"(margin={window_margin_cells} cells)", flush=True)
+
         opt.zero_grad()
         loss, components = smooth_proxy_for_v7(
             macro_pos, t_density, t_cong,
@@ -430,6 +463,8 @@ def adam_warm_start(
             proximal_pos=proximal_anchor,
             proximal_weight=proximal_weight,
             hard_only_proximal=True, n_hard=n_hard,
+            cell_idx_density=cell_idx_d,
+            cell_idx_cong=cell_idx_c,
         )
         loss.backward()
         # Optional: zero-out hard-macro gradients if soft_only
@@ -446,9 +481,13 @@ def adam_warm_start(
 
         history["loss"].append(float(loss.item()))
         history["hpwl"].append(float(components["hpwl"].item()))
+        history["density"].append(float(components["density"].item()))
+        history["cong"].append(float(components["cong"].item()))
         if verbose and (step % 100 == 0 or step == n_steps - 1):
             print(f"    [adam] step {step}: loss={loss.item():.6f} "
-                  f"HPWL_norm={components['hpwl'].item():.6f} "
+                  f"HPWL={components['hpwl'].item():.4f} "
+                  f"den={components['density'].item():.4f} "
+                  f"cng={components['cong'].item():.4f} "
                   f"({time.time()-t0:.1f}s)", flush=True)
 
     pos_final = macro_pos.detach().cpu().numpy().astype(np.float64)

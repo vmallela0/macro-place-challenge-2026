@@ -24,6 +24,12 @@ export PLACER_ESC_HARD_DESTROY=${PLACER_ESC_HARD_DESTROY:-80}
 export PLACER_V7_LAPLACIAN=${PLACER_V7_LAPLACIAN:-1}
 export PLACER_V7_LAPLACIAN_PASSES=${PLACER_V7_LAPLACIAN_PASSES:-2}
 export PLACER_V7_LAPLACIAN_BUDGET_FRAC=${PLACER_V7_LAPLACIAN_BUDGET_FRAC:-0.04}
+# 0 = auto-trigger basin-hop only when post-Laplacian cost ≥ 1.0
+# >0 = force N hops regardless. σ_0 is conservative (0.10·canvas_diag)
+# since aggressive perturbation tends to push softs outside any
+# reachable basin within the per-hop budget.
 export PLACER_V7_BASIN_HOPS=${PLACER_V7_BASIN_HOPS:-0}
+export PLACER_V7_BASIN_SIGMA0=${PLACER_V7_BASIN_SIGMA0:-0.10}
+export PLACER_V7_BASIN_HOP_BUDGET=${PLACER_V7_BASIN_HOP_BUDGET:-300}
 
 exec uv run evaluate submissions/vmallela_v7/placer.py "$@"
