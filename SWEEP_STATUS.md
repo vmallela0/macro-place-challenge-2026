@@ -1,9 +1,10 @@
 # Overnight v6 sweep — status (2nd run, with determinism fixes + viz)
 
-**Scheduled start:** 2026-04-28 **19:10:00 PDT** (delayed kickoff)
-**Kickoff wrapper PID:** 22100 (sleeps until 19:10 then exec's the sweep)
-**Caffeinate:** spawned by the kickoff wrapper at start time (no manual mgmt needed)
-**Results dir:** `/tmp/v6_overnight_<TIMESTAMP>/` — created at start time
+**Started:** 2026-04-28 **18:28:54 PDT** (kickoff cancelled, ran early)
+**Sweep PID:** 23242
+**Caffeinate PID:** 23269
+**Results dir:** `/tmp/v6_overnight_20260428_182854/`
+**ETA done:** ~03:30 AM (~9 hours, 17 benches × ~32 min)
 
 **Previous run (1st sweep):** completed; results at
 `/tmp/v6_overnight_20260428_013503/`. 1.0196 mean over 17 IBM benches.
