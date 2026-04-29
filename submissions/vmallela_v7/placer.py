@@ -249,7 +249,12 @@ class OptimalPlacer:
         # Off by default; PLACER_V7_ADAM=1 enables it.
         if (os.environ.get("PLACER_V7_ADAM", "0") == "1"
                 and overlaps == 0):
-            adam_steps = int(os.environ.get("PLACER_V7_ADAM_STEPS", "200"))
+            # Default 300: 50 Adam steps cost ~1.85s on ibm01 (MPS), so 300
+            # ≈ 11 s — fits comfortably in the 450 s reserve. Cosine-annealed
+            # lr means later steps make small corrections; beyond ~300 the
+            # marginal step is in the noise. Bigger lever for next iteration
+            # is τ-annealing (LSE sharpness schedule), not raw step count.
+            adam_steps = int(os.environ.get("PLACER_V7_ADAM_STEPS", "300"))
             adam_lr_frac = float(os.environ.get(
                 "PLACER_V7_ADAM_LR_FRAC", "0.02"))
             adam_soft_only = (os.environ.get(

@@ -28,6 +28,66 @@ v6 wins/loses lives at:
 
 → **[`submissions/vmallela_v6/README.md`](submissions/vmallela_v6/README.md)**
 
+## v7-combinatorial (in flight)
+
+A four-layer stack on top of v6 targeting the hard sparse benches.
+
+```
+v6 portfolio (8 workers + GPU CD + consensus)         →  1.0184 mean
+   ↓
+Layer 1 — Laplacian soft-resolve
+   Closed-form HPWL minimum for soft macros given fixed hards via
+   clique-model Laplacian L solving L_ff x_f = -L_fc x_c. Per-soft
+   line search with full-proxy strict-improvement gating; never
+   regresses. Validated on ibm01: 1.056 → 0.984 in 1.4 s.
+   ↓
+Layer 2 — Topological basin-hopping (Wales-Doye 1997)
+   σ-perturb → reduced single-worker pipeline → strict accept.
+   σ_0 = 0.10·canvas_diag (tuned via 9-config grid; 0.30·D too
+   aggressive on ibm15, 0.05·D doesn't escape).
+   ↓
+Layer 3 — Adam Phase 4.5 (PLACER_V7_ADAM=1; off by default)
+   Fully vectorized smooth surrogate:
+     • LSE-HPWL via scatter_reduce(amax) + scatter_add(exp).
+       O(P) compute (P = total pins). 60× speedup vs Python loop:
+       50 steps on 6k-net synthetic in 0.48 s on MPS.
+       Numerical parity vs Python reference: 4.6e-7 value, 3.6e-8 grad.
+     • CVaR top-K density / congestion (Rockafellar-Uryasev 2000):
+       focuses gradient on the tail (top 10% hottest cells), not
+       the bulk — the bulk-gradient is what would otherwise drown
+       out the hot-cell signal. CVaR exactly equals the top-K mean
+       at t* = ρ_(n-K) (numerically verified at μ=1000).
+     • Cell-window truncation: O(K_max) cells per macro, snapshotted
+       every 25 steps. Density and blockage gradients pass autograd
+       finiteness checks.
+     • GradNorm component balancing (Chen et al. 2018): per-component
+       initial gradient norms on ibm01 are HPWL=9.9e-4, density=0.115,
+       cong=0.456 — without GradNorm, density/cong gradients are
+       100×–500× larger than HPWL and the optimizer treats HPWL as
+       essentially zero. GradNorm freezes per-component scale at
+       step 0 so all three contribute on equal footing.
+     • Strict-improvement gate via compute_proxy_cost — Adam can
+       never make the placement worse than the post-Laplacian state.
+   ↓
+Layer 4 — Hard macro gradient drift (T3, soft_only=0)
+   Hard macros added to Adam parameter set with quadratic inertia
+   penalty toward init position. Lets the floorplan "breathe"
+   during the smooth phase before final legalization. Bounded
+   to <5 cells of drift; validated on ibm01.
+```
+
+Per-bench sweep results: **TBD** — sweep with tuned basin-hop +
+Adam Phase 4.5 enabled is queued for kickoff at 16:42 PDT
+2026-04-29 after the 9-config σ × hops mini-grid on ibm15
+completes. Results land at
+[`submissions/vmallela_v7/sweep_results.csv`](submissions/vmallela_v7/)
+and the v7 README is auto-updated by `scripts/v7_results_to_readme.py`.
+
+The detailed v7 writeup with the math derivations, validation tests,
+performance numbers, and architecture diagram lives at:
+
+→ **[`submissions/vmallela_v7/README.md`](submissions/vmallela_v7/README.md)**
+
 ## v6 visualizations
 
 ### Static placements (17 benches)
