@@ -132,9 +132,21 @@ class OptimalPlacer:
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         bench_path = _benchmark_pt_path(benchmark.name)
-        per_worker_budget = self.TOTAL_TIME_LIMIT
         log_prefix = "  "
         t0 = time.time()
+
+        # Reserve time at the tail for Laplacian + basin-hopping. The
+        # portfolio's per-worker budget is shrunk by this amount so that
+        # the final time_remaining check leaves room for at least
+        # ceil(reserve / hop_budget) basin-hops on hard benches.
+        # Default 0 preserves prior behavior (basin-hop only fires when
+        # portfolio happens to underrun TOTAL_TIME_LIMIT, which is rare).
+        # Sweep harnesses set this to ~450 to guarantee 1-2 hops fire.
+        basin_reserve = int(os.environ.get("PLACER_V7_BASIN_HOP_RESERVE", "0"))
+        per_worker_budget = max(300, self.TOTAL_TIME_LIMIT - basin_reserve)
+        if basin_reserve > 0:
+            print(f"  [v7] reserving {basin_reserve}s for laplacian+basin-hop "
+                  f"(portfolio budget: {per_worker_budget}s)", flush=True)
 
         # Phase 1+2+3: standard v6 portfolio pipeline.
         from _portfolio import run_portfolio
