@@ -508,6 +508,37 @@ class OptimalPlacer:
                 print(f"  [v7.hop {hop}] SP swap k={sp_n_swaps} "
                       f"(scale={scale:.3f}), running single-worker pipeline "
                       f"at {hop_budget}s...", flush=True)
+            elif perturb_mode == "levy":
+                # Lévy α-stable noise: heavy-tailed, occasional large jumps.
+                # α=2 is Gaussian; α=1 is Cauchy. α≈1.5 gives jumps that are
+                # mostly small but ~5% of samples make big topology-crossing
+                # moves. Provably better mixing for multimodal landscapes
+                # than Gaussian (Yang-Deb 2009; Pavlyukevich 2007).
+                from scipy.stats import levy_stable
+                alpha = float(os.environ.get(
+                    "PLACER_V7_LEVY_ALPHA", "1.5"))
+                sigma_soft = self.BASIN_HOP_SIGMA0 * (0.6 ** (hop - 1)) * canvas_diag
+                sigma_hard = sigma_soft * 0.25
+                perturbed = best_pos.cpu().numpy().astype(np.float64).copy()
+                seed_h = int(rng.integers(0, 2**31 - 1))
+                seed_s = int(rng.integers(0, 2**31 - 1))
+                noise = np.zeros_like(perturbed)
+                noise[:n_hard] = levy_stable.rvs(
+                    alpha=alpha, beta=0.0, scale=sigma_hard,
+                    size=(n_hard, 2), random_state=seed_h)
+                noise[n_hard:n_total] = levy_stable.rvs(
+                    alpha=alpha, beta=0.0, scale=sigma_soft,
+                    size=(n_total - n_hard, 2), random_state=seed_s)
+                perturbed = perturbed + noise
+                perturbed[:, 0] = np.clip(perturbed[:, 0], 0.0, cw)
+                perturbed[:, 1] = np.clip(perturbed[:, 1], 0.0, ch)
+                # Stats on the noise to track tail heaviness in the log
+                soft_jumps = np.linalg.norm(noise[n_hard:n_total], axis=1)
+                p99 = float(np.percentile(soft_jumps, 99))
+                pmax = float(np.max(soft_jumps))
+                print(f"  [v7.hop {hop}] LEVY α={alpha} σ_soft={sigma_soft:.2f} "
+                      f"(p99={p99:.2f} max={pmax:.2f}), running single-worker "
+                      f"pipeline at {hop_budget}s...", flush=True)
             else:
                 sigma_soft = self.BASIN_HOP_SIGMA0 * (0.6 ** (hop - 1)) * canvas_diag
                 sigma_hard = sigma_soft * 0.25
