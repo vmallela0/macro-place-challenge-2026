@@ -242,6 +242,35 @@ class OptimalPlacer:
             except Exception as e:
                 print(f"  [v7] laplacian err: {e}", flush=True)
 
+        # ── Phase 4.6: Hessian negative-eigenvector escape ─────────────
+        # At post-Laplacian state, compute Hessian of smooth surrogate.
+        # If λ_min < 0, we're at a saddle: v_min is the curvature-down
+        # escape direction (transition-state theory). Generate K
+        # perturbed candidates by stepping along ±v_min at multiple
+        # step sizes; run a SHORT pipeline from each in parallel; take
+        # min, strict-improvement gate. Off by default;
+        # PLACER_V7_HESSIAN=1 enables.
+        if (os.environ.get("PLACER_V7_HESSIAN", "0") == "1"
+                and overlaps == 0):
+            hess_steps_str = os.environ.get(
+                "PLACER_V7_HESSIAN_STEPS", "0.02,-0.02,0.05,-0.05")
+            hess_steps = [float(s) for s in hess_steps_str.split(",") if s]
+            hess_budget = int(os.environ.get(
+                "PLACER_V7_HESSIAN_BUDGET", "300"))
+            hess_n_lanczos = int(os.environ.get(
+                "PLACER_V7_HESSIAN_LANCZOS", "50"))
+            try:
+                portfolio_pos, portfolio_cost = self._hessian_escape_phase(
+                    portfolio_pos, portfolio_cost, bench_path,
+                    hess_steps, hess_budget, hess_n_lanczos)
+                # Re-eval in case
+                if isinstance(portfolio_pos, np.ndarray):
+                    portfolio_pos = torch.tensor(portfolio_pos, dtype=torch.float32)
+                overlaps = 0   # all candidates pre-validated overlap-free
+            except Exception as e:
+                print(f"  [v7] hessian err: {type(e).__name__}: {e}; "
+                      f"keeping post-Laplacian", flush=True)
+
         # ── Phase 4.5: Adam polish on the smooth surrogate ─────────────
         # Vectorized LSE-HPWL + CVaR top-K density/congestion via
         # cell-window scatter, with GradNorm component balancing.
@@ -737,6 +766,153 @@ class OptimalPlacer:
         print(f"  [v7] basin-hopping done. {accepted}/{n_hops} accepted.",
               flush=True)
         return best_pos, best_cost
+
+    def _hessian_escape_phase(self, current_pos, current_cost, bench_path,
+                                step_sizes, hop_budget, n_lanczos_iters):
+        """Phase 4.6: Hessian negative-eigenvector escape.
+
+        Compute Hessian of smooth surrogate at the post-Laplacian state.
+        The smallest-eigenvalue eigenvector v_min is the curvature-down
+        direction (transition-state theory). Generate len(step_sizes)
+        candidates by perturbing along step·v_min, run a reduced
+        pipeline from each in parallel via mp.Pool, take min, strict
+        improvement gate.
+        """
+        import multiprocessing as _mp
+        from _hessian_escape import hessian_escape_step
+        from _smooth_proxy import (lse_hpwl_vectorized, build_pin_to_net,
+                                     cvar_smooth)
+        from _cell_window import (build_window_indices, smooth_density_grid)
+        from _hessian_worker import hessian_candidate_worker
+        import importlib.util as _ilu
+
+        bench = Benchmark.load(bench_path)
+        n_hard = bench.num_hard_macros
+        canvas_diag = math.hypot(
+            float(bench.canvas_width), float(bench.canvas_height))
+
+        # Build IncrementalEvaluator at the current placement
+        v1_spec = _ilu.spec_from_file_location(
+            "_v1_v7_hess",
+            str(_HERE.parent / "vmallela" / "placer.py"))
+        v1 = _ilu.module_from_spec(v1_spec)
+        v1_spec.loader.exec_module(v1)
+        plc = v1._load_plc(bench.name)
+        incr = v1.IncrementalEvaluator(plc, bench)
+        incr.macro_pos[:] = current_pos.cpu().numpy()
+        incr._recompute_pin_positions()
+        incr._full_recompute_wl()
+        incr._full_recompute_density()
+        incr._full_recompute_congestion()
+
+        # Build smooth-surrogate closure (HPWL + density only; cong is
+        # too far from exact, omitted)
+        device = (torch.device("mps")
+                  if torch.backends.mps.is_available()
+                  else torch.device("cpu"))
+        macro_pos_t = torch.tensor(
+            np.asarray(incr.macro_pos), dtype=torch.float32, device=device)
+        pin_macro_t = torch.tensor(
+            np.asarray(incr.pin_macro), dtype=torch.long, device=device)
+        pin_xoff_t = torch.tensor(
+            np.asarray(incr.pin_xoff), dtype=torch.float32, device=device)
+        pin_yoff_t = torch.tensor(
+            np.asarray(incr.pin_yoff), dtype=torch.float32, device=device)
+        net_starts_t = torch.tensor(
+            np.asarray(incr.net_starts), dtype=torch.long, device=device)
+        net_weight_t = torch.tensor(
+            np.asarray(incr.net_weight), dtype=torch.float32, device=device)
+        macro_w_t = torch.tensor(
+            np.asarray(incr.macro_w), dtype=torch.float32, device=device)
+        macro_h_t = torch.tensor(
+            np.asarray(incr.macro_h), dtype=torch.float32, device=device)
+        pin_to_net_t = build_pin_to_net(net_starts_t)
+        n_nets = int(net_weight_t.shape[0])
+        cell_idx_d, _ = build_window_indices(
+            macro_pos_t.detach(), macro_w_t, macro_h_t,
+            grid_col=incr.grid_col, grid_row=incr.grid_row,
+            grid_w=incr.grid_width, grid_h=incr.grid_height,
+            margin_cells=4)
+        cw_f, ch_f = float(incr.cw), float(incr.ch)
+        net_cnt = float(incr.net_cnt)
+        K_d = max(1, int(0.10 * incr.n_cells))
+
+        def smooth_proxy_call(macro_pos_var):
+            is_port = (pin_macro_t < 0)
+            safe = torch.where(is_port, torch.zeros_like(pin_macro_t), pin_macro_t)
+            macro_xy = macro_pos_var[safe]
+            pin_x = torch.where(is_port, pin_xoff_t, macro_xy[:, 0] + pin_xoff_t)
+            pin_y = torch.where(is_port, pin_yoff_t, macro_xy[:, 1] + pin_yoff_t)
+            hpwl = lse_hpwl_vectorized(
+                pin_x, pin_y, pin_to_net_t, net_weight_t, n_nets,
+                cw=cw_f, ch=ch_f, net_cnt=net_cnt, tau_lse=50.0)
+            rho = smooth_density_grid(
+                macro_pos_var, macro_w_t, macro_h_t, cell_idx_d,
+                incr.grid_col, incr.grid_row,
+                incr.grid_width, incr.grid_height,
+                n_cells=incr.n_cells, cell_area=incr.grid_area, mu=100.0)
+            with torch.no_grad():
+                t_d = torch.quantile(rho, 1.0 - K_d / incr.n_cells)
+            density_smooth = cvar_smooth(rho.unsqueeze(0), K_d, t_d.detach(),
+                                           mu=100.0).squeeze()
+            return hpwl + 0.5 * density_smooth
+
+        # Compute Hessian eigvec
+        t_h = time.time()
+        candidates, diag = hessian_escape_step(
+            macro_pos_t, smooth_proxy_call,
+            step_sizes=step_sizes,
+            canvas_diag=canvas_diag,
+            n_lanczos_iters=n_lanczos_iters,
+            n_hard=n_hard,
+            soft_only_perturb=True,
+            verbose=True)
+        if not candidates:
+            print(f"  [v7] hessian: no candidates (eigvec degenerate); "
+                  f"keeping post-Lap", flush=True)
+            return current_pos, current_cost
+        print(f"  [v7] hessian: λ_min={diag['lambda_min']:.6f}, "
+              f"computed eigvec in {time.time()-t_h:.1f}s, "
+              f"running {len(candidates)} candidates "
+              f"× {hop_budget}s in parallel...", flush=True)
+
+        # Spawn workers, each runs reduced pipeline from a perturbed init
+        args = []
+        for s, pos_np in candidates:
+            pos64 = np.ascontiguousarray(pos_np, dtype=np.float64)
+            seed = self.seed + int(abs(s) * 10000) + (1 if s > 0 else 0)
+            args.append((bench_path, pos64.tobytes(), pos64.shape,
+                          str(pos64.dtype), int(hop_budget), seed,
+                          f"step={s:+.3f}"))
+        ctx = _mp.get_context("spawn")
+        with ctx.Pool(min(len(args), 8)) as pool:
+            results = pool.map(hessian_candidate_worker, args)
+
+        best_pos = None
+        best_cost = float(current_cost)
+        best_label = None
+        for label, pos_bytes, shape, dtype_str, cost, ov in results:
+            tag = "VALID" if ov == 0 else f"INVALID({ov})"
+            print(f"    [v7.hess.{label}] cost={cost:.6f} {tag}",
+                  flush=True)
+            if ov != 0:
+                continue
+            if cost < best_cost - 1e-7:
+                best_cost = cost
+                best_pos = np.frombuffer(
+                    pos_bytes, dtype=np.dtype(dtype_str)
+                ).reshape(shape).copy()
+                best_label = label
+
+        if best_pos is None:
+            print(f"  [v7] hessian: no candidate beat post-Lap "
+                  f"({current_cost:.6f}); keeping", flush=True)
+            return current_pos, current_cost
+
+        print(f"  [v7] HESSIAN WIN: {best_label} cost={best_cost:.6f} < "
+              f"{current_cost:.6f} (Δ {current_cost-best_cost:+.4f})",
+              flush=True)
+        return torch.tensor(best_pos, dtype=torch.float32), best_cost
 
     def _sp_multi_worker_hop(self, perturbed_full, bench_path, budget,
                               n_workers, base_seed):
