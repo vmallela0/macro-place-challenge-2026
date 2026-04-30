@@ -455,24 +455,75 @@ class OptimalPlacer:
         best_cost = float(current_cost)
         accepted = 0
 
+        # Perturbation mode: gaussian (default) or sp (sequence-pair swap).
+        # SP swaps change the topological order of hard macros (e.g., flips
+        # "A is left of B" into "A is below B") which Gaussian noise can't
+        # do reliably within a budget that doesn't destroy feasibility.
+        # The 9-config Gaussian σ-grid showed 0/9 hops accepted on ibm15
+        # because the post-perturbation legalize couldn't recover from any
+        # meaningful Gaussian σ. SP perturbation is structural: decode
+        # produces a tightly-packed feasible placement, which the local
+        # minimizer can refine.
+        perturb_mode = os.environ.get("PLACER_V7_BASIN_PERTURB", "gaussian")
+        sp_n_swaps = int(os.environ.get("PLACER_V7_SP_N_SWAPS", "3"))
+
         for hop in range(1, n_hops + 1):
-            sigma_soft = self.BASIN_HOP_SIGMA0 * (0.6 ** (hop - 1)) * canvas_diag
-            sigma_hard = sigma_soft * 0.25
-
-            # Perturb: softs get σ_soft, hards get σ_hard.
-            perturbed = best_pos.cpu().numpy().astype(np.float64).copy()
-            noise = np.zeros_like(perturbed)
-            noise[:n_hard] = rng.normal(0.0, sigma_hard, (n_hard, 2))
-            noise[n_hard:n_total] = rng.normal(
-                0.0, sigma_soft, (n_total - n_hard, 2))
-            perturbed = perturbed + noise
-            perturbed[:, 0] = np.clip(perturbed[:, 0], 0.0, cw)
-            perturbed[:, 1] = np.clip(perturbed[:, 1], 0.0, ch)
-
-            print(f"  [v7.hop {hop}] σ_soft={sigma_soft:.2f} "
-                  f"σ_hard={sigma_hard:.2f}, "
-                  f"running single-worker pipeline at {hop_budget}s...",
-                  flush=True)
+            if perturb_mode == "sp":
+                # SP perturbation: encode current hards → swap → decode →
+                # fit to canvas. Softs are taken from current state and
+                # the reduced pipeline's push-apart/legalize/refine fixes
+                # any overlap and re-routes softs around the new hard
+                # arrangement.
+                from _sequence_pair import (encode_sp, sp_swap as _sp_swap_fn,
+                                              decode_sp, fit_to_canvas)
+                import random as _random
+                cur_np = best_pos.cpu().numpy().astype(np.float64).copy()
+                # Benchmark stores positions as CENTERS and sizes as
+                # (n, 2) tensor of (width, height). SP decode operates
+                # on lower-left corners, so we convert.
+                hard_sizes = bench.macro_sizes.cpu().numpy().astype(
+                    np.float64)[:n_hard]
+                hard_w_np = hard_sizes[:, 0]
+                hard_h_np = hard_sizes[:, 1]
+                hard_pos_ll = cur_np[:n_hard].copy()
+                hard_pos_ll[:, 0] -= hard_w_np / 2.0
+                hard_pos_ll[:, 1] -= hard_h_np / 2.0
+                alpha0, beta0 = encode_sp(hard_pos_ll)
+                py_rng = _random.Random(self.seed + 1000 * hop)
+                alpha1, beta1 = _sp_swap_fn(
+                    alpha0, beta0, n_swaps=sp_n_swaps, rng=py_rng)
+                new_hx, new_hy = decode_sp(
+                    alpha1, beta1, hard_w_np, hard_h_np)
+                new_hard_xy = np.stack([new_hx, new_hy], axis=1)
+                new_hx_fit, new_hy_fit, scale = fit_to_canvas(
+                    new_hard_xy[:, 0], new_hard_xy[:, 1],
+                    hard_w_np, hard_h_np, cw, ch)
+                perturbed = cur_np.copy()
+                # Convert lower-left back to center coords for the placer.
+                perturbed[:n_hard, 0] = new_hx_fit + hard_w_np / 2.0
+                perturbed[:n_hard, 1] = new_hy_fit + hard_h_np / 2.0
+                # Soft positions: leave at current state. The downstream
+                # pipeline's push-apart + legalize + refine will fix any
+                # overlap with the relocated hards.
+                print(f"  [v7.hop {hop}] SP swap k={sp_n_swaps} "
+                      f"(scale={scale:.3f}), running single-worker pipeline "
+                      f"at {hop_budget}s...", flush=True)
+            else:
+                sigma_soft = self.BASIN_HOP_SIGMA0 * (0.6 ** (hop - 1)) * canvas_diag
+                sigma_hard = sigma_soft * 0.25
+                # Gaussian perturbation: softs get σ_soft, hards get σ_hard.
+                perturbed = best_pos.cpu().numpy().astype(np.float64).copy()
+                noise = np.zeros_like(perturbed)
+                noise[:n_hard] = rng.normal(0.0, sigma_hard, (n_hard, 2))
+                noise[n_hard:n_total] = rng.normal(
+                    0.0, sigma_soft, (n_total - n_hard, 2))
+                perturbed = perturbed + noise
+                perturbed[:, 0] = np.clip(perturbed[:, 0], 0.0, cw)
+                perturbed[:, 1] = np.clip(perturbed[:, 1], 0.0, ch)
+                print(f"  [v7.hop {hop}] σ_soft={sigma_soft:.2f} "
+                      f"σ_hard={sigma_hard:.2f}, "
+                      f"running single-worker pipeline at {hop_budget}s...",
+                      flush=True)
 
             # Run the v4 single-worker pipeline at reduced budget from
             # the perturbed start. We achieve "start from perturbed" by
