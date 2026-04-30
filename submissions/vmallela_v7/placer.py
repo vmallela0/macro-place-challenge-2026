@@ -354,6 +354,136 @@ class OptimalPlacer:
                 print(f"  [v7] adam err: {type(e).__name__}: {e}; "
                       f"keeping post-Laplacian", flush=True)
 
+        # ── Phase 4.7: Greedy top-K congestion eviction ────────────────
+        # Identify softs whose footprint touches a top-K hot cell;
+        # search radius R for a cooler cell; validate via exact
+        # compute_proxy_cost; strict accept. Bypasses the smooth-vs-
+        # exact divergence that broke Adam, and the local-minimizer
+        # plateau that broke basin-hop. Off by default;
+        # PLACER_V7_EVICT=1 enables.
+        if (os.environ.get("PLACER_V7_EVICT", "0") == "1"
+                and overlaps == 0):
+            evict_top_k = float(os.environ.get(
+                "PLACER_V7_EVICT_TOP_K", "0.05"))
+            evict_radius = int(os.environ.get(
+                "PLACER_V7_EVICT_RADIUS", "5"))
+            evict_passes = int(os.environ.get(
+                "PLACER_V7_EVICT_PASSES", "3"))
+            evict_max_per_pass_env = os.environ.get(
+                "PLACER_V7_EVICT_MAX_PER_PASS", "")
+            evict_max_per_pass = (int(evict_max_per_pass_env)
+                                   if evict_max_per_pass_env else None)
+            try:
+                from _eviction import evict_hot_softs
+                import importlib.util as _ilu
+                v1_spec = _ilu.spec_from_file_location(
+                    "_v1_v7_evict",
+                    str(_HERE.parent / "vmallela" / "placer.py"))
+                v1 = _ilu.module_from_spec(v1_spec)
+                v1_spec.loader.exec_module(v1)
+                bench_for_evict = Benchmark.load(bench_path)
+                plc_e = v1._load_plc(bench_for_evict.name)
+                incr_e = v1.IncrementalEvaluator(plc_e, bench_for_evict)
+                full_np_e = portfolio_pos.cpu().numpy()
+                n_hard_e = bench_for_evict.num_hard_macros
+                incr_e.sync_positions(full_np_e[:n_hard_e])
+                incr_e.macro_pos[n_hard_e:] = \
+                    full_np_e[n_hard_e:].astype(incr_e.macro_pos.dtype)
+                incr_e._recompute_pin_positions()
+                incr_e._full_recompute_wl()
+                incr_e._full_recompute_density()
+                incr_e._full_recompute_congestion()
+
+                t_evict_start = time.time()
+                evict_pos, evict_cost, n_accepted = evict_hot_softs(
+                    incr_e, bench_for_evict, plc_e,
+                    top_k_frac=evict_top_k,
+                    radius_cells=evict_radius,
+                    n_passes=evict_passes,
+                    max_softs_per_pass=evict_max_per_pass,
+                    verbose=True,
+                )
+                print(f"  [v7] evict: {n_accepted} accepted moves in "
+                      f"{time.time()-t_evict_start:.1f}s; "
+                      f"exact-proxy {portfolio_cost:.6f} → "
+                      f"{evict_cost:.6f}", flush=True)
+                if evict_cost < portfolio_cost - 1e-7:
+                    print(f"  [v7] EVICT WIN: {evict_cost:.6f} < "
+                          f"{portfolio_cost:.6f} "
+                          f"(Δ {portfolio_cost-evict_cost:+.4f})",
+                          flush=True)
+                    portfolio_cost = evict_cost
+                    portfolio_pos = torch.tensor(
+                        evict_pos, dtype=torch.float32)
+                    overlaps = 0
+                else:
+                    print(f"  [v7] evict: no net improvement; "
+                          f"keeping post-Laplacian "
+                          f"({portfolio_cost:.6f})", flush=True)
+            except Exception as e:
+                print(f"  [v7] evict err: {type(e).__name__}: {e}; "
+                      f"keeping post-Laplacian", flush=True)
+
+        # ── Phase 4.8: Sinkhorn optimal-transport eviction ────────────
+        # Globally optimal soft → cell assignment via Sinkhorn (entropy-
+        # regularized OT). Cost = current cong[cell] + α·dist²(soft, cell).
+        # Apply: each soft moves to argmax(T) cell. Validate via exact
+        # compute_proxy_cost; if full-apply fails, fall back to top-K
+        # most-confident partial application. Off by default;
+        # PLACER_V7_SINKHORN=1 enables.
+        if (os.environ.get("PLACER_V7_SINKHORN", "0") == "1"
+                and overlaps == 0):
+            sk_alpha = float(os.environ.get(
+                "PLACER_V7_SINKHORN_ALPHA", "0.5"))
+            sk_eps = float(os.environ.get(
+                "PLACER_V7_SINKHORN_EPS", "0.05"))
+            sk_iters = int(os.environ.get(
+                "PLACER_V7_SINKHORN_ITERS", "50"))
+            try:
+                from _sinkhorn_ot import sinkhorn_evict
+                import importlib.util as _ilu
+                v1_spec = _ilu.spec_from_file_location(
+                    "_v1_v7_sk",
+                    str(_HERE.parent / "vmallela" / "placer.py"))
+                v1 = _ilu.module_from_spec(v1_spec)
+                v1_spec.loader.exec_module(v1)
+                bench_for_sk = Benchmark.load(bench_path)
+                plc_sk = v1._load_plc(bench_for_sk.name)
+                incr_sk = v1.IncrementalEvaluator(plc_sk, bench_for_sk)
+                full_np_sk = portfolio_pos.cpu().numpy()
+                n_hard_sk = bench_for_sk.num_hard_macros
+                incr_sk.sync_positions(full_np_sk[:n_hard_sk])
+                incr_sk.macro_pos[n_hard_sk:] = \
+                    full_np_sk[n_hard_sk:].astype(incr_sk.macro_pos.dtype)
+                incr_sk._recompute_pin_positions()
+                incr_sk._full_recompute_wl()
+                incr_sk._full_recompute_density()
+                incr_sk._full_recompute_congestion()
+
+                t_sk_start = time.time()
+                sk_pos, sk_cost, sk_diag = sinkhorn_evict(
+                    incr_sk, bench_for_sk, plc_sk,
+                    alpha_hpwl=sk_alpha, eps=sk_eps, iters=sk_iters,
+                    verbose=True)
+                print(f"  [v7] sinkhorn: {time.time()-t_sk_start:.1f}s "
+                      f"total; exact-proxy {portfolio_cost:.6f} → "
+                      f"{sk_cost:.6f}", flush=True)
+                if sk_cost < portfolio_cost - 1e-7:
+                    print(f"  [v7] SINKHORN WIN: {sk_cost:.6f} < "
+                          f"{portfolio_cost:.6f} "
+                          f"(Δ {portfolio_cost-sk_cost:+.4f})",
+                          flush=True)
+                    portfolio_cost = sk_cost
+                    portfolio_pos = torch.tensor(
+                        sk_pos, dtype=torch.float32)
+                    overlaps = 0
+                else:
+                    print(f"  [v7] sinkhorn: no net improvement; "
+                          f"keeping post-Laplacian", flush=True)
+            except Exception as e:
+                print(f"  [v7] sinkhorn err: {type(e).__name__}: {e}; "
+                      f"keeping post-Laplacian", flush=True)
+
         # Phase 5: basin-hopping on hard benches only (cost >= 1.0).
         # Each hop perturbs the current best by σ * canvas, runs a
         # SINGLE-WORKER reduced-budget pipeline, keeps if better.
