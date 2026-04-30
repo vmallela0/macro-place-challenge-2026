@@ -259,17 +259,43 @@ class OptimalPlacer:
                 "PLACER_V7_HESSIAN_BUDGET", "300"))
             hess_n_lanczos = int(os.environ.get(
                 "PLACER_V7_HESSIAN_LANCZOS", "50"))
-            try:
-                portfolio_pos, portfolio_cost = self._hessian_escape_phase(
-                    portfolio_pos, portfolio_cost, bench_path,
-                    hess_steps, hess_budget, hess_n_lanczos)
-                # Re-eval in case
-                if isinstance(portfolio_pos, np.ndarray):
-                    portfolio_pos = torch.tensor(portfolio_pos, dtype=torch.float32)
-                overlaps = 0   # all candidates pre-validated overlap-free
-            except Exception as e:
-                print(f"  [v7] hessian err: {type(e).__name__}: {e}; "
-                      f"keeping post-Laplacian", flush=True)
+            # Iterative Hessian: each iter crosses one saddle. Loop until
+            # smooth surrogate's λ_min ≥ ε (true 2nd-order critical
+            # point) OR max iters OR strict-improvement fails.
+            hess_max_iters = int(os.environ.get(
+                "PLACER_V7_HESSIAN_MAX_ITERS", "1"))
+            hess_total_budget_s = int(os.environ.get(
+                "PLACER_V7_HESSIAN_TOTAL_BUDGET", "0"))   # 0 = no cap
+            t_hess_start = time.time()
+            for hess_iter in range(hess_max_iters):
+                if (hess_total_budget_s > 0
+                        and time.time() - t_hess_start
+                        + hess_budget * 1.1 > hess_total_budget_s):
+                    print(f"  [v7] hessian iter {hess_iter}: insufficient "
+                          f"budget for another pass; stop",
+                          flush=True)
+                    break
+                try:
+                    new_pos, new_cost = self._hessian_escape_phase(
+                        portfolio_pos, portfolio_cost, bench_path,
+                        hess_steps, hess_budget, hess_n_lanczos)
+                    if isinstance(new_pos, np.ndarray):
+                        new_pos = torch.tensor(new_pos, dtype=torch.float32)
+                    if new_cost >= portfolio_cost - 1e-7:
+                        print(f"  [v7] hessian iter {hess_iter}: no further "
+                              f"improvement; converged", flush=True)
+                        break
+                    print(f"  [v7] hessian iter {hess_iter}: cost "
+                          f"{portfolio_cost:.6f} → {new_cost:.6f} "
+                          f"(Δ {portfolio_cost-new_cost:+.4f})",
+                          flush=True)
+                    portfolio_pos = new_pos
+                    portfolio_cost = float(new_cost)
+                    overlaps = 0
+                except Exception as e:
+                    print(f"  [v7] hessian iter {hess_iter} err: "
+                          f"{type(e).__name__}: {e}", flush=True)
+                    break
 
         # ── Phase 4.5: Adam polish on the smooth surrogate ─────────────
         # Vectorized LSE-HPWL + CVaR top-K density/congestion via

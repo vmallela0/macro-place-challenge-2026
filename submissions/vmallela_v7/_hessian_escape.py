@@ -101,6 +101,89 @@ def hessian_min_eigvec(
     return lam_min, v_min
 
 
+def hessian_min_eigvecs_topk(
+    proxy_call,
+    macro_pos: torch.Tensor,
+    *,
+    k: int = 3,
+    n_lanczos_iters: int = 50,
+    tolerance: float = 1e-4,
+    verbose: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the k smallest eigenvalues + eigenvectors of the Hessian.
+
+    Mathematical justification: H is real symmetric → orthogonal
+    eigenvector basis. Top-k smallest eigenvalues identify the
+    "negative curvature subspace" (when negative). Each eigenvector
+    is an independent escape direction in the high-dim manifold.
+
+    Returns (lambda_array, eigvec_matrix) where eigvec_matrix has
+    shape (N, k) with each column a normalized eigenvector.
+    """
+    from scipy.sparse.linalg import eigsh, LinearOperator
+    n_total = macro_pos.shape[0]
+    N = 2 * n_total
+
+    macro_pos = macro_pos.detach().clone().requires_grad_(True)
+    loss = proxy_call(macro_pos)
+    grad = torch.autograd.grad(loss, macro_pos, create_graph=True)[0]
+    grad_flat = grad.reshape(-1)
+
+    def hv(v_np: np.ndarray) -> np.ndarray:
+        v = torch.tensor(v_np, dtype=macro_pos.dtype,
+                         device=macro_pos.device).reshape(n_total, 2)
+        gv = (grad * v).sum()
+        Hv = torch.autograd.grad(gv, macro_pos, retain_graph=True)[0]
+        return Hv.detach().cpu().numpy().reshape(-1)
+
+    H_op = LinearOperator(shape=(N, N), matvec=hv, dtype=np.float64)
+    try:
+        eigvals, eigvecs = eigsh(
+            H_op, k=k, which="SA",
+            maxiter=n_lanczos_iters, tol=tolerance)
+    except Exception as e:
+        if verbose:
+            print(f"    [hessian.topk] eigsh err: {e}", flush=True)
+        return np.zeros(k), np.zeros((N, k))
+    return eigvals, eigvecs
+
+
+def iterative_hessian_termination_check(
+    proxy_call,
+    macro_pos: torch.Tensor,
+    *,
+    n_lanczos_iters: int = 30,
+    epsilon: float = -1e-5,
+) -> tuple[bool, float]:
+    """Should we keep iterating Hessian escape?
+
+    Returns (should_stop, lambda_min). Stop when lambda_min ≥ epsilon
+    (we're at a 2nd-order critical point of the smooth surrogate, no
+    more negative-curvature direction).
+    """
+    from scipy.sparse.linalg import eigsh, LinearOperator
+    n_total = macro_pos.shape[0]
+    N = 2 * n_total
+    macro_pos_d = macro_pos.detach().clone().requires_grad_(True)
+    loss = proxy_call(macro_pos_d)
+    grad = torch.autograd.grad(loss, macro_pos_d, create_graph=True)[0]
+
+    def hv(v_np):
+        v = torch.tensor(v_np, dtype=macro_pos_d.dtype,
+                         device=macro_pos_d.device).reshape(n_total, 2)
+        Hv = torch.autograd.grad(
+            (grad * v).sum(), macro_pos_d, retain_graph=True)[0]
+        return Hv.detach().cpu().numpy().reshape(-1)
+    H_op = LinearOperator(shape=(N, N), matvec=hv, dtype=np.float64)
+    try:
+        eigvals, _ = eigsh(H_op, k=1, which="SA", maxiter=n_lanczos_iters,
+                            tol=1e-3)
+        lam = float(eigvals[0])
+    except Exception:
+        return True, 0.0   # error → stop (be conservative)
+    return (lam >= epsilon), lam
+
+
 def hessian_escape_step(
     macro_pos: torch.Tensor,
     smooth_proxy_call,
