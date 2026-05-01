@@ -1,20 +1,24 @@
 #!/bin/bash
-# Hessian-escape full 17-bench sweep.
-# Architecture: v6 portfolio → Laplacian → Phase 4.6 Hessian escape.
-# Adam, basin-hop, eviction, sinkhorn DISABLED (all proven net-zero or worse).
+# Path C+ resume — hard benches first.
+# ibm01-03 already completed in the prior run (rows kept in results.csv).
+# This script runs the 14 remaining benches in this order:
+#   ibm12 ibm13 ibm14 ibm15 ibm16 ibm17 ibm18 ibm04 ibm06 ibm07 ibm08 ibm09 ibm10 ibm11
+# (hard set 12-18 first; easy set 04+06-11 after.)
 #
-# Per-bench wall: 1500s portfolio + 30s Lap + ~5min Hessian (4 candidates
-# at 300s each in parallel) ≈ 1830s ≈ 31 min.
-# 17 benches × 31 min = ~9 hours. Hard timeout 2400s gives margin.
+# Same Adam config as v7_pathC_sweep.sh (Fix C: K_d=0.10, K_c=0.05, 100 steps,
+# snapshot every 10, validate every 25, best-of-Adam line search).
+# Same OUT dir as the prior run so PNGs / .npy / sweep.log stay co-located.
+# results.csv is APPENDED, not truncated — preserves ibm01-03 rows.
 
 set -u
 cd "$(dirname "$0")/.."
 
-OUT="/tmp/v7_hessian_sweep_$(date +%Y%m%d_%H%M%S)"
+# Same OUT as the prior run.
+OUT="${OUT:-/tmp/v7_pathC_20260429_152926}"
 mkdir -p "$OUT"
 
-WORKER_BUDGET=${WORKER_BUDGET:-2050}      # COMPLIANT: 2050+120+30+1200+50 = 3450s (150s margin)
-HARD_TIMEOUT_S=${HARD_TIMEOUT_S:-3600}    # 1-hour competition cap (strict)
+WORKER_BUDGET=${WORKER_BUDGET:-1800}
+HARD_TIMEOUT_S=${HARD_TIMEOUT_S:-2400}
 
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -39,30 +43,35 @@ export PLACER_V7_LAPLACIAN_BUDGET_FRAC=0.04
 export PLACER_V7_BASIN_HOPS=0
 export PLACER_V7_BASIN_HOP_AUTO=999.0
 export PLACER_V7_BASIN_HOP_RESERVE=0
-export PLACER_V7_ADAM=0
-export PLACER_V7_EVICT=0
-export PLACER_V7_SINKHORN=0
 
-# Phase 4.6: Hessian escape
-export PLACER_V7_HESSIAN=1
-export PLACER_V7_HESSIAN_STEPS="0.02,-0.02,0.05,-0.05"
-export PLACER_V7_HESSIAN_BUDGET=1200      # Match the compliant smoke's verified config
-export PLACER_V7_HESSIAN_LANCZOS=50
+# Path C+ Fix C: full surrogate, α-aligned, best-of-Adam line search.
+export PLACER_V7_ADAM=1
+export PLACER_V7_ADAM_STEPS=100
+export PLACER_V7_ADAM_LR_FRAC=0.02
+export PLACER_V7_ADAM_SOFT_ONLY=1
+export PLACER_V7_ADAM_INERTIA=1.0
+export PLACER_V7_K_DENS_FRAC=0.10
+export PLACER_V7_K_CONG_FRAC=0.05
+export PLACER_V7_ADAM_SNAPSHOT_EVERY=10
+export PLACER_V7_ADAM_VALIDATE_EVERY=25
+export PLACER_V7_ADAM_ENABLE_DENS=1
+export PLACER_V7_ADAM_ENABLE_CONG=1   # full surrogate; flip to 0 for Mode A
 
 export PLACER_V6_SAVE_PLACEMENT="$OUT/{name}.npy"
 
-# Hard-first ordering so we know early if hessian fails on hard benches.
-BENCHES="ibm15 ibm17 ibm18 ibm12 ibm14 ibm16 ibm13 ibm04 ibm06 ibm07 ibm08 ibm09 ibm10 ibm11 ibm01 ibm02 ibm03"
+# Hard first (ibm12-18), then easy (ibm04, 06-11).
+BENCHES="ibm12 ibm13 ibm14 ibm15 ibm16 ibm17 ibm18 ibm04 ibm06 ibm07 ibm08 ibm09 ibm10 ibm11"
 
-echo "v7 Hessian-escape full 17-bench sweep" > "$OUT/sweep.log"
-echo "  started: $(date)" >> "$OUT/sweep.log"
-echo "  results dir: $OUT" >> "$OUT/sweep.log"
-echo "  Hessian: 4 candidates (±0.02, ±0.05) × 300s parallel" >> "$OUT/sweep.log"
+echo "" >> "$OUT/sweep.log"
+echo "=== RESUME (hard first): started $(date) ===" >> "$OUT/sweep.log"
 echo "  order: $BENCHES" >> "$OUT/sweep.log"
 echo "" >> "$OUT/sweep.log"
 
-echo "benchmark,proxy_cost,wirelength_cost,density_cost,congestion_cost,overlap_count,wall_clock_s,exit_code,timestamp" \
-  > "$OUT/results.csv"
+# results.csv: append mode. Header already written from the prior run.
+if [ ! -f "$OUT/results.csv" ]; then
+  echo "benchmark,proxy_cost,wirelength_cost,density_cost,congestion_cost,overlap_count,wall_clock_s,exit_code,timestamp" \
+    > "$OUT/results.csv"
+fi
 
 for b in $BENCHES; do
   echo "=== $b: started $(date) ===" | tee -a "$OUT/sweep.log"
@@ -104,23 +113,28 @@ for b in $BENCHES; do
 
   echo "${b},${proxy:-NA},${wl:-NA},${den:-NA},${cong:-NA},${overlaps:-NA},${elapsed},${rc},$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >> "$OUT/results.csv"
-
-  hess_status=$(grep -E "(HESSIAN WIN|hessian: λ_min|hessian: no candidate)" "$OUT/${b}.log" | tail -2 | tr '\n' ' | ')
-  echo "  proxy=${proxy:-NA} overlaps=${overlaps:-NA} | $hess_status" \
+  adam_status=$(grep -E "ADAM WIN|adam: rejected" "$OUT/${b}.log" | tail -1)
+  echo "  proxy=${proxy:-NA} overlaps=${overlaps:-NA} | $adam_status" \
     | tee -a "$OUT/sweep.log"
 
   if [ -f "$OUT/${b}.npy" ]; then
     .venv/bin/python scripts/v6_placement_plot.py "$b" "$OUT/${b}.npy" \
-      "$OUT/${b}.png" >> "$OUT/sweep.log" 2>&1 || true
+      "$OUT/${b}.png" >> "$OUT/sweep.log" 2>&1 || \
+      echo "  plot $OUT/${b}.png failed" | tee -a "$OUT/sweep.log"
     .venv/bin/python scripts/v6_placement_plot.py "$b" "$OUT/${b}.npy" \
-      "assets/v7_${b}.png" >> "$OUT/sweep.log" 2>&1 || true
+      "assets/v7_${b}.png" >> "$OUT/sweep.log" 2>&1 || \
+      echo "  plot assets/v7_${b}.png failed" | tee -a "$OUT/sweep.log"
+  else
+    echo "  (no .npy saved for ${b}; skipping plot)" | tee -a "$OUT/sweep.log"
   fi
 done
 
 echo "" >> "$OUT/sweep.log"
-echo "v7 Hessian sweep finished: $(date)" >> "$OUT/sweep.log"
+echo "v7 Path C+ resume finished: $(date)" >> "$OUT/sweep.log"
 
 .venv/bin/python scripts/v7_results_to_readme.py "$OUT/results.csv" \
-  >> "$OUT/sweep.log" 2>&1 || true
+  >> "$OUT/sweep.log" 2>&1 || \
+  echo "  (v7_results_to_readme.py missing; skipping README update)" \
+    | tee -a "$OUT/sweep.log"
 
 echo "DONE" >> "$OUT/sweep.log"

@@ -62,27 +62,51 @@ def sinkhorn(
     a: np.ndarray | None = None,
     b: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Standard Sinkhorn: T = arg min_T  Σ T*C  + ε * Σ T log(T)
+    """Log-domain Sinkhorn: T = arg min_T Σ T*C + ε Σ T log T
        s.t. T·1 = a, 1·T = b.
 
-    Returns T of shape (n, m). a defaults to 1/n, b to 1/m.
+    Numerically stable for any C, ε; no exp(-C/ε) underflow/overflow.
+    Updates the log-potentials f, g via logsumexp:
+        g[j] = ε log(b[j]) - ε logsumexp((f - C[:,j])/ε)
+        f[i] = ε log(a[i]) - ε logsumexp((g - C[i,:])/ε)
+        T[i,j] = exp((f[i] + g[j] - C[i,j]) / ε)
+
+    Equivalent to the multiplicative form K = exp(-C/ε) but operates
+    entirely in log space until the final T construction. Stable when
+    max(C)/ε ≫ log(realmax) ≈ 700.
     """
     n, m = C.shape
     if a is None:
         a = np.full(n, 1.0 / n, dtype=np.float64)
     if b is None:
         b = np.full(m, 1.0 / m, dtype=np.float64)
+    log_a = np.log(np.maximum(a, 1e-300))
+    log_b = np.log(np.maximum(b, 1e-300))
 
-    K = np.exp(-C / eps)  # element-wise
-    u = np.ones(n)
-    v = np.ones(m)
+    f = np.zeros(n, dtype=np.float64)
+    g = np.zeros(m, dtype=np.float64)
     for _ in range(iters):
-        Kv = K @ v
-        u = a / np.maximum(Kv, 1e-30)
-        Ku = K.T @ u
-        v = b / np.maximum(Ku, 1e-30)
-    T = u[:, None] * K * v[None, :]
+        # g[j] = ε log(b[j]) - ε logsumexp_i ((f[i] - C[i,j]) / ε)
+        # Implemented as ε * log_b - ε * logsumexp(M_col, axis=0)
+        # where M[i,j] = (f[i] - C[i,j]) / ε.
+        M_col = (f[:, None] - C) / eps           # (n, m)
+        g = eps * (log_b - _logsumexp(M_col, axis=0))
+        M_row = (g[None, :] - C) / eps           # (n, m)
+        f = eps * (log_a - _logsumexp(M_row, axis=1))
+    log_T = (f[:, None] + g[None, :] - C) / eps
+    T = np.exp(log_T)
     return T
+
+
+def _logsumexp(X: np.ndarray, axis: int) -> np.ndarray:
+    """Numerically-stable logsumexp(X, axis=axis)."""
+    M = np.max(X, axis=axis, keepdims=True)
+    # Guard against -inf max (all -inf row → 0 sum → log -inf)
+    M_safe = np.where(np.isfinite(M), M, 0.0)
+    Y = np.exp(X - M_safe)
+    S = np.sum(Y, axis=axis, keepdims=True)
+    out = np.log(np.maximum(S, 1e-300)) + M_safe
+    return np.squeeze(out, axis=axis)
 
 
 def sinkhorn_evict(
