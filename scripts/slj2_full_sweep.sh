@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 OUT="/tmp/slj2_sweep_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUT"
 
-WORKER_BUDGET=${WORKER_BUDGET:-2000}
+WORKER_BUDGET=${WORKER_BUDGET:-2300}
 HARD_TIMEOUT_S=${HARD_TIMEOUT_S:-3700}
 
 export OMP_NUM_THREADS=1
@@ -42,17 +42,17 @@ export PLACER_V7_ADAM=0
 export PLACER_V7_EVICT=0
 export PLACER_V7_SINKHORN=0
 
-# v7 Hessian — multi-iter via TOTAL_BUDGET cap
+# Hessian — same budgets as v7 (smoke #1 showed cuts hurt more than helped)
 export PLACER_V7_HESSIAN=1
 export PLACER_V7_HESSIAN_STEPS="0.02,-0.02,0.05,-0.05"
-export PLACER_V7_HESSIAN_BUDGET=700
+export PLACER_V7_HESSIAN_BUDGET=1000
 export PLACER_V7_HESSIAN_LANCZOS=50
-export PLACER_V7_HESSIAN_MAX_ITERS=2
-export PLACER_V7_HESSIAN_TOTAL_BUDGET=1500
+export PLACER_V7_HESSIAN_MAX_ITERS=1
 
-# slj2 layers
+# slj2 layers — topk only (mirror was rejected uniformly: too far from
+# any good basin to recover within per-candidate budget).
 export PLACER_SLJ2_TOPK=2
-export PLACER_SLJ2_MIRROR=1
+export PLACER_SLJ2_MIRROR=0
 export PLACER_SLJ2_POOL=16
 
 export PLACER_V6_SAVE_PLACEMENT="$OUT/{name}.npy"
