@@ -1,6 +1,6 @@
 # vmallela_v7 — Hessian Negative-Eigenvalue Escape
 
-**Mean proxy cost: TBD across 17 IBM benchmarks.** Beats v4 baseline (1.0186) by **TBD**.
+**Mean proxy cost: 1.0003 across 17 IBM benchmarks.** Beats v4 baseline (1.0186) by **-0.0183**.
 All 17 placements are overlap-free; every bench runs in ≤ 3600 s wall (competition cap).
 
 ## TL;DR
@@ -154,7 +154,7 @@ init, deterministic (fixed seed=42), within the 3600 s competition cap.
 |-------|---------:|-----------:|------------:|---------:|--------------:|
 | ibm01 | 0.7653 | 0.7803 | **-0.0150** | 3127 | -0.015036 |
 | ibm02 | 0.9482 | 0.9737 | **-0.0255** | 3309 | -0.008263 |
-| ibm03 | _TBD_  | 0.9254 | _TBD_       | _running_ | _TBD_ |
+| ibm03 | 0.9166 | 0.9254 | **-0.0088** | 2287 | _degenerate_ |
 | ibm04 | 0.9287 | 0.9345 | **-0.0058** | 3315 | -0.006040 |
 | ibm06 | 1.0546 | 1.0755 | **-0.0209** | 3312 | -0.005568 |
 | ibm07 | 1.0324 | 1.0432 | **-0.0108** | 3318 | -0.005452 |
@@ -169,23 +169,27 @@ init, deterministic (fixed seed=42), within the 3600 s competition cap.
 | ibm16 | 1.0435 | 1.0771 | **-0.0336** | 3481 | -0.001099 |
 | ibm17 | 1.2813 | 1.3012 | **-0.0199** | 3571* | -0.001564 |
 | ibm18 | 1.2697 | 1.2865 | **-0.0168** | 3392 | -0.002308 |
-| **mean (16 done, ibm03 TBD)** | **TBD** | **1.0186** | **TBD** | | |
+| **mean (17 / 17)** | **1.0003** | **1.0186** | **-0.0183** | | |
 
 \* ibm17 placer wall = 3571 s (compliant). Bash bookkeeping was killed at
 3600 s during plot generation; results recovered manually from the
 placer's `[v7] DONE` log line.
 
 **Key observations:**
-- λ_min < 0 on every bench → every bench was at a saddle, not a true
-  local min, before Hessian escape ran.
+- λ_min < 0 on every bench where Lanczos converged → every such bench
+  was at a saddle, not a true local minimum, before Hessian escape
+  ran. ibm03 is the lone exception: Lanczos returned a degenerate
+  eigenvector and no candidates were generated, so we shipped the
+  post-Laplacian result (still -0.0088 below v4).
 - All wall times ≤ 3600 s (competition compliance).
-- Hessian gave a strict-improvement win on every single bench (16/16 so
-  far, ibm03 pending).
+- Hessian gave a strict-improvement win on 16 / 17 benches; ibm03
+  shipped its post-Laplacian result.
 - Largest lifts on ibm16 (-0.034), ibm14 (-0.027), ibm08 (-0.026),
-  ibm02 (-0.026) — these are mid-utilization benches where v4's local
-  minimum was farthest from the global optimum.
-- Smallest lift on ibm04 (-0.006) and ibm07 (-0.011) — already near
-  the global min; Hessian found smaller saddles to escape.
+  ibm02 (-0.026) — mid-utilization benches where v4's local minimum
+  was farthest from the global optimum.
+- Smallest lifts on ibm04 (-0.006), ibm03 (-0.009), ibm07 (-0.011) —
+  already near the global min; Hessian found smaller saddles (or, on
+  ibm03, none).
 
 ## Reproduction
 

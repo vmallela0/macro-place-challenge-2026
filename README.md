@@ -85,7 +85,7 @@ Hard macros = red rectangles, soft cluster centroids = blue dots.
 | | | | |
 |---|---|---|---|
 | ![ibm01](assets/v7_ibm01.png) | ![ibm02](assets/v7_ibm02.png) | ![ibm03](assets/v7_ibm03.png) | ![ibm04](assets/v7_ibm04.png) |
-| **ibm01** 0.7653 | **ibm02** 0.9482 | **ibm03** _running_ | **ibm04** 0.9287 |
+| **ibm01** 0.7653 | **ibm02** 0.9482 | **ibm03** 0.9166 | **ibm04** 0.9287 |
 | ![ibm06](assets/v7_ibm06.png) | ![ibm07](assets/v7_ibm07.png) | ![ibm08](assets/v7_ibm08.png) | ![ibm09](assets/v7_ibm09.png) |
 | **ibm06** 1.0546 | **ibm07** 1.0324 | **ibm08** 1.0291 | **ibm09** 0.7628 |
 | ![ibm10](assets/v7_ibm10.png) | ![ibm11](assets/v7_ibm11.png) | ![ibm12](assets/v7_ibm12.png) | ![ibm13](assets/v7_ibm13.png) |
@@ -106,7 +106,7 @@ competition cap (`COMPETITION.md`).
 |-------|---------:|------------:|------------:|---------:|--------------:|
 | ibm01 | 0.7653 | 0.7803 | **-0.0150** | 3127 | -0.015036 |
 | ibm02 | 0.9482 | 0.9737 | **-0.0255** | 3309 | -0.008263 |
-| ibm03 | _running_ | 0.9254 | _TBD_ | _TBD_ | _TBD_ |
+| ibm03 | 0.9166 | 0.9254 | **-0.0088** | 2287 | _degenerate_ |
 | ibm04 | 0.9287 | 0.9345 | **-0.0058** | 3315 | -0.006040 |
 | ibm06 | 1.0546 | 1.0755 | **-0.0209** | 3312 | -0.005568 |
 | ibm07 | 1.0324 | 1.0432 | **-0.0108** | 3318 | -0.005452 |
@@ -121,14 +121,18 @@ competition cap (`COMPETITION.md`).
 | ibm16 | 1.0435 | 1.0771 | **-0.0336** | 3481 | -0.001099 |
 | ibm17 | 1.2813 | 1.3012 | **-0.0199** | 3571 | -0.001564 |
 | ibm18 | 1.2697 | 1.2865 | **-0.0168** | 3392 | -0.002308 |
-| **mean (16/17)** | **TBD** | **1.0186** | **TBD** | | |
+| **mean (17/17)** | **1.0003** | **1.0186** | **-0.0183** | | |
 
 **Key observations:**
-- λ_min < 0 on every bench → every bench was at a saddle, not a true
-  local min, before Hessian escape ran.
+- λ_min < 0 on every bench where Lanczos converged → every such bench
+  was at a saddle, not a true local min, before Hessian escape ran.
+  (ibm03 was the lone exception: Lanczos returned a degenerate
+  eigenvector, no candidates were generated, and the post-Laplacian
+  result was kept.)
 - All wall times ≤ 3600 s (competition compliance).
-- Hessian gave a strict-improvement win on every bench (16 / 16 done so
-  far; ibm03 in flight).
+- Hessian gave a strict-improvement win on 16 / 17 benches; ibm03
+  shipped its post-Laplacian result, still -0.0088 below v4.
+- **17-bench mean: 1.0003** (vs v4 1.0186 → -0.0183 lift).
 
 ## Reproduction
 
