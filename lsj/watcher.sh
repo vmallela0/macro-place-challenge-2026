@@ -8,13 +8,15 @@
 
 set -u
 
-SWEEP_DIR="${1:?usage: watcher.sh <sweep_dir>}"
+SWEEP_DIR="${1:?usage: watcher.sh <sweep_dir> [data_dir=lsj]}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+DATA_DIR="${2:-lsj}"
 SRC_CSV="${SWEEP_DIR}/results.csv"
-DST_CSV="${REPO}/lsj/results.csv"
-PNG_DIR="${REPO}/lsj/png"
-LOG="${REPO}/lsj/watcher.log"
+DST_CSV="${REPO}/${DATA_DIR}/results.csv"
+PNG_DIR="${REPO}/${DATA_DIR}/png"
+LOG="${REPO}/${DATA_DIR}/watcher.log"
 mkdir -p "$PNG_DIR"
+BRANCH=$(cd "$REPO" && git rev-parse --abbrev-ref HEAD)
 
 EXPECTED=17
 START_TS=$(date +%s)
@@ -64,16 +66,16 @@ while true; do
       fi
 
       # regen README table
-      "${REPO}/.venv/bin/python" "${REPO}/lsj/update_readme.py" >> "$LOG" 2>&1 || true
+      "${REPO}/.venv/bin/python" "${REPO}/${DATA_DIR}/update_readme.py" >> "$LOG" 2>&1 || true
 
-      # commit + push
+      # commit + push to whichever branch is checked out
       cd "$REPO"
-      git add lsj/results.csv "$dst_png" README.md 2>>"$LOG"
-      msg="lsj: ${bench} proxy=${proxy} overlaps=${overlaps} wall=${wall}s"
+      git add "${DATA_DIR}/results.csv" "$dst_png" README.md 2>>"$LOG"
+      msg="${BRANCH}: ${bench} proxy=${proxy} overlaps=${overlaps} wall=${wall}s"
       if git commit -m "$msg" >> "$LOG" 2>&1; then
         for attempt in 1 2 3; do
-          if git push origin lsj >> "$LOG" 2>&1; then
-            echo "[$(date -u +%FT%TZ)] pushed $bench (attempt $attempt)" >> "$LOG"
+          if git push origin "$BRANCH" >> "$LOG" 2>&1; then
+            echo "[$(date -u +%FT%TZ)] pushed $bench to $BRANCH (attempt $attempt)" >> "$LOG"
             break
           fi
           echo "[$(date -u +%FT%TZ)] push attempt $attempt failed, retrying" >> "$LOG"

@@ -95,3 +95,6 @@ NETLIST_CLEANING_SUMMARY.md
 lsj/smoke_dir.txt
 lsj/sweep_dir.txt
 lsj/watcher.log
+slj2/smoke_dir.txt
+slj2/sweep_dir.txt
+slj2/watcher.log

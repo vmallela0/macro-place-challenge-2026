@@ -238,3 +238,103 @@ def hessian_escape_step(
         "n_hard_zeroed": int(n_hard) if soft_only_perturb else 0,
     }
     return candidates, diagnostics
+
+
+def slj2_topk_candidates(
+    macro_pos: torch.Tensor,
+    smooth_proxy_call,
+    *,
+    k: int = 2,
+    step_sizes: list = (0.02, 0.05),
+    canvas_diag: float = 1.0,
+    n_lanczos_iters: int = 50,
+    n_hard: int = 0,
+    soft_only_perturb: bool = True,
+    verbose: bool = False,
+) -> tuple[list, dict]:
+    """slj2 upgrade: top-k eigvecs + ±step. Generates 2·k·|step_sizes|
+    perturbed candidates, one per (eigvec_i, ±, step_size). Each is an
+    independent direction in the negative-curvature subspace of the
+    smooth-surrogate Hessian; eigvec orthogonality (real symmetric H)
+    means each escape direction is mathematically distinct.
+
+    Lift over the k=1 baseline comes from probing more of the saddle's
+    decay manifold in parallel — the strict-improvement gate downstream
+    ensures we only adopt a candidate that actually reduces exact cost.
+    """
+    n_total = macro_pos.shape[0]
+    eigvals, eigvecs = hessian_min_eigvecs_topk(
+        smooth_proxy_call, macro_pos,
+        k=k, n_lanczos_iters=n_lanczos_iters, verbose=verbose)
+    base = macro_pos.detach().cpu().numpy()
+    candidates: list = []
+    used_eigvals: list = []
+    for j in range(eigvecs.shape[1]):
+        v_j = eigvecs[:, j].reshape(n_total, 2)
+        v_norm = float(np.linalg.norm(v_j))
+        if v_norm < 1e-12:
+            continue
+        v_j = v_j / v_norm
+        if soft_only_perturb and n_hard > 0:
+            v_j[:n_hard] = 0.0
+            v_norm_post = float(np.linalg.norm(v_j))
+            if v_norm_post < 1e-12:
+                continue
+            v_j = v_j / v_norm_post
+        used_eigvals.append(float(eigvals[j]))
+        for s in step_sizes:
+            delta = s * canvas_diag
+            candidates.append((f"e{j}+{s:.2f}", base + delta * v_j))
+            candidates.append((f"e{j}-{s:.2f}", base - delta * v_j))
+    diagnostics = {
+        "lambda_min": float(eigvals[0]) if len(eigvals) else 0.0,
+        "lambda_topk": [float(x) for x in used_eigvals],
+        "k_eigvecs_used": len(used_eigvals),
+        "n_candidates": len(candidates),
+    }
+    return candidates, diagnostics
+
+
+def slj2_mirror_candidates(
+    macro_pos: torch.Tensor,
+    *,
+    canvas_w: float,
+    canvas_h: float,
+    n_hard: int = 0,
+    mirror_softs_only: bool = True,
+) -> list:
+    """slj2 upgrade: discrete-symmetry escape candidates.
+
+    Reflects soft macros across canvas axes to produce alternative
+    initializations. Mirror is cost-preserving for the wirelength /
+    density / congestion proxy if the canvas is symmetric and macros
+    are mirrored together — but each reflection lands the configuration
+    in a *different basin* of the SA cost landscape (LNS swap moves
+    can't reach a global mirror in any reasonable budget). Strict-
+    improvement gate downstream filters non-improvements.
+
+    Returns list of (label, perturbed_pos_np). Hards stay put when
+    mirror_softs_only=True (so legality vs the .plc init is preserved).
+    """
+    base = macro_pos.detach().cpu().numpy().copy()
+    n_total = base.shape[0]
+    out: list = []
+    soft_slice = slice(n_hard if mirror_softs_only else 0, n_total)
+
+    # x-mirror: x ← canvas_w - x
+    p_x = base.copy()
+    p_x[soft_slice, 0] = canvas_w - p_x[soft_slice, 0]
+    out.append(("mirror_x", p_x))
+
+    # y-mirror: y ← canvas_h - y
+    p_y = base.copy()
+    p_y[soft_slice, 1] = canvas_h - p_y[soft_slice, 1]
+    out.append(("mirror_y", p_y))
+
+    # 180° (xy-mirror): both axes
+    p_xy = base.copy()
+    p_xy[soft_slice, 0] = canvas_w - p_xy[soft_slice, 0]
+    p_xy[soft_slice, 1] = canvas_h - p_xy[soft_slice, 1]
+    out.append(("rot180", p_xy))
+
+    return out

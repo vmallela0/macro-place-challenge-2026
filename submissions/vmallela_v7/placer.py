@@ -883,35 +883,72 @@ class OptimalPlacer:
                                            mu=100.0).squeeze()
             return hpwl + 0.5 * density_smooth
 
-        # Compute Hessian eigvec
+        # Compute Hessian eigvec(s). slj2 upgrades layered when env vars set:
+        #   PLACER_SLJ2_TOPK>1   — top-k eigvecs (default 1 = baseline)
+        #   PLACER_SLJ2_MIRROR=1 — add x/y/180° mirror candidates
+        #   PLACER_SLJ2_POOL=N   — worker count cap (default 8)
+        slj2_topk = max(1, int(os.environ.get("PLACER_SLJ2_TOPK", "1")))
+        slj2_mirror = (os.environ.get("PLACER_SLJ2_MIRROR", "0") == "1")
+        slj2_pool = max(1, int(os.environ.get("PLACER_SLJ2_POOL", "8")))
+
         t_h = time.time()
-        candidates, diag = hessian_escape_step(
-            macro_pos_t, smooth_proxy_call,
-            step_sizes=step_sizes,
-            canvas_diag=canvas_diag,
-            n_lanczos_iters=n_lanczos_iters,
-            n_hard=n_hard,
-            soft_only_perturb=True,
-            verbose=True)
-        if not candidates:
+        labeled_candidates: list = []  # list of (label_str, pos_np)
+        if slj2_topk > 1:
+            from _hessian_escape import slj2_topk_candidates
+            cand_topk, diag = slj2_topk_candidates(
+                macro_pos_t, smooth_proxy_call,
+                k=slj2_topk,
+                step_sizes=[abs(s) for s in step_sizes
+                             if abs(s) not in (0.0,) and s > 0]
+                            or [0.02, 0.05],
+                canvas_diag=canvas_diag,
+                n_lanczos_iters=n_lanczos_iters,
+                n_hard=n_hard, soft_only_perturb=True, verbose=True)
+            labeled_candidates.extend(cand_topk)
+            print(f"  [v7] hessian: topk={slj2_topk} λ={diag.get('lambda_topk')}, "
+                  f"{len(cand_topk)} eigvec candidates",
+                  flush=True)
+        else:
+            cand_v7, diag = hessian_escape_step(
+                macro_pos_t, smooth_proxy_call,
+                step_sizes=step_sizes, canvas_diag=canvas_diag,
+                n_lanczos_iters=n_lanczos_iters,
+                n_hard=n_hard, soft_only_perturb=True, verbose=True)
+            for s, pos_np in cand_v7:
+                labeled_candidates.append((f"step={s:+.3f}", pos_np))
+
+        if slj2_mirror:
+            from _hessian_escape import slj2_mirror_candidates
+            mirror_cands = slj2_mirror_candidates(
+                macro_pos_t,
+                canvas_w=float(bench.canvas_width),
+                canvas_h=float(bench.canvas_height),
+                n_hard=n_hard, mirror_softs_only=True)
+            labeled_candidates.extend(mirror_cands)
+            print(f"  [v7] hessian: +{len(mirror_cands)} mirror candidates",
+                  flush=True)
+
+        if not labeled_candidates:
             print(f"  [v7] hessian: no candidates (eigvec degenerate); "
                   f"keeping post-Lap", flush=True)
             return current_pos, current_cost
         print(f"  [v7] hessian: λ_min={diag['lambda_min']:.6f}, "
               f"computed eigvec in {time.time()-t_h:.1f}s, "
-              f"running {len(candidates)} candidates "
-              f"× {hop_budget}s in parallel...", flush=True)
+              f"running {len(labeled_candidates)} candidates "
+              f"× {hop_budget}s in parallel (pool={slj2_pool})...",
+              flush=True)
 
-        # Spawn workers, each runs reduced pipeline from a perturbed init
+        # Spawn workers, each runs reduced pipeline from a perturbed init.
+        # Seeds are deterministic from label + base seed so reruns reproduce.
         args = []
-        for s, pos_np in candidates:
+        for label, pos_np in labeled_candidates:
             pos64 = np.ascontiguousarray(pos_np, dtype=np.float64)
-            seed = self.seed + int(abs(s) * 10000) + (1 if s > 0 else 0)
+            seed = self.seed + (abs(hash(label)) % (1 << 16))
             args.append((bench_path, pos64.tobytes(), pos64.shape,
                           str(pos64.dtype), int(hop_budget), seed,
-                          f"step={s:+.3f}"))
+                          str(label)))
         ctx = _mp.get_context("spawn")
-        with ctx.Pool(min(len(args), 8)) as pool:
+        with ctx.Pool(min(len(args), slj2_pool)) as pool:
             results = pool.map(hessian_candidate_worker, args)
 
         best_pos = None
