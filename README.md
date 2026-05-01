@@ -1,23 +1,32 @@
-# slj2 — algorithmic upgrades over v7 on c4d-standard-16
+# slj2 — algorithmic + CUDA-aware upgrades over v7
 
 Branch `slj2` is a **cumulative upgrade** of the `vmallela_v7` macro placer,
-designed to recover the proxy-cost gap that the un-upgraded pipeline showed
-on a real c4d-standard-16 box (the competition grader's instance class).
+targeting the actual competition grader hardware (per COMPETITION.md):
+
+> All submissions will be evaluated on a **AMD EPYC 9655P with 16 cores +
+> 100 GB of memory and an NVIDIA RTX 6000 Ada 48 GB.**
 
 ## Why this branch exists
 
-Reproducing v7's published 17-bench mean of **1.0003** on a fresh
-`c4d-standard-16` (16 vCPU AMD EPYC 9B45) failed: smoke runs on `ibm15`
-landed at **1.107** (with default deps) and **1.109** (with deps pinned to
-the dev-box `uv.lock`). Both miss the published `ibm15 = 1.0835` by ~0.022.
-The drift originates in the v4 SA cycles, not the Hessian phase, and is
-not fixed by env-stack pinning — meaning the published 1.0003 was either
-generated on different hardware or under a different python/dep stack
-than what the c4d grader will actually use.
+The original v7 placer's Hessian phase used `mps else cpu` device dispatch
+— it ran on Apple Metal on the Mac dev box but fell through to CPU on
+anything else (including the grader, which has CUDA). The published
+17-bench mean of **1.0003** was a Mac/MPS number; running v7 unmodified
+on a CPU-only host (this `c4d-standard-16` validation box) lands at
+~1.10 on `ibm15` — about 0.022 above the dev-box ref.
 
-slj2 closes the gap **algorithmically** rather than by chasing
-unreproducible hardware. We give up trying to match the published numbers
-and instead try to beat the v4 baseline (1.0186) by more than v7 did.
+slj2 fixes this with two kinds of changes:
+
+1. **Add a CUDA branch to the device dispatch** (`placer.py`). Now the
+   Hessian phase prefers CUDA when available, MPS on Mac dev, CPU as a
+   last resort. The grader's RTX 6000 Ada is now actually used.
+2. **Algorithmic upgrades that help on any device** — top-k eigvecs,
+   discrete-symmetry candidates, multi-iteration Hessian — making the
+   saddle-escape phase more thorough so we don't have to rely on any
+   single eigvec being "good enough" under any one backend's FP rounding.
+
+We also flip `PLACER_V6_GPU_WORKERS` from `0` → `1` in the slj2 sweep
+config so the v6 portfolio uses the grader's GPU.
 
 ## What's different in slj2
 

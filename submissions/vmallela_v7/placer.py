@@ -833,9 +833,19 @@ class OptimalPlacer:
 
         # Build smooth-surrogate closure (HPWL + density only; cong is
         # too far from exact, omitted)
-        device = (torch.device("mps")
-                  if torch.backends.mps.is_available()
-                  else torch.device("cpu"))
+        # Hessian phase device dispatch. Original code only checked MPS
+        # (dev box was Apple Silicon) and fell through to CPU. The grader
+        # (per COMPETITION.md) is an AMD EPYC 9655P + NVIDIA RTX 6000 Ada
+        # — i.e. has CUDA. Without this CUDA branch the grader would run
+        # the Hessian-vector product on CPU and get worse eigvecs than
+        # both Mac dev and the GPU it actually has. Order: prefer CUDA on
+        # grader, MPS on Mac dev, CPU as a last resort.
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
         macro_pos_t = torch.tensor(
             np.asarray(incr.macro_pos), dtype=torch.float32, device=device)
         pin_macro_t = torch.tensor(

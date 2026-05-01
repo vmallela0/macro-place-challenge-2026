@@ -24,7 +24,10 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 export PLACER_TOTAL_BUDGET=$WORKER_BUDGET
 export PLACER_V6_WORKERS=1
-export PLACER_V6_GPU_WORKERS=0
+# Grader has NVIDIA RTX 6000 Ada (per COMPETITION.md). Enable a GPU portfolio
+# worker if CUDA is present at runtime — harmless on CPU-only hosts (the v6
+# pipeline checks torch.cuda.is_available before instantiating GPU paths).
+export PLACER_V6_GPU_WORKERS=1
 export PLACER_V6_CONSENSUS=0
 export PLACER_SA_T0=0.00005
 export PLACER_ESC_HARD_DESTROY=80
