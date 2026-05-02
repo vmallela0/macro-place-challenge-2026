@@ -95,36 +95,27 @@ def test_quadratic_recovery_newton():
 
 
 def test_saddle_escape_1d_match():
-    """f(x,y) = x² - y² at (0.1, 0). H = diag(2, -2), grad = (0.2, 0).
+    """1D scalar saddle: f(s) = -s²/2 at s=0.1.  H = -1, g(0.1) = -0.1.
 
-    ARC step in y is decoupled: subspace contains both x and y axes when
-    Lanczos starts from g = (0.2, 0) — actually, g aligned with x means
-    the Krylov subspace from g contains only the x-axis (since H is diag).
+    For a true 1D ARC problem, the answer matches the closed-form
+    cubic minimizer exactly (no axis-coupling via ||s||³ — this is
+    the only setup in which the 1D analytic test is meaningful).
 
-    To make the test 2D-meaningful, perturb: start at (0.1, 0.01) so the
-    gradient has both components. Then ARC's y-component should match the
-    1D cubic minimizer with g_y = -0.02, h_y = -2.0 to high precision.
+    ARC produces step matching cubic_minimizer_1d(g, h, M) to 1e-8.
     """
-    A = np.diag([2.0, -2.0])
-    b_offset = np.zeros(2)  # f(x) = 0.5 x^T A x  (no linear term — saddle at 0)
+    A = np.array([[-1.0]])           # H = -1 (negative-curvature scalar)
+    b_offset = np.array([0.0])
     _, grad, hvp = make_quadratic(A, b_offset)
-    x0 = np.array([0.1, 0.01])
+    s_start = 0.1
+    x0 = np.array([s_start])
     M = 1.0
-    s, _, _, _ = arc_step(x0, grad, hvp, M_init=M, k_lanczos=2)
-
-    # Decoupled per axis (diag H, diag start). Each component is the 1D
-    # cubic minimum given that axis's (g_i, h_i, M).
-    g0 = grad(x0)  # (0.2, -0.02)
-    s_x_expected = cubic_minimizer_1d(g0[0], A[0, 0], M)
-    s_y_expected = cubic_minimizer_1d(g0[1], A[1, 1], M)
-    err_y = abs(s[1] - s_y_expected)
-    err_x = abs(s[0] - s_x_expected)
-    # The Krylov subspace from g spans both axes (diag H, both g
-    # components nonzero), so 2D recovery should be near-exact.
-    assert err_y < 1e-6, f"saddle y-component err={err_y:.2e}"
-    assert err_x < 1e-6, f"saddle x-component err={err_x:.2e}"
-    print(f"  ✓ saddle escape: s = ({s[0]:.4f}, {s[1]:.4f}), "
-          f"y-err {err_y:.2e}, x-err {err_x:.2e}")
+    s, _, _, info = arc_step(x0, grad, hvp, M_init=M, k_lanczos=1)
+    g0 = grad(x0)                    # = -0.1
+    s_expected = cubic_minimizer_1d(g0[0], A[0, 0], M)
+    err = abs(s[0] - s_expected)
+    assert err < 1e-7, f"1D saddle escape err={err:.2e} (s={s[0]} vs {s_expected})"
+    print(f"  ✓ saddle escape (1D): s={s[0]:.6f} vs cubic-min {s_expected:.6f}, "
+          f"err {err:.2e}")
 
 
 def test_indefinite_hessian_negative_curvature():

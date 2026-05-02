@@ -117,13 +117,17 @@ def short_pushapart(
             elif j_movable:
                 pos[j, axis] -= sign * push
             # else: both hard, can't fix this overlap here
-        # Clip to canvas (centers stay within [size/2, canvas - size/2]).
-        pos[indices, 0] = np.clip(pos[indices, 0],
-                                    w[indices] / 2.0,
-                                    canvas_w - w[indices] / 2.0)
-        pos[indices, 1] = np.clip(pos[indices, 1],
-                                    h[indices] / 2.0,
-                                    canvas_h - h[indices] / 2.0)
+        # Clip to canvas — only soft macros (hards are constraints).
+        soft_in_window = indices[indices >= n_hard]
+        if soft_in_window.size > 0:
+            pos[soft_in_window, 0] = np.clip(
+                pos[soft_in_window, 0],
+                w[soft_in_window] / 2.0,
+                canvas_w - w[soft_in_window] / 2.0)
+            pos[soft_in_window, 1] = np.clip(
+                pos[soft_in_window, 1],
+                h[soft_in_window] / 2.0,
+                canvas_h - h[soft_in_window] / 2.0)
         n_iters = it + 1
 
     remaining = overlap_pairs(pos, w, h, indices)

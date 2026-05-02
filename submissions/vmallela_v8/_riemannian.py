@@ -44,49 +44,57 @@ def tangent_projection(
     w: NDArray,
     h: NDArray,
     *,
-    contact_eps: float = 1e-3,
+    contact_eps: float | None = None,
 ) -> NDArray:
     """Project ambient gradient onto the tangent space of the no-overlap
     manifold at pos.
 
-    For each pair of macros that are "in contact" (gap ≤ contact_eps
-    along one axis, overlapping along the other), zero out the
-    components of grad that would push them deeper into the contact.
+    For each pair of macros (i, j) that are "in contact" (gap ≤ contact_eps
+    along one axis, overlapping along the other axis), if the descent
+    direction d = -g would deepen the contact, project out the inward
+    component.
 
-    Implementation: for each contact pair (i, j) along axis a with
-    sign(pos[i, a] - pos[j, a]) = +1, the inward-normal direction is
-    (-e_a for i, +e_a for j). Remove the component of grad along that
-    direction.
+    Constraint surface for sign_i = +1 (i to the right of j):
+        i_a - j_a ≥ (w_i + w_j) / 2
+    Active-constraint normal in joint (i, j) coords: n = (e_a^i - e_a^j).
+    Descent d = -g violates iff <d, n> < 0  ⇔  g[i,a] > g[j,a] (sign_i=+1).
+
+    Project out the inward part: result is that both g[i,a] and g[j,a]
+    become (g[i,a] + g[j,a])/2 → equal motion along the contact axis,
+    no relative motion. (Symmetric for sign_i = -1.)
+
+    contact_eps defaults to max(0.05 * mean_macro_size, 1e-3) so the
+    projection kicks in slightly before geometric contact, giving the
+    optimiser a chance to slow tangentially before retraction triggers.
     """
     g = grad.astype(np.float64).copy()
     n = pos.shape[0]
+    if contact_eps is None:
+        mean_size = float(np.mean(np.concatenate([w, h])))
+        contact_eps = max(0.05 * mean_size, 1e-3)
     for i in range(n):
         for j in range(i + 1, n):
             dx = pos[i, 0] - pos[j, 0]
             dy = pos[i, 1] - pos[j, 1]
             gap_x = abs(dx) - (w[i] + w[j]) / 2.0
             gap_y = abs(dy) - (h[i] + h[j]) / 2.0
-            # In contact when one axis has near-zero gap and the OTHER
-            # axis has overlap (negative gap). Otherwise the macros are
-            # not touching.
-            if (abs(gap_x) <= contact_eps and gap_y < 0.0) or \
-               (abs(gap_y) <= contact_eps and gap_x < 0.0):
-                # Determine contact axis (the small-gap one)
-                contact_axis = 0 if abs(gap_x) <= contact_eps else 1
-                sign_i = 1.0 if pos[i, contact_axis] >= pos[j, contact_axis] else -1.0
-                # Inward normal for i: -sign_i e_a. For j: +sign_i e_a.
-                # Remove inward component from each:
-                g_i = g[i, contact_axis]
-                g_j = g[j, contact_axis]
-                # The constraint is "i and j stay separated along axis a".
-                # Inward-pointing means sign(g_i) opposes sign_i (i.e.
-                # gradient pushes i toward j) AND sign(g_j) is sign_i
-                # (gradient pushes j toward i).
-                # Project out the symmetric inward component:
-                inward = 0.5 * (-sign_i * g_i + sign_i * g_j)
-                if inward > 0:  # inward push present
-                    g[i, contact_axis] += sign_i * inward
-                    g[j, contact_axis] -= sign_i * inward
+            # In contact when one axis has near-zero (or negative) gap
+            # and the OTHER axis has overlap (negative gap). Otherwise
+            # the macros are not touching.
+            cx_active = (gap_x <= contact_eps and gap_y < 0.0)
+            cy_active = (gap_y <= contact_eps and gap_x < 0.0)
+            if not (cx_active or cy_active):
+                continue
+            # Pick the contact axis (the smaller-gap one)
+            contact_axis = 0 if (cx_active and (not cy_active or gap_x < gap_y)) else 1
+            sign_i = 1.0 if pos[i, contact_axis] >= pos[j, contact_axis] else -1.0
+            g_i = g[i, contact_axis]
+            g_j = g[j, contact_axis]
+            # Active iff sign_i * (g[i, a] - g[j, a]) > 0  (descent violates).
+            if sign_i * (g_i - g_j) > 0.0:
+                avg = 0.5 * (g_i + g_j)
+                g[i, contact_axis] = avg
+                g[j, contact_axis] = avg
     return g
 
 
