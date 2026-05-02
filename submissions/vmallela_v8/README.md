@@ -20,7 +20,28 @@ All phases additive on top of v7's pipeline. v7/slj2 code unchanged.
 ## Live results
 
 <!--V8:START-->
-_v8 sweep results land here as benchmarks complete._
+_v8 results — 0 / 17 complete. ibm15-first ordering._
+
+| Bench | v8 proxy | v7 dev-box | Δ vs v7 | Overlaps | Wall (s) | Status | PNG |
+|---|---:|---:|---:|---:|---:|:---:|:---:|
+| ibm15 | — | 1.0835 | — | — | — | — | — |
+| ibm17 | — | 1.2813 | — | — | — | — | — |
+| ibm18 | — | 1.2697 | — | — | — | — | — |
+| ibm12 | — | 1.1557 | — | — | — | — | — |
+| ibm14 | — | 1.1070 | — | — | — | — | — |
+| ibm16 | — | 1.0435 | — | — | — | — | — |
+| ibm13 | — | 0.8757 | — | — | — | — | — |
+| ibm04 | — | 0.9287 | — | — | — | — | — |
+| ibm06 | — | 1.0546 | — | — | — | — | — |
+| ibm07 | — | 1.0324 | — | — | — | — | — |
+| ibm08 | — | 1.0291 | — | — | — | — | — |
+| ibm09 | — | 0.7628 | — | — | — | — | — |
+| ibm10 | — | 0.9492 | — | — | — | — | — |
+| ibm11 | — | 0.8013 | — | — | — | — | — |
+| ibm01 | — | 0.7653 | — | — | — | — | — |
+| ibm02 | — | 0.9482 | — | — | — | — | — |
+| ibm03 | — | 0.9166 | — | — | — | — | — |
+
 <!--V8:END-->
 
 ## Files
