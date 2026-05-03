@@ -197,7 +197,41 @@ class OptimalPlacer:
 
         print(f"  [legalize] {time.time() - t0:.1f}s cost={best_cost:.6f}", flush=True)
         if best_pos is None:
-            return benchmark.macro_positions.clone()
+            # Recovery: legalize couldn't find a fully overlap-free placement
+            # within budget (happens on dense benches like ibm17). Returning
+            # the unmodified initial placement here = the worker reports
+            # INVALID with the original overlap count — guaranteed loss.
+            # Instead, fall back to the BEST PARTIAL placement (fewest
+            # overlaps, then lowest cost) so the CD phase has a recoverable
+            # starting point; CD's cost function penalizes overlap-driven
+            # congestion, so it will resolve at least some of the remaining
+            # overlaps within its own budget.
+            print(f"  [legalize] no fully-legal candidate; running recovery", flush=True)
+            best_partial_pos = None
+            best_partial_overlaps = float("inf")
+            best_partial_cost = float("inf")
+            recovery_candidates = list(pushed_positions)
+            if _fast_t:
+                recovery_candidates.extend([p for _c, p in _top_candidates])
+            for cand_pos in recovery_candidates:
+                full = benchmark.macro_positions.clone()
+                full[:n_hard] = torch.tensor(cand_pos, dtype=torch.float32)
+                r = compute_proxy_cost(full, benchmark, plc_eval)
+                ov = r["overlap_count"]
+                c = r["proxy_cost"]
+                if (ov < best_partial_overlaps
+                        or (ov == best_partial_overlaps and c < best_partial_cost)):
+                    best_partial_overlaps = ov
+                    best_partial_cost = c
+                    best_partial_pos = cand_pos.copy()
+            if best_partial_pos is not None:
+                best_pos = best_partial_pos
+                best_cost = best_partial_cost
+                print(f"  [legalize] recovery: best partial has "
+                      f"{best_partial_overlaps} overlaps, "
+                      f"cost={best_cost:.6f}", flush=True)
+            else:
+                return benchmark.macro_positions.clone()
 
         plc_cd = _load_plc(benchmark.name)
         incr_eval = IncrementalEvaluator(plc_cd, benchmark)
