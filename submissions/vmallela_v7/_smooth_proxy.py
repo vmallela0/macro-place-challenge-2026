@@ -290,6 +290,110 @@ def lse_hpwl_vectorized(
     return hpwl_total / ((cw + ch) * net_cnt)
 
 
+def lse_congestion_rudy(
+    pin_x: torch.Tensor,        # (n_pins,) requires_grad
+    pin_y: torch.Tensor,        # (n_pins,) requires_grad
+    pin_to_net: torch.Tensor,   # (n_pins,) long
+    net_weight: torch.Tensor,   # (n_nets,) float
+    n_nets: int,
+    cw: float, ch: float,
+    *,
+    tau_lse: float = 50.0,
+    K_frac: float = 0.02,
+    mu: float = 100.0,
+    bbox_floor: float = 1e-2,
+) -> torch.Tensor:
+    """RUDY-style smooth congestion proxy (Spindler 2007).
+
+    Per-net wire-density demand = HPWL / area:
+      bbox_w + bbox_h         ← total wire length needed by the net
+      bbox_w · bbox_h         ← bbox footprint (area)
+      demand = HPWL / area    ← wire-length per unit area
+
+    Tight nets with many pins drive high RUDY density — exactly the
+    routing congestion the official proxy penalizes via top-K-mean
+    over edge demands. CVaR top-K over per-net demands picks the
+    worst-bottleneck nets.
+
+    Reuses the same LSE-max/min bbox machinery as lse_hpwl_vectorized
+    so the gradient flows through pin positions identically.
+    """
+    device = pin_x.device
+    dtype = pin_x.dtype
+
+    # ── lse_max(pin_x) per net ──────────────────────────────────────
+    x_max = torch.full((n_nets,), float('-inf'), device=device, dtype=dtype)
+    x_max.scatter_reduce_(0, pin_to_net, pin_x.detach(),
+                          reduce='amax', include_self=True)
+    x_max_per_pin = x_max[pin_to_net]
+    exp_x = torch.exp(tau_lse * (pin_x - x_max_per_pin))
+    sum_exp_x = torch.zeros(n_nets, device=device, dtype=dtype)
+    sum_exp_x.scatter_add_(0, pin_to_net, exp_x)
+    lse_max_x = x_max + torch.log(sum_exp_x.clamp_min(1e-30)) / tau_lse
+
+    nx_max = torch.full((n_nets,), float('-inf'), device=device, dtype=dtype)
+    nx_max.scatter_reduce_(0, pin_to_net, (-pin_x).detach(),
+                           reduce='amax', include_self=True)
+    nx_max_per_pin = nx_max[pin_to_net]
+    exp_nx = torch.exp(tau_lse * (-pin_x - nx_max_per_pin))
+    sum_exp_nx = torch.zeros(n_nets, device=device, dtype=dtype)
+    sum_exp_nx.scatter_add_(0, pin_to_net, exp_nx)
+    lse_min_x = -(nx_max + torch.log(sum_exp_nx.clamp_min(1e-30)) / tau_lse)
+
+    bbox_x = lse_max_x - lse_min_x
+
+    # ── Same for y ──────────────────────────────────────────────────
+    y_max = torch.full((n_nets,), float('-inf'), device=device, dtype=dtype)
+    y_max.scatter_reduce_(0, pin_to_net, pin_y.detach(),
+                          reduce='amax', include_self=True)
+    y_max_per_pin = y_max[pin_to_net]
+    exp_y = torch.exp(tau_lse * (pin_y - y_max_per_pin))
+    sum_exp_y = torch.zeros(n_nets, device=device, dtype=dtype)
+    sum_exp_y.scatter_add_(0, pin_to_net, exp_y)
+    lse_max_y = y_max + torch.log(sum_exp_y.clamp_min(1e-30)) / tau_lse
+
+    ny_max = torch.full((n_nets,), float('-inf'), device=device, dtype=dtype)
+    ny_max.scatter_reduce_(0, pin_to_net, (-pin_y).detach(),
+                           reduce='amax', include_self=True)
+    ny_max_per_pin = ny_max[pin_to_net]
+    exp_ny = torch.exp(tau_lse * (-pin_y - ny_max_per_pin))
+    sum_exp_ny = torch.zeros(n_nets, device=device, dtype=dtype)
+    sum_exp_ny.scatter_add_(0, pin_to_net, exp_ny)
+    lse_min_y = -(ny_max + torch.log(sum_exp_ny.clamp_min(1e-30)) / tau_lse)
+
+    bbox_y = lse_max_y - lse_min_y
+
+    # ── RUDY demand: HPWL / area, per net ───────────────────────────
+    # Floor bbox to bbox_floor·canvas so 1-pin nets and tiny bboxes
+    # don't divide by zero / blow up the demand.
+    floor_x = torch.tensor(bbox_floor * cw, device=device, dtype=dtype)
+    floor_y = torch.tensor(bbox_floor * ch, device=device, dtype=dtype)
+    safe_w = torch.maximum(bbox_x, floor_x)
+    safe_h = torch.maximum(bbox_y, floor_y)
+    hpwl_per_net = bbox_x + bbox_y
+    area_per_net = safe_w * safe_h
+    demand = hpwl_per_net / area_per_net
+
+    # Mask non-finite (empty nets via -inf max)
+    demand = torch.where(torch.isfinite(demand), demand,
+                         torch.zeros_like(demand))
+    demand = demand * net_weight
+
+    # ── CVaR top-K (worst-K demand mean) ────────────────────────────
+    K = max(1, int(K_frac * n_nets))
+    with torch.no_grad():
+        sorted_demand = torch.sort(demand, descending=True)[0]
+        if K <= demand.shape[0]:
+            t = sorted_demand[K - 1].clone()
+        else:
+            t = demand.min().clone()
+    cvar = t + softplus_mu(demand - t, mu).sum() / K
+
+    # Normalize by canvas perimeter so this term has comparable scale
+    # to HPWL (which is also normalized by (cw+ch)).
+    return cvar / (cw + ch)
+
+
 def smooth_proxy_for_v7(
     macro_pos: torch.Tensor,           # (n_total, 2) requires_grad
     t_density: torch.Tensor,           # () requires_grad

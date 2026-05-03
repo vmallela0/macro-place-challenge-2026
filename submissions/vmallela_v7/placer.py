@@ -161,44 +161,6 @@ class OptimalPlacer:
         log_prefix = "  "
         t0 = time.time()
 
-        # Optional: hyperbolic-embedding warm-start (env-gated). Replaces
-        # the .plc initial macro positions with positions derived from a
-        # hyperbolic embedding of the netlist hypergraph. Saves the
-        # modified benchmark to a temp .pt and uses that path downstream.
-        # See _hyperbolic_warmstart.py for theory (Krioukov 2010).
-        if os.environ.get("PLACER_V7_HYPERBOLIC_WARMSTART", "0") == "1":
-            try:
-                import tempfile
-                from _hyperbolic_warmstart import hyperbolic_warm_start_positions
-                _v1_dir = str(_HERE.parent / "vmallela")
-                if _v1_dir not in sys.path:
-                    sys.path.insert(0, _v1_dir)
-                from placer import _load_plc as _v1_load_plc
-                plc_for_ws = _v1_load_plc(benchmark.name)
-                t_ws = time.time()
-                new_positions = hyperbolic_warm_start_positions(
-                    benchmark, plc_for_ws,
-                    canvas_margin_frac=float(os.environ.get(
-                        "PLACER_V7_HYP_MARGIN", "0.10")),
-                    radius_compress=float(os.environ.get(
-                        "PLACER_V7_HYP_COMPRESS", "1.5")),
-                    verbose=True,
-                )
-                print(f"  [v7] hyperbolic warm-start: {time.time()-t_ws:.1f}s",
-                      flush=True)
-                bench_copy = benchmark
-                bench_copy.macro_positions = torch.tensor(
-                    new_positions, dtype=bench_copy.macro_positions.dtype)
-                tmp_pt = tempfile.NamedTemporaryFile(
-                    suffix=f"_{benchmark.name}_hwstart.pt",
-                    delete=False).name
-                bench_copy.save(tmp_pt)
-                bench_path = tmp_pt
-                print(f"  [v7] hyperbolic init saved → {tmp_pt}", flush=True)
-            except Exception as e:
-                print(f"  [v7] hyperbolic warm-start err: {e}; "
-                      f"falling back to .plc init", flush=True)
-
         # Reserve time at the tail for Laplacian + basin-hopping. The
         # portfolio's per-worker budget is shrunk by this amount so that
         # the final time_remaining check leaves room for at least
@@ -870,8 +832,8 @@ class OptimalPlacer:
         """
         import multiprocessing as _mp
         from _hessian_escape import hessian_escape_step
-        from _smooth_proxy import (lse_hpwl_vectorized, build_pin_to_net,
-                                     cvar_smooth)
+        from _smooth_proxy import (lse_hpwl_vectorized, lse_congestion_rudy,
+                                     build_pin_to_net, cvar_smooth)
         from _cell_window import (build_window_indices, smooth_density_grid)
         from _hessian_worker import hessian_candidate_worker
         import importlib.util as _ilu
@@ -927,6 +889,15 @@ class OptimalPlacer:
         net_cnt = float(incr.net_cnt)
         K_d = max(1, int(0.10 * incr.n_cells))
 
+        # Feynman-style: the official proxy is 1.0·WL + 0.5·Den + 0.5·Cong.
+        # On hard benches congestion is the dominant term (~68% of cost).
+        # The original surrogate was hpwl + 0.5·density only — the Hessian
+        # saddle-escape was BLIND to the dominant cost term, polishing
+        # the wrong rock. Adding RUDY-style smooth congestion gives the
+        # gradient visibility into routing-bottleneck nets.
+        cong_weight = float(os.environ.get("PLACER_V7_SMOOTH_CONG_WEIGHT", "0.5"))
+        cong_K_frac = float(os.environ.get("PLACER_V7_SMOOTH_CONG_K", "0.02"))
+
         def smooth_proxy_call(macro_pos_var):
             is_port = (pin_macro_t < 0)
             safe = torch.where(is_port, torch.zeros_like(pin_macro_t), pin_macro_t)
@@ -945,7 +916,14 @@ class OptimalPlacer:
                 t_d = torch.quantile(rho, 1.0 - K_d / incr.n_cells)
             density_smooth = cvar_smooth(rho.unsqueeze(0), K_d, t_d.detach(),
                                            mu=100.0).squeeze()
-            return hpwl + 0.5 * density_smooth
+            total = hpwl + 0.5 * density_smooth
+            if cong_weight > 0.0:
+                cong_smooth = lse_congestion_rudy(
+                    pin_x, pin_y, pin_to_net_t, net_weight_t, n_nets,
+                    cw=cw_f, ch=ch_f, tau_lse=50.0,
+                    K_frac=cong_K_frac, mu=100.0)
+                total = total + cong_weight * cong_smooth
+            return total
 
         # Compute Hessian eigvec
         t_h = time.time()
