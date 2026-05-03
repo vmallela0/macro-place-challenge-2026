@@ -28,12 +28,19 @@ classifiers = [
 ]
 
 dependencies = [
-    "torch>=2.0.0",
-    "numpy>=1.20.0",
-    "matplotlib>=3.5.0",
+    # Constraints tightened for cross-machine numerical reproducibility.
+    # The placer's SA loop is chaos-sensitive to ULP-level float deltas;
+    # numpy 2.x changed default float-promotion rules vs 1.x, causing
+    # measurable drift in SA acceptance trajectories. Tested config:
+    # numpy==1.26.4, scipy==1.13.1, matplotlib==3.9.4, torch==2.4.1+cu124.
+    # Pins below match these versions while leaving small patch-level slack.
+    "torch>=2.0.0,<3.0.0",
+    "numpy>=1.26,<2",
+    "matplotlib>=3.7,<4.0",
     "tqdm>=4.65.0",
     "absl-py>=1.0.0",
-    "scipy>=1.10.0",          # used by submissions/vmallela_v6/_hungarian_lns.py
+    "scipy>=1.11,<1.14",      # last scipy line supporting numpy 1.x;
+                              # used by submissions/vmallela_v6/_hungarian_lns.py
     "threadpoolctl>=3.0.0",   # runtime BLAS thread pin for hardware-portable
                               # determinism (submissions/vmallela_v6/placer.py
                               # calls threadpool_limits(1) at module import).
