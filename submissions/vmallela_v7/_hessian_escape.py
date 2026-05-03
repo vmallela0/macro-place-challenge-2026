@@ -238,3 +238,189 @@ def hessian_escape_step(
         "n_hard_zeroed": int(n_hard) if soft_only_perturb else 0,
     }
     return candidates, diagnostics
+
+
+# ============================================================================
+# istanbul branch additions: adaptive line search + feasibility filter.
+#
+# Critique of the v7-combinatorial baseline:
+#   1. Step sizes [0.02, 0.05] are arbitrary heuristics.
+#   2. No feasibility check before launching 1000s SA workers per candidate.
+#
+# Fixes:
+#   adaptive_topk_candidates  — backtracking line search on the smooth proxy
+#                                replaces fixed step_sizes; one candidate per
+#                                eigvec at its optimal step.
+#   feasibility_filter        — O(N²) vectorized overlap count; drops
+#                                candidates with too many overlaps before
+#                                spawning expensive SA workers.
+# ============================================================================
+
+
+def adaptive_line_search(
+    proxy_call,
+    x0: "torch.Tensor",
+    direction: "torch.Tensor",
+    *,
+    initial: float = 0.10,
+    n_steps: int = 10,
+    shrink: float = 0.6,
+) -> tuple[float, float]:
+    """Backtracking line search to find the best step along ±direction.
+
+    Geometric backtracking — start at `initial` step, halve until either we
+    find a step that reduces the surrogate proxy or we exhaust `n_steps`.
+    Tries both signs (±direction) at every shrink level since saddle-escape
+    eigvec sign is ambiguous.
+
+    Returns (best_step, best_proxy) where best_step has sign included.
+    Returns (0.0, f0) if no improvement found within budget.
+    """
+    import torch
+    with torch.no_grad():
+        f0 = float(proxy_call(x0).item())
+    best_s, best_f = 0.0, f0
+
+    s = float(initial)
+    for _ in range(int(n_steps)):
+        for sign in (+1.0, -1.0):
+            x_try = x0 + sign * s * direction
+            try:
+                with torch.no_grad():
+                    f_try = float(proxy_call(x_try).item())
+            except Exception:
+                continue
+            if f_try < best_f:
+                best_s = sign * s
+                best_f = f_try
+        s *= float(shrink)
+    return best_s, best_f
+
+
+def adaptive_topk_candidates(
+    macro_pos: "torch.Tensor",
+    smooth_proxy_call,
+    *,
+    k: int = 2,
+    canvas_diag: float = 1.0,
+    n_lanczos_iters: int = 50,
+    n_hard: int = 0,
+    soft_only_perturb: bool = True,
+    ls_initial: float = 0.10,
+    ls_n_steps: int = 10,
+    ls_shrink: float = 0.6,
+    verbose: bool = False,
+) -> tuple[list, dict]:
+    """Adaptive variant of slj2_topk_candidates.
+
+    For each of the top-k smallest-eigval eigvecs of the Hessian, run a
+    backtracking line search on the smooth surrogate to find the *optimal*
+    step size in that direction. Yields one candidate per eigvec (with the
+    best step found), instead of |step_sizes| × 2 candidates per eigvec at
+    arbitrary fixed step magnitudes.
+
+    Mathematically: at a true saddle (∇U = 0, λ_min < 0), the second-order
+    Taylor gives U(x + s·v) ≈ U(x) + ½ s² λ_min, monotone-decreasing in
+    |s| up to where higher-order terms kick in. The optimal step is the
+    one where the cubic/quartic correction starts to dominate, which is
+    bench-and-state-specific — *exactly* what line search discovers.
+    """
+    import numpy as np
+    import torch
+
+    eigvals, eigvecs = hessian_min_eigvecs_topk(
+        smooth_proxy_call, macro_pos,
+        k=k, n_lanczos_iters=n_lanczos_iters, verbose=verbose)
+
+    n_total = macro_pos.shape[0]
+    base = macro_pos.detach().cpu().numpy().copy()
+    candidates: list = []
+    used_eigvals: list = []
+    line_search_results: list = []
+
+    for j in range(eigvecs.shape[1]):
+        v_j = eigvecs[:, j].reshape(n_total, 2)
+        v_norm = float(np.linalg.norm(v_j))
+        if v_norm < 1e-12:
+            continue
+        v_j = v_j / v_norm
+        if soft_only_perturb and n_hard > 0:
+            v_j[:n_hard] = 0.0
+            v_norm_post = float(np.linalg.norm(v_j))
+            if v_norm_post < 1e-12:
+                continue
+            v_j = v_j / v_norm_post
+
+        # Scale by canvas_diag so step=1 means "one canvas-diag's worth of move"
+        v_j_scaled = canvas_diag * v_j
+        v_t = torch.tensor(v_j_scaled, dtype=macro_pos.dtype,
+                           device=macro_pos.device)
+
+        best_s, best_f = adaptive_line_search(
+            smooth_proxy_call, macro_pos, v_t,
+            initial=ls_initial, n_steps=ls_n_steps, shrink=ls_shrink)
+
+        if abs(best_s) < 1e-6:
+            line_search_results.append((j, 0.0, best_f, "no_improvement"))
+            continue
+
+        perturbed = base + best_s * v_j_scaled
+        used_eigvals.append(float(eigvals[j]))
+        candidates.append(
+            (f"e{j}_ls{best_s:+.3f}", perturbed))
+        line_search_results.append((j, best_s, best_f, "kept"))
+        if verbose:
+            print(f"    [hessian.adaptive] e{j}: λ={eigvals[j]:+.4e} "
+                  f"best_step={best_s:+.4f} surrogate_f={best_f:.6f}",
+                  flush=True)
+
+    diag = {
+        "lambda_min": float(eigvals[0]) if len(eigvals) else 0.0,
+        "lambda_topk": [float(x) for x in used_eigvals],
+        "k_eigvecs_used": len(used_eigvals),
+        "n_candidates": len(candidates),
+        "method": "adaptive_line_search",
+        "line_search_results": line_search_results,
+    }
+    return candidates, diag
+
+
+def feasibility_filter(
+    candidates: list,
+    benchmark,
+    *,
+    max_overlaps: int = 200,
+    gap: float = 0.05,
+) -> tuple[list, list]:
+    """Drop candidates with too many macro-macro overlaps before SA workers spawn.
+
+    Vectorized O(N²) pairwise overlap count on hard macros (soft macros
+    are stand-cell clusters — overlaps are allowed between them per the
+    competition spec). Threshold defaults to 200 overlaps which is the
+    rough boundary above which legalize+CD has historically failed to
+    recover within the SA budget.
+
+    Each dropped candidate would otherwise consume hop_budget seconds of
+    SA wall time on a result that ends up INVALID anyway. Filtering at
+    candidate-gen time saves k_dropped × hop_budget seconds.
+    """
+    import numpy as np
+    n_hard = benchmark.num_hard_macros
+    sizes = benchmark.macro_sizes[:n_hard].numpy().astype(np.float64)
+    sep_x = (sizes[:, 0:1] + sizes[:, 0:1].T) / 2.0 - gap
+    sep_y = (sizes[:, 1:2] + sizes[:, 1:2].T) / 2.0 - gap
+
+    keep: list = []
+    drop: list = []
+    for label, pos in candidates:
+        p = pos[:n_hard]
+        dx = np.abs(p[:, 0:1] - p[:, 0:1].T)
+        dy = np.abs(p[:, 1:2] - p[:, 1:2].T)
+        overlap = (dx < sep_x) & (dy < sep_y)
+        np.fill_diagonal(overlap, False)
+        n_ov = int(np.triu(overlap, k=1).sum())
+        if n_ov <= int(max_overlaps):
+            keep.append((label, pos))
+        else:
+            drop.append((label, n_ov))
+    return keep, drop

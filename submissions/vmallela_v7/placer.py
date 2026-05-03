@@ -71,6 +71,16 @@ for _k, _v in [
     ("PLACER_V7_HESSIAN_BUDGET", "1000"),
     ("PLACER_V7_HESSIAN_LANCZOS", "50"),
     ("PLACER_V7_HESSIAN_MAX_ITERS", "1"),
+    # istanbul: enable adaptive line-search + feasibility filter for
+    # the saddle-escape phase. Replaces the hardcoded HESSIAN_STEPS
+    # and drops candidates whose post-perturbation overlap count
+    # exceeds MAX_OVERLAPS, saving wasted SA worker time.
+    ("PLACER_V7_HESSIAN_ADAPTIVE", "1"),
+    ("PLACER_V7_HESSIAN_ADAPTIVE_TOPK", "2"),
+    ("PLACER_V7_HESSIAN_LS_INITIAL", "0.10"),
+    ("PLACER_V7_HESSIAN_LS_STEPS", "10"),
+    ("PLACER_V7_HESSIAN_LS_SHRINK", "0.6"),
+    ("PLACER_V7_HESSIAN_MAX_OVERLAPS", "200"),
 ]:
     _os.environ.setdefault(_k, _v)
 
@@ -911,14 +921,57 @@ class OptimalPlacer:
 
         # Compute Hessian eigvec
         t_h = time.time()
-        candidates, diag = hessian_escape_step(
-            macro_pos_t, smooth_proxy_call,
-            step_sizes=step_sizes,
-            canvas_diag=canvas_diag,
-            n_lanczos_iters=n_lanczos_iters,
-            n_hard=n_hard,
-            soft_only_perturb=True,
-            verbose=True)
+        # istanbul: adaptive line search + feasibility filter (env-gated).
+        if os.environ.get("PLACER_V7_HESSIAN_ADAPTIVE", "0") == "1":
+            from _hessian_escape import (
+                adaptive_topk_candidates, feasibility_filter)
+            adaptive_k = int(os.environ.get(
+                "PLACER_V7_HESSIAN_ADAPTIVE_TOPK", "2"))
+            ls_initial = float(os.environ.get(
+                "PLACER_V7_HESSIAN_LS_INITIAL", "0.10"))
+            ls_steps = int(os.environ.get(
+                "PLACER_V7_HESSIAN_LS_STEPS", "10"))
+            ls_shrink = float(os.environ.get(
+                "PLACER_V7_HESSIAN_LS_SHRINK", "0.6"))
+            candidates, diag = adaptive_topk_candidates(
+                macro_pos_t, smooth_proxy_call,
+                k=adaptive_k,
+                canvas_diag=canvas_diag,
+                n_lanczos_iters=n_lanczos_iters,
+                n_hard=n_hard,
+                soft_only_perturb=True,
+                ls_initial=ls_initial,
+                ls_n_steps=ls_steps,
+                ls_shrink=ls_shrink,
+                verbose=True)
+            # Convert to (s, pos) tuple shape that the worker code below
+            # expects (existing code uses `s` as a sortkey/seed-shifter).
+            # We re-encode the ±step from the label into a numeric sortkey.
+            candidates = [
+                (float(lab.split("_ls")[1]) if "_ls" in lab else 0.0, pos)
+                for lab, pos in candidates
+            ]
+            # Feasibility filter
+            max_overlaps = int(os.environ.get(
+                "PLACER_V7_HESSIAN_MAX_OVERLAPS", "200"))
+            kept, dropped = feasibility_filter(
+                candidates, bench, max_overlaps=max_overlaps)
+            if dropped:
+                drop_summary = ", ".join(f"e{i}={n}" for i, (_, n) in enumerate(dropped))
+                print(f"  [v7] hessian feasibility filter dropped "
+                      f"{len(dropped)}/{len(candidates)} "
+                      f"(threshold={max_overlaps}): {drop_summary}",
+                      flush=True)
+            candidates = kept
+        else:
+            candidates, diag = hessian_escape_step(
+                macro_pos_t, smooth_proxy_call,
+                step_sizes=step_sizes,
+                canvas_diag=canvas_diag,
+                n_lanczos_iters=n_lanczos_iters,
+                n_hard=n_hard,
+                soft_only_perturb=True,
+                verbose=True)
         if not candidates:
             print(f"  [v7] hessian: no candidates (eigvec degenerate); "
                   f"keeping post-Lap", flush=True)
