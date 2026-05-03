@@ -161,6 +161,44 @@ class OptimalPlacer:
         log_prefix = "  "
         t0 = time.time()
 
+        # Optional: hyperbolic-embedding warm-start (env-gated). Replaces
+        # the .plc initial macro positions with positions derived from a
+        # hyperbolic embedding of the netlist hypergraph. Saves the
+        # modified benchmark to a temp .pt and uses that path downstream.
+        # See _hyperbolic_warmstart.py for theory (Krioukov 2010).
+        if os.environ.get("PLACER_V7_HYPERBOLIC_WARMSTART", "0") == "1":
+            try:
+                import tempfile
+                from _hyperbolic_warmstart import hyperbolic_warm_start_positions
+                _v1_dir = str(_HERE.parent / "vmallela")
+                if _v1_dir not in sys.path:
+                    sys.path.insert(0, _v1_dir)
+                from placer import _load_plc as _v1_load_plc
+                plc_for_ws = _v1_load_plc(benchmark.name)
+                t_ws = time.time()
+                new_positions = hyperbolic_warm_start_positions(
+                    benchmark, plc_for_ws,
+                    canvas_margin_frac=float(os.environ.get(
+                        "PLACER_V7_HYP_MARGIN", "0.10")),
+                    radius_compress=float(os.environ.get(
+                        "PLACER_V7_HYP_COMPRESS", "1.5")),
+                    verbose=True,
+                )
+                print(f"  [v7] hyperbolic warm-start: {time.time()-t_ws:.1f}s",
+                      flush=True)
+                bench_copy = benchmark
+                bench_copy.macro_positions = torch.tensor(
+                    new_positions, dtype=bench_copy.macro_positions.dtype)
+                tmp_pt = tempfile.NamedTemporaryFile(
+                    suffix=f"_{benchmark.name}_hwstart.pt",
+                    delete=False).name
+                bench_copy.save(tmp_pt)
+                bench_path = tmp_pt
+                print(f"  [v7] hyperbolic init saved → {tmp_pt}", flush=True)
+            except Exception as e:
+                print(f"  [v7] hyperbolic warm-start err: {e}; "
+                      f"falling back to .plc init", flush=True)
+
         # Reserve time at the tail for Laplacian + basin-hopping. The
         # portfolio's per-worker budget is shrunk by this amount so that
         # the final time_remaining check leaves room for at least
