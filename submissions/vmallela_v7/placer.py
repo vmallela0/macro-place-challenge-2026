@@ -76,7 +76,7 @@ for _k, _v in [
     # and drops candidates whose post-perturbation overlap count
     # exceeds MAX_OVERLAPS, saving wasted SA worker time.
     ("PLACER_V7_HESSIAN_ADAPTIVE", "1"),
-    ("PLACER_V7_HESSIAN_ADAPTIVE_TOPK", "2"),
+    ("PLACER_V7_HESSIAN_ADAPTIVE_TOPK", "1"),
     ("PLACER_V7_HESSIAN_LS_INITIAL", "0.10"),
     ("PLACER_V7_HESSIAN_LS_STEPS", "10"),
     ("PLACER_V7_HESSIAN_LS_SHRINK", "0.6"),

@@ -301,7 +301,7 @@ def adaptive_topk_candidates(
     macro_pos: "torch.Tensor",
     smooth_proxy_call,
     *,
-    k: int = 2,
+    k: int = 1,                    # was k=2; k=1 converges reliably in n_lanczos_iters=50
     canvas_diag: float = 1.0,
     n_lanczos_iters: int = 50,
     n_hard: int = 0,
@@ -328,9 +328,18 @@ def adaptive_topk_candidates(
     import numpy as np
     import torch
 
+    # Fallback: if k>1 ARPACK doesn't converge, retry k=1 (always reliable).
     eigvals, eigvecs = hessian_min_eigvecs_topk(
         smooth_proxy_call, macro_pos,
         k=k, n_lanczos_iters=n_lanczos_iters, verbose=verbose)
+    if (eigvecs is None or eigvecs.shape[1] == 0
+            or float(np.linalg.norm(eigvecs)) < 1e-12) and k > 1:
+        if verbose:
+            print(f"    [hessian.adaptive] k={k} ARPACK unconverged; "
+                  f"falling back to k=1", flush=True)
+        eigvals, eigvecs = hessian_min_eigvecs_topk(
+            smooth_proxy_call, macro_pos,
+            k=1, n_lanczos_iters=n_lanczos_iters, verbose=verbose)
 
     n_total = macro_pos.shape[0]
     base = macro_pos.detach().cpu().numpy().copy()
