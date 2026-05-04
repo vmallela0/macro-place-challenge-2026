@@ -72,6 +72,9 @@ checkpoints/
 tmp/
 temp/
 *.tmp
+
+# Claude Code local settings (contains secrets)
+.claude/settings.local.json
 # MacroPlacement evaluator (submodule)
 # Keep the submodule but ignore unnecessary files
 external/MacroPlacement/Testcases/

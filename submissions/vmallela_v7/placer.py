@@ -98,6 +98,72 @@ def _benchmark_pt_path(bench_name: str) -> str:
     return str(p)
 
 
+def _write_halo_pt(src_path: str, bench_name: str, halo_pct: float) -> str:
+    """Read benchmark .pt, inflate hard-macro sizes, write to /tmp.
+
+    Returns the new path. Caller threads it as `bench_path` so workers
+    loading via `Benchmark.load(bench_path)` see the inflated sizes.
+    """
+    return _write_modified_pt(src_path, bench_name, halo_pct=halo_pct)
+
+
+def _compute_timing_weights(benchmark: "Benchmark", alpha: float
+                            ) -> torch.Tensor:
+    """Topology-based net weight modulation: fanout boost.
+
+    Heuristic: w_n *= 1 + alpha * log2(1 + fanout_n / median_fanout).
+    Higher-fanout nets are more likely on critical paths under STA so we
+    upweight them in HPWL — placer brings their pins closer at the cost
+    of slight HPWL on low-fanout nets. Net counts come from
+    `net_pin_nodes` (preferred, pin-level) or `net_nodes`.
+    """
+    if benchmark.net_pin_nodes:
+        fan = torch.tensor(
+            [pins.shape[0] for pins in benchmark.net_pin_nodes],
+            dtype=torch.float32)
+    elif benchmark.net_nodes:
+        fan = torch.tensor(
+            [n.numel() for n in benchmark.net_nodes],
+            dtype=torch.float32)
+    else:
+        return benchmark.net_weights.clone()
+
+    if fan.numel() == 0:
+        return benchmark.net_weights.clone()
+    median = fan.median().clamp(min=1.0)
+    boost = 1.0 + alpha * torch.log2(1.0 + fan / median)
+    weights = benchmark.net_weights.clone()
+    if weights.numel() == 0:
+        weights = torch.ones_like(boost)
+    return weights * boost
+
+
+def _write_modified_pt(src_path: str, bench_name: str,
+                       halo_pct: float = 0.0,
+                       timing_alpha: float = 0.0) -> str:
+    """Read benchmark .pt, optionally apply halo + timing weights, save."""
+    import tempfile
+    bench = Benchmark.load(src_path)
+
+    tag_parts = []
+    if halo_pct > 0:
+        n_hard = bench.num_hard_macros
+        sizes = bench.macro_sizes.clone()
+        sizes[:n_hard] = sizes[:n_hard] * (1.0 + halo_pct)
+        bench.macro_sizes = sizes
+        tag_parts.append(f"h{int(halo_pct*1000)}")
+    if timing_alpha > 0:
+        bench.net_weights = _compute_timing_weights(bench, timing_alpha)
+        tag_parts.append(f"t{int(timing_alpha*1000)}")
+    tag = "_".join(tag_parts) or "mod"
+
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f"{tag}_{bench_name}_", suffix=".pt", dir="/tmp")
+    os.close(fd)
+    bench.save(tmp_path)
+    return tmp_path
+
+
 class OptimalPlacer:
     """v7 = v6 + Laplacian soft-resolve + (optional) basin-hopping."""
 
@@ -134,6 +200,32 @@ class OptimalPlacer:
         bench_path = _benchmark_pt_path(benchmark.name)
         log_prefix = "  "
         t0 = time.time()
+
+        # Tier 2 prep: rewrite the .pt benchmark with optional hard-macro
+        # halo (size inflation) and/or timing-aware net weighting (fanout
+        # boost), point bench_path at it for the duration. Workers load
+        # by path, so this propagates everywhere. In-memory `benchmark`
+        # left untouched so validate_placement / overlap counting use
+        # actual sizes. Both default off (PLACER_V7_HALO_PCT=0,
+        # PLACER_V7_TIMING_ALPHA=0). Halo hurts proxy slightly, buys
+        # routing channels. Timing weights hurt proxy slightly, buy WNS.
+        halo_pct = float(os.environ.get("PLACER_V7_HALO_PCT", "0"))
+        timing_alpha = float(os.environ.get("PLACER_V7_TIMING_ALPHA", "0"))
+        if halo_pct > 0 or timing_alpha > 0:
+            try:
+                bench_path = _write_modified_pt(
+                    bench_path, benchmark.name,
+                    halo_pct=halo_pct, timing_alpha=timing_alpha)
+                tags = []
+                if halo_pct > 0:
+                    tags.append(f"halo +{halo_pct*100:.1f}%")
+                if timing_alpha > 0:
+                    tags.append(f"timing α={timing_alpha:.2f}")
+                print(f"  [v7] modified PT: {', '.join(tags)} -> {bench_path}",
+                      flush=True)
+            except Exception as e:
+                print(f"  [v7] WARNING: PT modification skipped: {e}",
+                      flush=True)
 
         # Reserve time at the tail for Laplacian + basin-hopping. The
         # portfolio's per-worker budget is shrunk by this amount so that
@@ -602,6 +694,16 @@ class OptimalPlacer:
             except Exception as e:
                 print(f"  [v7] WARNING: failed to save placement: {e}",
                       flush=True)
+
+        # Tier 2 prep: optionally write Klein-4 orientations.pt sidecar.
+        # Pure no-op for Tier 1 — proxy evaluator never reads pin offsets
+        # post-load, so orientation choices don't affect proxy_cost.
+        try:
+            from _orientation_flip import maybe_run_orientation_flip
+            maybe_run_orientation_flip(portfolio_pos, benchmark)
+        except Exception as e:
+            print(f"  [v7] WARNING: orientation flip skipped: {e}",
+                  flush=True)
         return portfolio_pos
 
     def _basin_hop_loop(self, current_pos, current_cost, bench_path,
