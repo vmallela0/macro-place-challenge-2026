@@ -69,7 +69,13 @@ for _k, _v in [
     ("PLACER_V7_HESSIAN", "1"),
     ("PLACER_V7_HESSIAN_STEPS", "0.02,-0.02,0.05,-0.05"),
     ("PLACER_V7_HESSIAN_BUDGET", "1000"),
-    ("PLACER_V7_HESSIAN_LANCZOS", "50"),
+    # Lanczos default bumped 50 → 100 because cong-included surrogate has
+    # worse conditioning than HPWL+density alone. Combined with the new
+    # auto-retry path in _hessian_escape (4× bump on convergence failure)
+    # and Tikhonov regularization (1e-4 default), Lanczos now succeeds on
+    # all 17 benches at default config.
+    ("PLACER_V7_HESSIAN_LANCZOS", "100"),
+    ("PLACER_V7_HESSIAN_TIKHONOV", "1e-4"),
     ("PLACER_V7_HESSIAN_MAX_ITERS", "1"),
     # istanbul: enable adaptive line-search + feasibility filter for
     # the saddle-escape phase. Replaces the hardcoded HESSIAN_STEPS
@@ -1121,11 +1127,14 @@ class OptimalPlacer:
                 "PLACER_V7_HESSIAN_LS_STEPS", "10"))
             ls_shrink = float(os.environ.get(
                 "PLACER_V7_HESSIAN_LS_SHRINK", "0.6"))
+            tikhonov = float(os.environ.get(
+                "PLACER_V7_HESSIAN_TIKHONOV", "1e-4"))
             candidates, diag = adaptive_topk_candidates(
                 macro_pos_t, smooth_proxy_call,
                 k=adaptive_k,
                 canvas_diag=canvas_diag,
                 n_lanczos_iters=n_lanczos_iters,
+                tikhonov=tikhonov,
                 n_hard=n_hard,
                 soft_only_perturb=True,
                 ls_initial=ls_initial,

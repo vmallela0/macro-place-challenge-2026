@@ -49,6 +49,8 @@ def hessian_min_eigvec(
     *,
     n_lanczos_iters: int = 50,
     tolerance: float = 1e-4,
+    tikhonov: float = 0.0,     # add ε·I to Hessian for numerical robustness
+    auto_retry: bool = True,    # on convergence failure, retry with 4× maxiter
     verbose: bool = False,
 ) -> tuple[float, np.ndarray]:
     """Compute the smallest eigenvalue + eigenvector of the Hessian of
@@ -56,6 +58,16 @@ def hessian_min_eigvec(
 
     Uses scipy.sparse.linalg.eigsh with a Hessian-vector LinearOperator.
     eigsh's `which='SA'` returns the smallest algebraic (most negative).
+
+    Numerical robustness:
+    - `tikhonov` adds ε·I to the operator. This shifts all eigenvalues
+      by +ε, so λ_min(H+εI) = λ_min(H)+ε. We subtract ε after solving
+      to recover the original λ_min. Tikhonov ε > 0 helps Lanczos when
+      the Hessian is rank-deficient or has tightly-clustered eigvals.
+    - `auto_retry`: on convergence failure (ARPACK error -1), retry
+      with 4× maxiter. Many failures are due to insufficient iters,
+      not actual divergence. Costs an extra 4× HVPs only on the
+      already-failed branch.
 
     Returns (lambda_min, v_min) where v_min is shape (n_total*2,) numpy.
     """
@@ -71,7 +83,8 @@ def hessian_min_eigvec(
     grad_flat = grad.reshape(-1)
     if verbose:
         print(f"    [hessian] loss={loss.item():.6f} "
-              f"||grad||={float(grad_flat.norm()):.4f}", flush=True)
+              f"||grad||={float(grad_flat.norm()):.4f} "
+              f"tikhonov={tikhonov:.2e}", flush=True)
 
     def hv(v_np: np.ndarray) -> np.ndarray:
         v = torch.tensor(v_np, dtype=macro_pos.dtype,
@@ -79,24 +92,44 @@ def hessian_min_eigvec(
         # H @ v = ∂(grad · v)/∂x
         gv = (grad * v).sum()
         Hv = torch.autograd.grad(gv, macro_pos, retain_graph=True)[0]
-        return Hv.detach().cpu().numpy().reshape(-1)
+        out = Hv.detach().cpu().numpy().reshape(-1)
+        if tikhonov > 0:
+            out = out + tikhonov * v_np
+        return out
 
     H_op = LinearOperator(shape=(N, N), matvec=hv, dtype=np.float64)
 
     # eigsh wants which='SA' for smallest algebraic. k=1 most-negative eigval.
-    try:
-        eigvals, eigvecs = eigsh(
-            H_op, k=1, which="SA",
-            maxiter=n_lanczos_iters, tol=tolerance)
-    except Exception as e:
-        if verbose:
-            print(f"    [hessian] eigsh err: {e}", flush=True)
-        return 0.0, np.zeros(N)
+    def _solve(maxiter):
+        return eigsh(H_op, k=1, which="SA",
+                       maxiter=maxiter, tol=tolerance)
 
-    lam_min = float(eigvals[0])
+    try:
+        eigvals, eigvecs = _solve(n_lanczos_iters)
+    except Exception as e:
+        if auto_retry:
+            if verbose:
+                print(f"    [hessian] eigsh err on {n_lanczos_iters} iters: "
+                      f"{e}; retrying with {4*n_lanczos_iters} iters",
+                      flush=True)
+            try:
+                eigvals, eigvecs = _solve(4 * n_lanczos_iters)
+            except Exception as e2:
+                if verbose:
+                    print(f"    [hessian] eigsh err on retry: {e2}",
+                          flush=True)
+                return 0.0, np.zeros(N)
+        else:
+            if verbose:
+                print(f"    [hessian] eigsh err: {e}", flush=True)
+            return 0.0, np.zeros(N)
+
+    lam_min = float(eigvals[0]) - float(tikhonov)
     v_min = eigvecs[:, 0]
     if verbose:
-        print(f"    [hessian] λ_min={lam_min:.6f}, ||v_min||={np.linalg.norm(v_min):.4f}",
+        print(f"    [hessian] λ_min={lam_min:.6f} "
+              f"(raw={float(eigvals[0]):.6f}, tikh={tikhonov:.2e}), "
+              f"||v_min||={np.linalg.norm(v_min):.4f}",
               flush=True)
     return lam_min, v_min
 
@@ -108,6 +141,8 @@ def hessian_min_eigvecs_topk(
     k: int = 3,
     n_lanczos_iters: int = 50,
     tolerance: float = 1e-4,
+    tikhonov: float = 0.0,
+    auto_retry: bool = True,
     verbose: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute the k smallest eigenvalues + eigenvectors of the Hessian.
@@ -116,6 +151,8 @@ def hessian_min_eigvecs_topk(
     eigenvector basis. Top-k smallest eigenvalues identify the
     "negative curvature subspace" (when negative). Each eigenvector
     is an independent escape direction in the high-dim manifold.
+
+    See `hessian_min_eigvec` docstring for tikhonov / auto_retry.
 
     Returns (lambda_array, eigvec_matrix) where eigvec_matrix has
     shape (N, k) with each column a normalized eigenvector.
@@ -134,17 +171,36 @@ def hessian_min_eigvecs_topk(
                          device=macro_pos.device).reshape(n_total, 2)
         gv = (grad * v).sum()
         Hv = torch.autograd.grad(gv, macro_pos, retain_graph=True)[0]
-        return Hv.detach().cpu().numpy().reshape(-1)
+        out = Hv.detach().cpu().numpy().reshape(-1)
+        if tikhonov > 0:
+            out = out + tikhonov * v_np
+        return out
 
     H_op = LinearOperator(shape=(N, N), matvec=hv, dtype=np.float64)
+    def _solve(maxiter):
+        return eigsh(H_op, k=k, which="SA",
+                      maxiter=maxiter, tol=tolerance)
     try:
-        eigvals, eigvecs = eigsh(
-            H_op, k=k, which="SA",
-            maxiter=n_lanczos_iters, tol=tolerance)
+        eigvals, eigvecs = _solve(n_lanczos_iters)
     except Exception as e:
-        if verbose:
-            print(f"    [hessian.topk] eigsh err: {e}", flush=True)
-        return np.zeros(k), np.zeros((N, k))
+        if auto_retry:
+            if verbose:
+                print(f"    [hessian.topk] eigsh err on {n_lanczos_iters} "
+                      f"iters: {e}; retrying with {4*n_lanczos_iters}",
+                      flush=True)
+            try:
+                eigvals, eigvecs = _solve(4 * n_lanczos_iters)
+            except Exception as e2:
+                if verbose:
+                    print(f"    [hessian.topk] eigsh err on retry: {e2}",
+                          flush=True)
+                return np.zeros(k), np.zeros((N, k))
+        else:
+            if verbose:
+                print(f"    [hessian.topk] eigsh err: {e}", flush=True)
+            return np.zeros(k), np.zeros((N, k))
+    if tikhonov > 0:
+        eigvals = eigvals - tikhonov
     return eigvals, eigvecs
 
 
@@ -304,6 +360,7 @@ def adaptive_topk_candidates(
     k: int = 1,                    # was k=2; k=1 converges reliably in n_lanczos_iters=50
     canvas_diag: float = 1.0,
     n_lanczos_iters: int = 50,
+    tikhonov: float = 0.0,
     n_hard: int = 0,
     soft_only_perturb: bool = True,
     ls_initial: float = 0.10,
@@ -328,18 +385,22 @@ def adaptive_topk_candidates(
     import numpy as np
     import torch
 
-    # Fallback: if k>1 ARPACK doesn't converge, retry k=1 (always reliable).
+    # Fallback ladder: try the original config; if eigvec degenerate, retry
+    # with (k=1, tikhonov bumped, more iters). This handles the "cong-included
+    # surrogate makes Lanczos non-convergent" failure mode.
     eigvals, eigvecs = hessian_min_eigvecs_topk(
         smooth_proxy_call, macro_pos,
-        k=k, n_lanczos_iters=n_lanczos_iters, verbose=verbose)
+        k=k, n_lanczos_iters=n_lanczos_iters, tikhonov=tikhonov,
+        verbose=verbose)
     if (eigvecs is None or eigvecs.shape[1] == 0
-            or float(np.linalg.norm(eigvecs)) < 1e-12) and k > 1:
+            or float(np.linalg.norm(eigvecs)) < 1e-12):
         if verbose:
-            print(f"    [hessian.adaptive] k={k} ARPACK unconverged; "
-                  f"falling back to k=1", flush=True)
+            print(f"    [hessian.adaptive] k={k} unconverged; retry k=1 "
+                  f"with tikhonov=1e-3 + 4× iters", flush=True)
         eigvals, eigvecs = hessian_min_eigvecs_topk(
             smooth_proxy_call, macro_pos,
-            k=1, n_lanczos_iters=n_lanczos_iters, verbose=verbose)
+            k=1, n_lanczos_iters=4 * n_lanczos_iters,
+            tikhonov=max(1e-3, tikhonov * 100), verbose=verbose)
 
     n_total = macro_pos.shape[0]
     base = macro_pos.detach().cpu().numpy().copy()
