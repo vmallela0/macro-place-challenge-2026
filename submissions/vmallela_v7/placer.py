@@ -137,6 +137,11 @@ for _k, _v in [
     # Weight on electrostatic energy (compared to HPWL_LSE term).
     # Balances density-spreading force vs HPWL-collapse force.
     ("PLACER_V7_HESSIAN_ELECTRO_WEIGHT", "1.0"),
+    # Use normalized (scale-balanced) electrostatic energy: divides by
+    # var(ρ)·canvas_area so the term is O(1) instead of O(10^5). This
+    # makes the Hessian eigvec a true mixture of HPWL+density modes
+    # rather than electro-dominated.
+    ("PLACER_V7_HESSIAN_ELECTRO_NORM", "0"),
 ]:
     _os.environ.setdefault(_k, _v)
 
@@ -1069,7 +1074,8 @@ class OptimalPlacer:
                                      cvar_smooth)
         from _cell_window import (build_window_indices, smooth_density_grid,
                                     smooth_macro_blockage,
-                                    electrostatic_density_energy)
+                                    electrostatic_density_energy,
+                                    electrostatic_density_energy_normalized)
         from _hessian_worker import hessian_candidate_worker
         import importlib.util as _ilu
 
@@ -1233,11 +1239,21 @@ class OptimalPlacer:
                 n_cells=incr.n_cells, cell_area=incr.grid_area, mu=100.0)
             if electro_enabled:
                 # DREAMPlace-style: Poisson energy of the density
-                # distribution (global structure).
-                density_term = electrostatic_density_energy(
-                    rho, incr.grid_row, incr.grid_col,
-                    grid_w=float(incr.grid_width),
-                    grid_h=float(incr.grid_height))
+                # distribution (global structure). Normalized variant
+                # divides by var(ρ)·canvas_area for scale-balance with
+                # HPWL_LSE (~1.0 typical magnitude).
+                use_normalized = (
+                    os.environ.get("PLACER_V7_HESSIAN_ELECTRO_NORM", "0") == "1")
+                if use_normalized:
+                    density_term = electrostatic_density_energy_normalized(
+                        rho, incr.grid_row, incr.grid_col,
+                        grid_w=float(incr.grid_width),
+                        grid_h=float(incr.grid_height))
+                else:
+                    density_term = electrostatic_density_energy(
+                        rho, incr.grid_row, incr.grid_col,
+                        grid_w=float(incr.grid_width),
+                        grid_h=float(incr.grid_height))
                 if hybrid_density:
                     # Hybrid: keep CVaR (local hotspots) AND add electro.
                     with torch.no_grad():

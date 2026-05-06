@@ -292,6 +292,32 @@ def electrostatic_density_energy(grid_density, grid_row, grid_col,
     return energy
 
 
+def electrostatic_density_energy_normalized(grid_density, grid_row, grid_col,
+                                              grid_w=1.0, grid_h=1.0):
+    """Scale-balanced electrostatic energy.
+
+    Returns the same Poisson energy as `electrostatic_density_energy`
+    but normalized by the energy of a delta-function input. The result
+    is dimensionless and roughly O(1) for typical density distributions,
+    making it directly comparable to HPWL_LSE-norm without scaling
+    issues that can dominate the Hessian.
+
+    Specifically: divide by (mean_density² · canvas_area) where the
+    energy of a uniform offset = 0 by construction (we subtract mean
+    inside the energy function), so we use the variance of density
+    times canvas_area as the natural scale.
+    """
+    rho = grid_density.reshape(grid_row, grid_col)
+    rho_var = ((rho - rho.mean()) ** 2).mean()
+    cell_area = float(grid_w) * float(grid_h)
+    canvas_area = float(grid_row) * float(grid_col) * cell_area
+    energy = electrostatic_density_energy(grid_density, grid_row, grid_col,
+                                             grid_w=grid_w, grid_h=grid_h)
+    # Normalize by characteristic scale: var(ρ) · canvas_area.
+    scale = rho_var * canvas_area + 1e-12
+    return energy / scale
+
+
 def smooth_macro_blockage(
     macro_pos: torch.Tensor,
     macro_w: torch.Tensor,
