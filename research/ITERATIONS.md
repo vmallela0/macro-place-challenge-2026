@@ -261,6 +261,60 @@ Files to inspect in the morning:
 
 Branch `albania1` at fd4ae2a. All commits pushed.
 
+---
+
+## Iter 6 — multi-seed jammed-state validation (FALSIFIED)
+
+ibm12 K=8 multi-seed test (cong-off, my code):
+- proxies: 1.1675, 1.1641, 1.1562, 1.1658, 1.1721, 1.1700, 1.1722, 1.1708
+- mean=1.1673, std=0.0050, min=1.1562, max=1.1722
+- range=0.016, predicted Gaussian range 2σ·√(2 ln 8)=0.020
+
+Observed range is SMALLER than Gaussian prediction — placement
+distribution is **sub-Gaussian (thin tails)**, not heavy-tailed.
+Multi-seed extreme value gain is bounded by σ·√(2 ln K) which is
+small for any K.
+
+Worse: my K=8 min (1.1562) doesn't beat verified single-seed (1.1557).
+The verified ran with v7-combinatorial-submission code (different from
+albania1) which is slightly luckier on ibm12.
+
+Conclusion: **multi-seed sampling is not a breakthrough lever for
+this problem class.** The placement landscape is a single-basin
+sub-Gaussian distribution at the v4-baseline level.
+
+## Iter 7 — saddle-depth-aware AUTO_CONG (running)
+
+Hypothesis: optimal cong_weight depends on Hessian λ_min depth.
+
+| ibm12 | residual +0.269 | λ_min(w=0.5) -0.002 (shallow) | AUTO w=1.5 helps -0.010 |
+| ibm06 | residual +0.262 | λ_min(w=0.5) -0.008 (deep)    | AUTO w=1.5 hurts +0.005 |
+
+Cong-weight sensitivity sweep on ibm06 with w ∈ {0.0, 0.5, 0.75, 1.0,
+1.25, 1.5} reveals λ_min is non-monotonic in w:
+
+```
+w=0.5 → -0.0070
+w=0.75 → -0.0091 (deepest, eigvec at HPWL/cong transition)
+w=1.0 → -0.0067
+w=1.5 → -0.0054
+```
+
+If proxy correlates with |λ_min|, optimal w_ibm06 ≈ 0.75.
+
+Implemented: `AUTO_LAMBDA_SCAN` does a 25-30s pre-Hessian scan over
+candidate weights, picks the one maximizing |λ_min|, then runs the
+real Hessian phase at that w. Default off; env-gated.
+
+## Pipeline state at last check (~7:10 AM PDT)
+
+Cong-weight sweep on ibm06 still running (6 placers parallel; ETA
+~30-60 min more). Once done:
+- If optimal w ≈ 0.75 (matches |λ_min| peak): saddle-depth rule validated
+  → deploy AUTO_LAMBDA_SCAN across all benches via new sweep
+- If optimal w differs from |λ_min| peak: hypothesis falsified;
+  return to AUTO_CONG residual rule
+
 Benches chosen to span the room spectrum:
 - ibm12, ibm06, ibm18 (high room — should show clear improvement)
 - ibm15 (medium room — small improvement expected)
