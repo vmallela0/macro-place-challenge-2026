@@ -108,8 +108,47 @@ for _k, _v in [
     ("PLACER_V7_HESSIAN_HPWL_WEIGHT", "1.0"),
     ("PLACER_V7_HESSIAN_DENS_WEIGHT", "0.5"),
     ("PLACER_V7_HESSIAN_CONG_WEIGHT", "0.5"),
+    # Per-bench auto-tuned cong weight based on netlist demand/supply
+    # residual (research/lower_bounds/cong_difficulty.csv). High-room
+    # benches benefit from aggressive cong weighting; low-room benches
+    # are already at floor and would only see noise. Default off; when
+    # enabled, env CONG_WEIGHT acts as a multiplier on the per-bench
+    # auto-scale.
+    ("PLACER_V7_HESSIAN_AUTO_CONG", "0"),
 ]:
     _os.environ.setdefault(_k, _v)
+
+
+# Per-bench cong residual table (from cong_difficulty.csv at v7 baseline).
+# Used by the AUTO_CONG path: positive residual = "v7 above structural
+# floor" = algorithmic room exists.  Higher residual → boost cong_weight.
+_BENCH_CONG_RESIDUAL = {
+    "ibm01": -0.165, "ibm02": +0.032, "ibm03": +0.062, "ibm04": -0.004,
+    "ibm06": +0.262, "ibm07": +0.080, "ibm08": +0.045, "ibm09": -0.232,
+    "ibm10": -0.072, "ibm11": -0.181, "ibm12": +0.269, "ibm13": -0.062,
+    "ibm14": -0.086, "ibm15": +0.032, "ibm16": -0.007, "ibm17": -0.207,
+    "ibm18": +0.234,
+}
+
+
+def _auto_cong_weight(bench_name, base_weight=0.5):
+    """Per-bench cong weight scaling based on structural residual.
+
+    residual > 0.20 → 3.0× base (high-room: ibm06, ibm12, ibm18)
+    residual > 0.05 → 2.0× base (medium-room: ibm03, ibm07, ibm08)
+    residual > 0.0  → 1.5× base (small-room: ibm02, ibm15)
+    residual ≤ 0.0  → 0.5× base (below floor: 9 benches)
+
+    Sub-1 weight on below-floor benches keeps cong from disturbing the
+    well-converged HPWL+density saddle structure (where v7 is already
+    beating the structural floor).
+    """
+    r = _BENCH_CONG_RESIDUAL.get(bench_name, 0.0)
+    if r > 0.20: scale = 3.0
+    elif r > 0.05: scale = 2.0
+    elif r > 0.0: scale = 1.5
+    else: scale = 0.5
+    return base_weight * scale
 
 import os
 import sys
@@ -1057,8 +1096,17 @@ class OptimalPlacer:
             k_cong_frac = float(
                 os.environ.get("PLACER_V7_K_CONG_FRAC", "0.05"))
             K_c = max(1, int(2 * incr.n_cells * k_cong_frac))
-            cong_weight = float(
+            base_cw = float(
                 os.environ.get("PLACER_V7_HESSIAN_CONG_WEIGHT", "0.5"))
+            if os.environ.get("PLACER_V7_HESSIAN_AUTO_CONG", "0") == "1":
+                cong_weight = _auto_cong_weight(bench.name, base_cw)
+                resid = _BENCH_CONG_RESIDUAL.get(bench.name, 0.0)
+                print(f"  [v7] hessian: AUTO_CONG bench={bench.name} "
+                      f"residual={resid:+.3f} → cong_weight={cong_weight:.2f} "
+                      f"(base {base_cw} × {cong_weight/max(base_cw,1e-9):.1f}×)",
+                      flush=True)
+            else:
+                cong_weight = base_cw
             print(f"  [v7] hessian: congestion ENABLED "
                   f"(K_c={K_c}/{2*incr.n_cells}, weight={cong_weight}, "
                   f"v_alloc={v_alloc:.4f}, h_alloc={h_alloc:.4f})",
