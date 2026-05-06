@@ -138,6 +138,15 @@ class Benchmark:
             data["port_positions"] = torch.zeros(0, 2)
         if "macro_pin_offsets" not in data:
             data["macro_pin_offsets"] = []
+        # Forward compat: some local .pt files (e.g. modified ibm15.pt
+        # that has been re-encoded with extra fields like net_pin_nodes)
+        # carry keys the dataclass doesn't know about. Drop them rather
+        # than failing to load.
+        valid_keys = set(cls.__dataclass_fields__.keys())
+        extra_keys = [k for k in data if k not in valid_keys]
+        if extra_keys:
+            for k in extra_keys:
+                data.pop(k)
         return cls(**data)
 
     def get_movable_mask(self) -> torch.Tensor:
