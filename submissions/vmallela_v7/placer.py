@@ -81,6 +81,12 @@ for _k, _v in [
     ("PLACER_V7_HESSIAN_LS_STEPS", "10"),
     ("PLACER_V7_HESSIAN_LS_SHRINK", "0.6"),
     ("PLACER_V7_HESSIAN_MAX_OVERLAPS", "200"),
+    # albania1: Tier 2 / Tier 1 levers. Default-on for orientation
+    # sidecar (Tier 2 only, no Tier 1 effect), default-off for halo
+    # (touches density surrogate; needs A/B before flipping on).
+    ("PLACER_V7_ORIENTATION_FLIP", "1"),
+    ("PLACER_V7_ORIENTATION_PASSES", "2"),
+    ("PLACER_V7_HALO_FRAC", "0.0"),
 ]:
     _os.environ.setdefault(_k, _v)
 
@@ -638,7 +644,86 @@ class OptimalPlacer:
             except Exception as e:
                 print(f"  [v7] WARNING: failed to save placement: {e}",
                       flush=True)
+
+        # albania1: Klein-4 orientation flip → orientations.pt sidecar.
+        # Tier 1 proxy (TILOS) ignores orientations and uses default 'N',
+        # so this cannot regress proxy. Tier 2 (OpenROAD WNS/TNS/Area)
+        # picks the sidecar up via the TCL generator if present.
+        if (os.environ.get("PLACER_V7_ORIENTATION_FLIP", "0") == "1"
+                and overlaps == 0):
+            try:
+                self._write_orientation_sidecar(
+                    bench_path, portfolio_pos, save_template, benchmark)
+            except Exception as e:
+                print(f"  [v7] WARNING: orientation flip failed: {e}",
+                      flush=True)
         return portfolio_pos
+
+    def _write_orientation_sidecar(self, bench_path, portfolio_pos,
+                                    save_template, benchmark):
+        """Run Klein-4 orientation greedy and persist orientations.pt
+        sidecar. Path: same as placement save_template with
+        ``.orientations.pt`` suffix; falls back to a per-bench path
+        under ``orientations/`` next to the benchmarks dir if no
+        save_template is set.
+        """
+        from _orientation_flip import klein4_orient, save_orientation_sidecar
+        import importlib.util as _ilu
+        bench = Benchmark.load(bench_path)
+        n_hard = bench.num_hard_macros
+        if n_hard == 0:
+            print("  [v7] orientation: no hard macros, skipping",
+                  flush=True)
+            return
+        v1_spec = _ilu.spec_from_file_location(
+            "_v1_v7_orient",
+            str(_HERE.parent / "vmallela" / "placer.py"))
+        v1 = _ilu.module_from_spec(v1_spec)
+        v1_spec.loader.exec_module(v1)
+        plc = v1._load_plc(bench.name)
+        incr = v1.IncrementalEvaluator(plc, bench)
+        # Sync incr to final positions
+        full_np = portfolio_pos.detach().cpu().numpy()
+        incr.macro_pos[:] = full_np
+        incr._recompute_pin_positions()
+        n_passes = int(os.environ.get("PLACER_V7_ORIENTATION_PASSES", "2"))
+        # Build pin_to_net (incr stores net_starts; need flat per-pin id)
+        pin_to_net = np.zeros(int(incr.pin_macro.shape[0]), dtype=np.int64)
+        net_starts = np.asarray(incr.net_starts)
+        for nid in range(net_starts.shape[0] - 1):
+            pin_to_net[net_starts[nid]:net_starts[nid + 1]] = nid
+        n_nets = int(net_starts.shape[0] - 1)
+        orientations, info = klein4_orient(
+            macro_pos=np.asarray(incr.macro_pos),
+            macro_w=np.asarray(incr.macro_w),
+            macro_h=np.asarray(incr.macro_h),
+            pin_macro=np.asarray(incr.pin_macro),
+            pin_xoff=np.asarray(incr.pin_xoff),
+            pin_yoff=np.asarray(incr.pin_yoff),
+            pin_to_net=pin_to_net,
+            net_weight=np.asarray(incr.net_weight),
+            n_hard=n_hard,
+            n_nets=n_nets,
+            n_passes=n_passes,
+            verbose=True,
+        )
+        if save_template:
+            try:
+                save_path = save_template.format(name=benchmark.name)
+            except Exception:
+                save_path = save_template
+            sidecar_path = save_path + ".orientations.pt"
+        else:
+            sidecar_dir = _HERE.parents[1] / "orientations"
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            sidecar_path = str(sidecar_dir / f"{benchmark.name}.orientations.pt")
+        save_orientation_sidecar(orientations, sidecar_path)
+        print(f"  [v7] orientations: HPWL "
+              f"{info['initial_hpwl']:.1f} → {info['final_hpwl']:.1f} "
+              f"(Δ {info['delta_hpwl']:+.1f}); "
+              f"flipped {info['n_flipped']}/{info['n_hard']} "
+              f"({info['counts']}); saved to {sidecar_path}",
+              flush=True)
 
     def _basin_hop_loop(self, current_pos, current_cost, bench_path,
                         n_hops, hop_budget):
@@ -888,16 +973,35 @@ class OptimalPlacer:
             np.asarray(incr.macro_w), dtype=torch.float32, device=device)
         macro_h_t = torch.tensor(
             np.asarray(incr.macro_h), dtype=torch.float32, device=device)
+        # albania1: halo for surrogate-only density. Inflate macro
+        # extents by halo_frac when computing density/cong; HPWL still
+        # uses real pin offsets (and thus real macro footprints). Net
+        # effect: surrogate prefers placements that leave routing
+        # channels around macros, while exact-cost HPWL stays clean.
+        # Strict-improvement gate against exact proxy preserves Tier 1.
+        halo_frac = float(os.environ.get("PLACER_V7_HALO_FRAC", "0.0"))
+        if halo_frac > 0.0:
+            macro_w_haloed = macro_w_t * (1.0 + halo_frac)
+            macro_h_haloed = macro_h_t * (1.0 + halo_frac)
+            print(f"  [v7] halo: surrogate density inflated by "
+                  f"{halo_frac*100:.1f}% (HPWL unchanged)", flush=True)
+        else:
+            macro_w_haloed = macro_w_t
+            macro_h_haloed = macro_h_t
         pin_to_net_t = build_pin_to_net(net_starts_t)
         n_nets = int(net_weight_t.shape[0])
         cell_idx_d, _ = build_window_indices(
-            macro_pos_t.detach(), macro_w_t, macro_h_t,
+            macro_pos_t.detach(), macro_w_haloed, macro_h_haloed,
             grid_col=incr.grid_col, grid_row=incr.grid_row,
             grid_w=incr.grid_width, grid_h=incr.grid_height,
             margin_cells=4)
         cw_f, ch_f = float(incr.cw), float(incr.ch)
         net_cnt = float(incr.net_cnt)
-        K_d = max(1, int(0.10 * incr.n_cells))
+        # albania1: PLACER_V7_K_DENS_FRAC also tightens density CVaR
+        # in the Hessian surrogate (was hardcoded 0.10). Tighter k
+        # concentrates the saddle direction on worst-case pinch points.
+        k_dens_frac = float(os.environ.get("PLACER_V7_K_DENS_FRAC", "0.10"))
+        K_d = max(1, int(k_dens_frac * incr.n_cells))
 
         def smooth_proxy_call(macro_pos_var):
             is_port = (pin_macro_t < 0)
@@ -909,7 +1013,7 @@ class OptimalPlacer:
                 pin_x, pin_y, pin_to_net_t, net_weight_t, n_nets,
                 cw=cw_f, ch=ch_f, net_cnt=net_cnt, tau_lse=50.0)
             rho = smooth_density_grid(
-                macro_pos_var, macro_w_t, macro_h_t, cell_idx_d,
+                macro_pos_var, macro_w_haloed, macro_h_haloed, cell_idx_d,
                 incr.grid_col, incr.grid_row,
                 incr.grid_width, incr.grid_height,
                 n_cells=incr.n_cells, cell_area=incr.grid_area, mu=100.0)
