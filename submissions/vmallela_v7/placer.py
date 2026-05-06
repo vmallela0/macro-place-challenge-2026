@@ -313,11 +313,14 @@ class OptimalPlacer:
                     np.asarray(incr_b.macro_h),
                     verbose=True)
                 # Save modified benchmark with bisect-init macro_positions.
+                # MUST live inside the repo's benchmarks/processed/public/
+                # because _portfolio.py computes ROOT = parents[3] of
+                # bench_path. /tmp/... would give ROOT='/' breaking
+                # relative imports of vmallela_v2.
                 bench_for_bisect.macro_positions = torch.tensor(
                     bisect_pos.astype(np.float32))
-                tmp_dir = Path("/tmp/albania1_bisect_init")
-                tmp_dir.mkdir(parents=True, exist_ok=True)
-                tmp_path = tmp_dir / f"{bench_for_bisect.name}_bisect.pt"
+                bench_dir = _HERE.parents[1] / "benchmarks" / "processed" / "public"
+                tmp_path = bench_dir / f"{bench_for_bisect.name}_bisect.pt"
                 bench_for_bisect.save(str(tmp_path))
                 print(f"  [v7] RECURSIVE_BISECT: saved warm-start to "
                       f"{tmp_path}; v4 will use it as init", flush=True)
