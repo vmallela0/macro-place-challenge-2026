@@ -62,16 +62,21 @@ GE_001=$(awk -v d="$DELTA" 'BEGIN { print (d >= 0.01) ? 1 : 0 }')
 GE_0005=$(awk -v d="$DELTA" 'BEGIN { print (d >= 0.005) ? 1 : 0 }')
 
 if [ "$GE_001" = "1" ]; then
-  echo "[$(date)] stage3: cong-on WINS (Δ=$DELTA ≥ 0.01) → full 17-bench cong sweep" \
+  echo "[$(date)] stage3: cong-on WINS (Δ=$DELTA ≥ 0.01) → high-room A/B (ibm12/06/18)" \
     >> /tmp/albania1_chain.log
-  exec ./scripts/v7_singlev4_full_sweep.sh
+  # Use high-room A/B with cong_weight=1.0 — faster and more informative
+  # than the full 17-bench sweep at this stage. Full sweep can run later.
+  exec ./scripts/albania1_high_room_ab.sh
 elif [ "$GE_0005" = "1" ]; then
-  echo "[$(date)] stage3: cong-on neutral (Δ=$DELTA in [0.005,0.01)) → trying cong_weight=1.0" \
+  echo "[$(date)] stage3: cong-on neutral (Δ=$DELTA in [0.005,0.01)) → trying cong_weight=1.0 on ibm15/17/08" \
     >> /tmp/albania1_chain.log
   export PLACER_V7_HESSIAN_CONG_WEIGHT=1.0
   exec ./scripts/albania1_cong_validation.sh
 else
-  echo "[$(date)] stage3: cong-on inconclusive or regresses (Δ=$DELTA < 0.005) → halting" \
+  echo "[$(date)] stage3: cong-on inconclusive or regresses (Δ=$DELTA < 0.005) → switching to high-room A/B as fallback" \
     >> /tmp/albania1_chain.log
-  exit 0
+  # Even if validation didn't show clear wins on low-room benches,
+  # the high-room benches (ibm12/06/18) are where cong-on is predicted
+  # to help most. Test there as a final shot.
+  exec ./scripts/albania1_high_room_ab.sh
 fi
