@@ -219,6 +219,79 @@ def smooth_density_grid(
     return grid_density
 
 
+def electrostatic_density_energy(grid_density, grid_row, grid_col,
+                                    grid_w=1.0, grid_h=1.0):
+    """DREAMPlace/ePlace-style electrostatic potential energy of the
+    density distribution.
+
+    Treats the density ρ(x) on the canvas grid as a charge distribution.
+    Solves the 2D Poisson equation ∇²φ = ρ - ρ̄ with periodic boundary
+    conditions via 2D FFT, then returns the integrated |φ|² as a
+    scalar energy.
+
+    Mathematical justification: at uniform density, ρ - ρ̄ ≡ 0, so
+    φ ≡ 0 and energy = 0. Any density variation creates a non-zero
+    potential field; the energy measures how "non-uniform" the
+    placement is. Minimizing energy = pushing density toward uniform =
+    the same global density structure DREAMPlace and ePlace exploit.
+
+    Differentiable via torch.fft.fft2 + torch.fft.ifft2 — the entire
+    Poisson solve flows gradients through to macro_pos via the upstream
+    smooth_density_grid call.
+
+    Why this matters: CVaR top-K density is *locally* myopic (sees
+    only K worst cells). Electrostatic potential is *globally aware*
+    (every cell contributes via the Green's function). The Hessian
+    eigenvector under this surrogate captures DREAMPlace-class
+    long-range curvature directions.
+
+    Args:
+        grid_density: (n_cells,) flat tensor with gradient w.r.t. macro_pos
+        grid_row, grid_col: grid dimensions
+        grid_w, grid_h: cell physical width and height (for the units of
+            the Laplacian)
+
+    Returns: scalar tensor (energy)
+    """
+    rho = grid_density.reshape(grid_row, grid_col)
+    rho_balanced = rho - rho.mean()
+
+    # 2D FFT (orthonormal scaling so that energy is preserved by Parseval)
+    F_rho = torch.fft.fft2(rho_balanced, norm="ortho")
+
+    # Wave-number grid. fftfreq returns cycles/sample; we scale by
+    # 2π/(N·d) to get physical wave number k. Then k² = k_x² + k_y².
+    # The Laplacian operator in Fourier space is -k², so Poisson is
+    # F(φ) = -F(ρ) / k².
+    import math
+    kx = torch.fft.fftfreq(grid_col,
+                              d=float(grid_w),
+                              device=rho.device,
+                              dtype=rho.dtype) * (2 * math.pi)
+    ky = torch.fft.fftfreq(grid_row,
+                              d=float(grid_h),
+                              device=rho.device,
+                              dtype=rho.dtype) * (2 * math.pi)
+    kx2 = (kx * kx).reshape(1, -1)
+    ky2 = (ky * ky).reshape(-1, 1)
+    k_sq = kx2 + ky2
+
+    # Solve in frequency domain. DC term (k=0) handled by setting it to
+    # zero explicitly — ρ_balanced has zero mean, so F_rho[0,0] is
+    # already ≈ 0 (up to floating point).
+    inv_k_sq = torch.where(k_sq > 0,
+                             1.0 / (k_sq + 1e-12),
+                             torch.zeros_like(k_sq))
+    F_phi = F_rho * inv_k_sq   # solving -∇²φ = ρ; sign absorbed into energy
+
+    phi = torch.fft.ifft2(F_phi, norm="ortho").real
+
+    # Energy = integrated potential squared, scaled by cell area.
+    cell_area = float(grid_w) * float(grid_h)
+    energy = (phi * phi).sum() * cell_area
+    return energy
+
+
 def smooth_macro_blockage(
     macro_pos: torch.Tensor,
     macro_w: torch.Tensor,

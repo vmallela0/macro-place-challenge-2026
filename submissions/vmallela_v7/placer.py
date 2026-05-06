@@ -125,6 +125,18 @@ for _k, _v in [
     ("PLACER_V7_HESSIAN_AUTO_LAMBDA_SCAN", "0"),
     ("PLACER_V7_HESSIAN_LAMBDA_SCAN_WEIGHTS",
      "0.25,0.5,0.75,1.0,1.5,2.0"),
+    # Electrostatic-field density (DREAMPlace/ePlace-style). Replaces
+    # CVaR top-K density in the Hessian smooth surrogate with a
+    # Poisson-energy formulation: ∇²φ = ρ - ρ̄, energy = ∫|φ|². The
+    # Hessian eigvec under this surrogate captures GLOBAL density
+    # structure (long-range repulsion) instead of CVaR's local myopia.
+    # Strict-improvement gate against EXACT proxy (which still uses
+    # top-K density) preserves Tier 1 safety. The combo gives DREAMPlace-
+    # class density curvature direction inside our combinatorial pipeline.
+    ("PLACER_V7_HESSIAN_ELECTROSTATIC", "0"),
+    # Weight on electrostatic energy (compared to HPWL_LSE term).
+    # Balances density-spreading force vs HPWL-collapse force.
+    ("PLACER_V7_HESSIAN_ELECTRO_WEIGHT", "1.0"),
 ]:
     _os.environ.setdefault(_k, _v)
 
@@ -1000,7 +1012,8 @@ class OptimalPlacer:
         from _smooth_proxy import (lse_hpwl_vectorized, build_pin_to_net,
                                      cvar_smooth)
         from _cell_window import (build_window_indices, smooth_density_grid,
-                                    smooth_macro_blockage)
+                                    smooth_macro_blockage,
+                                    electrostatic_density_energy)
         from _hessian_worker import hessian_candidate_worker
         import importlib.util as _ilu
 
@@ -1130,6 +1143,14 @@ class OptimalPlacer:
             print("  [v7] hessian: congestion DISABLED "
                   "(PLACER_V7_HESSIAN_CONG=0)", flush=True)
 
+        electro_enabled = (
+            os.environ.get("PLACER_V7_HESSIAN_ELECTROSTATIC", "0") == "1")
+        electro_weight = float(
+            os.environ.get("PLACER_V7_HESSIAN_ELECTRO_WEIGHT", "1.0"))
+        if electro_enabled:
+            print(f"  [v7] hessian: ELECTROSTATIC density (DREAMPlace-style) "
+                  f"ENABLED (weight={electro_weight})", flush=True)
+
         def smooth_proxy_call(macro_pos_var):
             is_port = (pin_macro_t < 0)
             safe = torch.where(is_port, torch.zeros_like(pin_macro_t), pin_macro_t)
@@ -1144,11 +1165,21 @@ class OptimalPlacer:
                 incr.grid_col, incr.grid_row,
                 incr.grid_width, incr.grid_height,
                 n_cells=incr.n_cells, cell_area=incr.grid_area, mu=100.0)
-            with torch.no_grad():
-                t_d = torch.quantile(rho, 1.0 - K_d / incr.n_cells)
-            density_smooth = cvar_smooth(rho.unsqueeze(0), K_d, t_d.detach(),
-                                           mu=100.0).squeeze()
-            loss = hpwl_weight * hpwl + dens_weight * density_smooth
+            if electro_enabled:
+                # DREAMPlace-style: replace CVaR top-K density with the
+                # full Poisson energy of the density distribution.
+                density_term = electrostatic_density_energy(
+                    rho, incr.grid_row, incr.grid_col,
+                    grid_w=float(incr.grid_width),
+                    grid_h=float(incr.grid_height))
+                loss = hpwl_weight * hpwl + electro_weight * density_term
+            else:
+                with torch.no_grad():
+                    t_d = torch.quantile(rho, 1.0 - K_d / incr.n_cells)
+                density_smooth = cvar_smooth(
+                    rho.unsqueeze(0), K_d, t_d.detach(),
+                    mu=100.0).squeeze()
+                loss = hpwl_weight * hpwl + dens_weight * density_smooth
             if cong_enabled:
                 V_macro, H_macro = smooth_macro_blockage(
                     macro_pos_var, macro_w_haloed, macro_h_haloed,
