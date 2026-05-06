@@ -142,6 +142,12 @@ for _k, _v in [
     # makes the Hessian eigvec a true mixture of HPWL+density modes
     # rather than electro-dominated.
     ("PLACER_V7_HESSIAN_ELECTRO_NORM", "0"),
+    # Fiedler recursive-bisect warm-start. Computes a globally-structured
+    # initial placement from the netlist Laplacian (Hall 1970 spectral
+    # partitioning). Replaces .plc init for v4. Reduces v4-baseline
+    # variance by giving v4 a deterministic, netlist-topology-aware
+    # starting point. ~0.3s overhead per bench.
+    ("PLACER_V7_RECURSIVE_BISECT", "0"),
 ]:
     _os.environ.setdefault(_k, _v)
 
@@ -276,6 +282,49 @@ class OptimalPlacer:
         if basin_reserve > 0:
             print(f"  [v7] reserving {basin_reserve}s for laplacian+basin-hop "
                   f"(portfolio budget: {per_worker_budget}s)", flush=True)
+
+        # albania1: optional Fiedler recursive-bisect warm-start.
+        # Replaces .plc init with a globally-structured placement based
+        # on netlist topology (Hall 1970 spectral partitioning).
+        # Reduces v4-baseline variance — same netlist structure produces
+        # the same init every run, so v4's refinement is more
+        # deterministic. Not yet uniformly tested; default off.
+        if os.environ.get("PLACER_V7_RECURSIVE_BISECT", "0") == "1":
+            try:
+                from _recursive_bisect import compute_recursive_bisect_init
+                import importlib.util as _ilu
+                v1_spec_b = _ilu.spec_from_file_location(
+                    "_v1_bisect",
+                    str(_HERE.parent / "vmallela" / "placer.py"))
+                v1_b = _ilu.module_from_spec(v1_spec_b)
+                v1_spec_b.loader.exec_module(v1_b)
+                bench_for_bisect = Benchmark.load(bench_path)
+                plc_b = v1_b._load_plc(bench_for_bisect.name)
+                incr_b = v1_b.IncrementalEvaluator(plc_b, bench_for_bisect)
+                n_macros_b = int(np.asarray(incr_b.macro_pos).shape[0])
+                bisect_pos = compute_recursive_bisect_init(
+                    np.asarray(incr_b.pin_macro),
+                    np.asarray(incr_b.net_starts),
+                    np.asarray(incr_b.net_weight),
+                    n_macros_b, bench_for_bisect.num_hard_macros,
+                    float(bench_for_bisect.canvas_width),
+                    float(bench_for_bisect.canvas_height),
+                    np.asarray(incr_b.macro_w),
+                    np.asarray(incr_b.macro_h),
+                    verbose=True)
+                # Save modified benchmark with bisect-init macro_positions.
+                bench_for_bisect.macro_positions = torch.tensor(
+                    bisect_pos.astype(np.float32))
+                tmp_dir = Path("/tmp/albania1_bisect_init")
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                tmp_path = tmp_dir / f"{bench_for_bisect.name}_bisect.pt"
+                bench_for_bisect.save(str(tmp_path))
+                print(f"  [v7] RECURSIVE_BISECT: saved warm-start to "
+                      f"{tmp_path}; v4 will use it as init", flush=True)
+                bench_path = str(tmp_path)
+            except Exception as e:
+                print(f"  [v7] RECURSIVE_BISECT failed: {e} — "
+                      f"falling back to .plc init", flush=True)
 
         # albania1: optional fast-path — skip v4+Lap by loading a saved
         # post-Lap placement. Used for clean A/B testing of Hessian
