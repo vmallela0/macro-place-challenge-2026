@@ -103,13 +103,51 @@ t3e=$(($(date +%s) - t3))
 electro_proxy=$(grep -E "^proxy=" "$log_electro" | tail -1 | sed -E 's/.*proxy=([0-9.]+).*/\1/' | head -c 12)
 echo "  step 3 (electro) proxy=$electro_proxy wall=${t3e}s" | tee -a "$OUT/sweep.log"
 
+# === Step 4: Hessian-only with NORMALIZED electrostatic (load post-Lap) ===
+echo "" >> "$OUT/sweep.log"
+echo "=== Step 4: Normalized Electrostatic Hessian (load post-Lap) ===" \
+  | tee -a "$OUT/sweep.log"
+t4=$(date +%s)
+log_electron="$OUT/electron_hess.log"
+PLACER_V7_LOAD_POST_LAP="$POST_LAP_FILE" \
+PLACER_V7_HESSIAN_ELECTROSTATIC=1 \
+PLACER_V7_HESSIAN_ELECTRO_NORM=1 \
+PLACER_V7_HESSIAN_ELECTRO_WEIGHT=0.5 \
+.venv/bin/python -u -m macro_place.evaluate \
+  submissions/vmallela_v7/placer.py --benchmark "$BENCH" \
+  > "$log_electron" 2>&1
+t4e=$(($(date +%s) - t4))
+electron_proxy=$(grep -E "^proxy=" "$log_electron" | tail -1 | sed -E 's/.*proxy=([0-9.]+).*/\1/' | head -c 12)
+echo "  step 4 (electron-norm) proxy=$electron_proxy wall=${t4e}s" \
+  | tee -a "$OUT/sweep.log"
+
+# === Step 5: HYBRID (CVaR + electro) ===
+echo "" >> "$OUT/sweep.log"
+echo "=== Step 5: Hybrid CVaR+Electro Hessian (load post-Lap) ===" \
+  | tee -a "$OUT/sweep.log"
+t5=$(date +%s)
+log_hybrid="$OUT/hybrid_hess.log"
+PLACER_V7_LOAD_POST_LAP="$POST_LAP_FILE" \
+PLACER_V7_HESSIAN_ELECTROSTATIC=1 \
+PLACER_V7_HESSIAN_HYBRID_DENSITY=1 \
+PLACER_V7_HESSIAN_ELECTRO_NORM=1 \
+PLACER_V7_HESSIAN_ELECTRO_WEIGHT=0.5 \
+.venv/bin/python -u -m macro_place.evaluate \
+  submissions/vmallela_v7/placer.py --benchmark "$BENCH" \
+  > "$log_hybrid" 2>&1
+t5e=$(($(date +%s) - t5))
+hybrid_proxy=$(grep -E "^proxy=" "$log_hybrid" | tail -1 | sed -E 's/.*proxy=([0-9.]+).*/\1/' | head -c 12)
+echo "  step 5 (hybrid) proxy=$hybrid_proxy wall=${t5e}s" | tee -a "$OUT/sweep.log"
+
 # === Summary ===
 echo "" >> "$OUT/sweep.log"
 echo "=== Clean A/B summary ===" | tee -a "$OUT/sweep.log"
 echo "  bench: $BENCH" | tee -a "$OUT/sweep.log"
 echo "  post-Lap baseline cost: $post_lap_cost" | tee -a "$OUT/sweep.log"
-echo "  CVaR Hessian:    proxy=$cvar_proxy" | tee -a "$OUT/sweep.log"
-echo "  Electro Hessian: proxy=$electro_proxy" | tee -a "$OUT/sweep.log"
+echo "  CVaR Hessian:        proxy=$cvar_proxy" | tee -a "$OUT/sweep.log"
+echo "  Electro raw:         proxy=$electro_proxy" | tee -a "$OUT/sweep.log"
+echo "  Electro normalized:  proxy=$electron_proxy" | tee -a "$OUT/sweep.log"
+echo "  Hybrid (CVaR+EN):    proxy=$hybrid_proxy" | tee -a "$OUT/sweep.log"
 if [ -n "$cvar_proxy" ] && [ -n "$electro_proxy" ]; then
   delta=$(awk -v c="$cvar_proxy" -v e="$electro_proxy" 'BEGIN { printf "%+.4f", e-c }')
   echo "  electro - CVaR = $delta" | tee -a "$OUT/sweep.log"
