@@ -115,6 +115,16 @@ for _k, _v in [
     # enabled, env CONG_WEIGHT acts as a multiplier on the per-bench
     # auto-scale.
     ("PLACER_V7_HESSIAN_AUTO_CONG", "0"),
+    # AUTO_LAMBDA_SCAN: pre-Hessian sweep over cong_weight candidates
+    # to find the value maximizing |λ_min| (deepest saddle = most
+    # effective escape). Physics: at the "eigenvector transition" point
+    # where the dominant eigvec rotates from HPWL-dominated to cong-
+    # dominated, the negative curvature is reinforced from both modes.
+    # Cost ~25s overhead vs 1000s Hessian budget. Validates against
+    # the cong-weight sensitivity test on ibm06 (peak |λ_min| at w=0.75).
+    ("PLACER_V7_HESSIAN_AUTO_LAMBDA_SCAN", "0"),
+    ("PLACER_V7_HESSIAN_LAMBDA_SCAN_WEIGHTS",
+     "0.25,0.5,0.75,1.0,1.5,2.0"),
 ]:
     _os.environ.setdefault(_k, _v)
 
@@ -1160,6 +1170,46 @@ class OptimalPlacer:
                     mu=100.0).squeeze()
                 loss = loss + cong_weight * cong_smooth
             return loss
+
+        # albania1: AUTO_LAMBDA_SCAN — pre-Hessian sweep over cong_weight
+        # candidates to find the value that MAXIMIZES |λ_min| (deepest
+        # saddle). Physics: deeper |λ_min| = stronger curvature in
+        # eigvec direction = larger optimal step → more effective
+        # saddle escape. From the cong-weight sensitivity test on ibm06,
+        # |λ_min| varies non-monotonically with cong_weight (peak around
+        # the "transition point" where eigvec rotates from HPWL-dominated
+        # to cong-dominated). Cost: ~5 quick Lanczos calls × 5s = 25s
+        # overhead, well under the Hessian budget.
+        if (os.environ.get("PLACER_V7_HESSIAN_AUTO_LAMBDA_SCAN", "0") == "1"
+                and cong_enabled):
+            from _hessian_escape import hessian_min_eigvec
+            scan_str = os.environ.get(
+                "PLACER_V7_HESSIAN_LAMBDA_SCAN_WEIGHTS",
+                "0.25,0.5,0.75,1.0,1.5,2.0")
+            candidate_weights = [float(w) for w in scan_str.split(",")]
+            best_w = cong_weight
+            best_lam = 0.0
+            t_scan = time.time()
+            print(f"  [v7] hessian AUTO_LAMBDA_SCAN: testing weights "
+                  f"{candidate_weights}", flush=True)
+            for w_test in candidate_weights:
+                cong_weight = w_test   # closure reads this on each call
+                try:
+                    lam, _ = hessian_min_eigvec(
+                        smooth_proxy_call, macro_pos_t,
+                        n_lanczos_iters=50, tikhonov=1e-4, verbose=False)
+                except Exception as e:
+                    print(f"  [v7]   w={w_test}: ERROR {e}", flush=True)
+                    continue
+                print(f"  [v7]   w={w_test}: λ_min={lam:+.6e}",
+                      flush=True)
+                if lam < best_lam:   # most negative wins
+                    best_lam = lam
+                    best_w = w_test
+            cong_weight = best_w
+            print(f"  [v7] hessian AUTO_LAMBDA_SCAN: optimal w={best_w} "
+                  f"(λ_min={best_lam:+.6e}, scan {time.time()-t_scan:.1f}s)",
+                  flush=True)
 
         # Compute Hessian eigvec
         t_h = time.time()
