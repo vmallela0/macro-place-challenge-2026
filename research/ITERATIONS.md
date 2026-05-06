@@ -75,7 +75,46 @@ Math tests still pass: saddle (λ=-2), min (λ=+2), top-3 orthogonality, etc.
 
 ---
 
-## Iter 4 — focused cong-on sweep (running, ETA ~4.7h)
+## Iter 4a — Lanczos fix verified (ibm09 smoke)
+
+ibm09 smoke (600s budget) ran to completion with the new Tikhonov +
+auto-retry path. Hessian phase FIRED:
+
+```
+[v7] hessian: λ_min=-0.003261, computed eigvec in 2.1s, running 1 candidates × 120s
+[v7] hessian: no candidate beat post-Lap (0.779433); keeping
+```
+
+Lanczos converged at 100 iters with Tikhonov=1e-4. No ARPACK errors.
+The candidate didn't improve over post-Lap (ibm09 is below structural
+floor — predicted no improvement; matches). **Convergence bug FIXED.**
+
+## Iter 4b — ibm12 cong-on (highest predicted-room bench)
+
+```
+[v7] hessian: λ_min=-0.002073, ran 1 candidate × 1000s parallel
+[v7] HESSIAN WIN: cost=1.149514 < 1.167754 (Δ +0.0182)
+```
+
+**Result: proxy=1.1495 vs verified=1.1557. Δ = -0.0062.**
+
+Component breakdown:
+- WL: 0.075 vs 0.077 (-0.002)
+- Density: 0.562 vs 0.558 (+0.004)
+- Cong: 1.588 vs 1.601 (-0.013)
+
+The cong-aware Hessian phase landed a -0.018 saddle escape (vs verified
+-0.010). The cong term in surrogate biased the eigvec toward a deeper
+saddle direction. Real validated improvement.
+
+**Caveat**: 0.006/0.135 = 4.6% of predicted structural room recovered.
+If proportional across all 8 positive-residual benches: 0.040 total →
+0.0024 mean improvement. That's noise.
+
+To get bigger improvements: try AUTO_CONG=1 (which would set ibm12's
+weight to 1.5 instead of 0.5). Defer to next iteration.
+
+## Iter 4c — focused sweep (running)
 
 Benches chosen to span the room spectrum:
 - ibm12, ibm06, ibm18 (high room — should show clear improvement)
