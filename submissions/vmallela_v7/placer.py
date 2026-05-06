@@ -92,12 +92,15 @@ for _k, _v in [
     # reproduce the verified-1.0109 baseline behavior.
     ("PLACER_V7_HESSIAN_CONG", "1"),
     ("PLACER_V7_K_CONG_FRAC", "0.05"),
-    # Cong weight in the SURROGATE (default 0.5 matches proxy formula).
-    # Boosting this above 0.5 over-weights congestion in the eigenvector
-    # direction without changing the strict-improvement gate (which uses
-    # the exact proxy with weight 0.5). Safe upside: emphasizing the
-    # variance-dominant term during saddle search, monotone gating
-    # prevents regressions.
+    # Per-component weights in the SURROGATE (defaults match proxy).
+    # Boosting these above their proxy weights over-weights that term
+    # in the eigenvector direction without changing the strict-improvement
+    # gate (which uses the exact proxy with the original weights). Safe
+    # upside: emphasizing the variance-dominant term during saddle search;
+    # monotone gating prevents regressions. Setting any to 0 ablates that
+    # term from the surrogate (e.g. cong-only saddle escape).
+    ("PLACER_V7_HESSIAN_HPWL_WEIGHT", "1.0"),
+    ("PLACER_V7_HESSIAN_DENS_WEIGHT", "0.5"),
     ("PLACER_V7_HESSIAN_CONG_WEIGHT", "0.5"),
 ]:
     _os.environ.setdefault(_k, _v)
@@ -1015,6 +1018,10 @@ class OptimalPlacer:
         # concentrates the saddle direction on worst-case pinch points.
         k_dens_frac = float(os.environ.get("PLACER_V7_K_DENS_FRAC", "0.10"))
         K_d = max(1, int(k_dens_frac * incr.n_cells))
+        hpwl_weight = float(os.environ.get(
+            "PLACER_V7_HESSIAN_HPWL_WEIGHT", "1.0"))
+        dens_weight = float(os.environ.get(
+            "PLACER_V7_HESSIAN_DENS_WEIGHT", "0.5"))
 
         # albania1: CONGESTION in the Hessian surrogate. Critical fix —
         # without this term the saddle escape only sees HPWL+density
@@ -1077,7 +1084,7 @@ class OptimalPlacer:
                 t_d = torch.quantile(rho, 1.0 - K_d / incr.n_cells)
             density_smooth = cvar_smooth(rho.unsqueeze(0), K_d, t_d.detach(),
                                            mu=100.0).squeeze()
-            loss = hpwl + 0.5 * density_smooth
+            loss = hpwl_weight * hpwl + dens_weight * density_smooth
             if cong_enabled:
                 V_macro, H_macro = smooth_macro_blockage(
                     macro_pos_var, macro_w_haloed, macro_h_haloed,
