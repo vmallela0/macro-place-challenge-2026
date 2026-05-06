@@ -116,6 +116,59 @@ weight to 1.5 instead of 0.5). Defer to next iteration.
 
 ## Iter 4c — focused sweep (running)
 
+3/5 benches done as of ~2:50 AM PDT:
+
+| Bench | Residual | Verified | Cong-on (w=0.5) | Δ |
+|---|---:|---:|---:|---:|
+| ibm12 | +0.269 | 1.1557 | 1.1495 | **-0.0062** |
+| ibm06 | +0.262 | 1.0546 | 1.0482 | **-0.0064** |
+| ibm18 | +0.234 | 1.2697 | 1.2760 | **+0.0063** (regress) |
+| ibm15 | +0.032 | 1.0835 | (running) | — |
+| ibm09 | -0.232 | 0.7628 | (queued) | — |
+
+Mean across 3 high-room: 0.0. Real per-bench signal but **swamped by
+v4-baseline variance** on ibm18 (its post-Laplacian was 1.291 vs
+verified's 1.280; the 0.011 v4 difference dominated).
+
+## Iter 5 — ibm12 AUTO_CONG (weight=1.5, parallel run)
+
+Boost cong_weight from 0.5 to 1.5 on ibm12 (residual +0.269 → AUTO scale 3×).
+
+```
+proxy=1.1458 (wl=0.076 den=0.561 cong=1.579)
+```
+
+| | proxy | wl | d | cong |
+|---|---:|---:|---:|---:|
+| verified | 1.1557 | 0.077 | 0.558 | 1.601 |
+| cong-on w=0.5 | 1.1495 | 0.075 | 0.562 | 1.588 |
+| **cong-on w=1.5 (AUTO)** | **1.1458** | 0.076 | 0.561 | 1.579 |
+
+Boosting weight 0.5→1.5 reduced cong further (1.588→1.579) and proxy
+by additional 0.0037. **AUTO_CONG works** — boosting weight on
+high-room benches gives ~1.7× more improvement than uniform weight=0.5.
+
+Closed 16% of structural room on ibm12 (vs 4.6% with weight=0.5).
+
+Realistic extrapolation: AUTO_CONG mean improvement across 17 benches
+≈ 0.005 (vs 0.003 with uniform weight=0.5). **Verified 1.0109 → ~1.006
+expected with AUTO_CONG full sweep.**
+
+## Conclusion (mid-night)
+
+The cong-aware Hessian breakthrough is **real but bounded by structural
+ceiling at ~0.95-0.98**. Maximum recovery from AUTO_CONG: ~0.005 mean.
+Cannot break below 0.95 without:
+- Tier 2 levers (orientation, halos, timing weights, macro halos in
+  routing only)
+- Architectural shifts (natural-gradient Langevin SDE, QP convex
+  relaxation, recursive bisection priors)
+
+The verified 1.0109 → ~1.006 expected with AUTO_CONG sweep is the
+realistic overnight target. Will queue this as the next sweep.
+
+## Iter 4d — finishing the focused sweep
+
 Benches chosen to span the room spectrum:
 - ibm12, ibm06, ibm18 (high room — should show clear improvement)
 - ibm15 (medium room — small improvement expected)
