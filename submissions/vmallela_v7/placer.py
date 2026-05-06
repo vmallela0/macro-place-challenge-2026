@@ -1147,9 +1147,19 @@ class OptimalPlacer:
             os.environ.get("PLACER_V7_HESSIAN_ELECTROSTATIC", "0") == "1")
         electro_weight = float(
             os.environ.get("PLACER_V7_HESSIAN_ELECTRO_WEIGHT", "1.0"))
+        # Hybrid mode: keep both CVaR and electrostatic terms in the
+        # surrogate. The Hessian eigvec captures BOTH local hotspots
+        # (CVaR) and long-range structure (electrostatic). Default: when
+        # electro is enabled, hybrid is OFF (pure electro replaces CVaR).
+        # Set hybrid=1 to ADD electro on top of CVaR rather than replace.
+        hybrid_density = (
+            os.environ.get("PLACER_V7_HESSIAN_HYBRID_DENSITY", "0") == "1")
         if electro_enabled:
-            print(f"  [v7] hessian: ELECTROSTATIC density (DREAMPlace-style) "
-                  f"ENABLED (weight={electro_weight})", flush=True)
+            mode = "HYBRID (CVaR + electro)" if hybrid_density else "ELECTRO-ONLY"
+            print(f"  [v7] hessian: {mode} density (DREAMPlace-style) "
+                  f"ENABLED (electro_weight={electro_weight}, "
+                  f"dens_weight={dens_weight if hybrid_density else 0})",
+                  flush=True)
 
         def smooth_proxy_call(macro_pos_var):
             is_port = (pin_macro_t < 0)
@@ -1166,13 +1176,25 @@ class OptimalPlacer:
                 incr.grid_width, incr.grid_height,
                 n_cells=incr.n_cells, cell_area=incr.grid_area, mu=100.0)
             if electro_enabled:
-                # DREAMPlace-style: replace CVaR top-K density with the
-                # full Poisson energy of the density distribution.
+                # DREAMPlace-style: Poisson energy of the density
+                # distribution (global structure).
                 density_term = electrostatic_density_energy(
                     rho, incr.grid_row, incr.grid_col,
                     grid_w=float(incr.grid_width),
                     grid_h=float(incr.grid_height))
-                loss = hpwl_weight * hpwl + electro_weight * density_term
+                if hybrid_density:
+                    # Hybrid: keep CVaR (local hotspots) AND add electro.
+                    with torch.no_grad():
+                        t_d = torch.quantile(rho, 1.0 - K_d / incr.n_cells)
+                    density_smooth = cvar_smooth(
+                        rho.unsqueeze(0), K_d, t_d.detach(),
+                        mu=100.0).squeeze()
+                    loss = (hpwl_weight * hpwl
+                            + dens_weight * density_smooth
+                            + electro_weight * density_term)
+                else:
+                    # Pure electro replaces CVaR.
+                    loss = hpwl_weight * hpwl + electro_weight * density_term
             else:
                 with torch.no_grad():
                     t_d = torch.quantile(rho, 1.0 - K_d / incr.n_cells)
