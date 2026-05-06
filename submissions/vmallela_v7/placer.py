@@ -272,30 +272,65 @@ class OptimalPlacer:
             print(f"  [v7] reserving {basin_reserve}s for laplacian+basin-hop "
                   f"(portfolio budget: {per_worker_budget}s)", flush=True)
 
-        # Phase 1+2+3: standard v6 portfolio pipeline.
-        from _portfolio import run_portfolio
-        result_pos, best_cost, overlaps, best_seed = run_portfolio(
-            bench_path,
-            total_budget=per_worker_budget,
-            n_workers=self.N_WORKERS,
-            gpu_workers=self.GPU_WORKERS,
-            base_seed=self.seed,
-            log_prefix=log_prefix,
-            apply_consensus=os.environ.get("PLACER_V6_CONSENSUS", "1") == "1",
-            consensus_refine_budget=int(os.environ.get(
-                "PLACER_V6_CONSENSUS_REFINE", "180")),
-            consensus_k_best=int(os.environ.get(
-                "PLACER_V6_CONSENSUS_K", "16")),
-        )
+        # albania1: optional fast-path — skip v4+Lap by loading a saved
+        # post-Lap placement. Used for clean A/B testing of Hessian
+        # variants without v4-baseline variance.
+        load_post_lap = os.environ.get("PLACER_V7_LOAD_POST_LAP")
+        if load_post_lap:
+            load_path_pl = load_post_lap.format(name=benchmark.name)
+            try:
+                loaded = np.load(load_path_pl)
+                portfolio_pos = torch.tensor(loaded, dtype=torch.float32)
+                # Compute cost via official evaluator
+                bench_load = Benchmark.load(bench_path)
+                import importlib.util as _ilu
+                v1_spec = _ilu.spec_from_file_location(
+                    "_v1_load",
+                    str(_HERE.parent / "vmallela" / "placer.py"))
+                v1 = _ilu.module_from_spec(v1_spec)
+                v1_spec.loader.exec_module(v1)
+                plc_load = v1._load_plc(bench_load.name)
+                r = compute_proxy_cost(portfolio_pos, bench_load, plc_load)
+                portfolio_cost = float(r["proxy_cost"])
+                overlaps = int(r["overlap_count"])
+                print(f"  [v7] LOAD_POST_LAP from {load_path_pl}: "
+                      f"cost={portfolio_cost:.6f} overlaps={overlaps} "
+                      f"(skipped v4+Lap)", flush=True)
+            except Exception as e:
+                print(f"  [v7] LOAD_POST_LAP failed: {e} — running v4+Lap",
+                      flush=True)
+                load_post_lap = None
 
-        portfolio_cost = float(best_cost)
-        portfolio_pos = result_pos.clone()
-        elapsed_after_portfolio = time.time() - t0
-        print(f"  [v7] after portfolio+consensus: cost={portfolio_cost:.6f} "
-              f"overlaps={overlaps} ({elapsed_after_portfolio:.1f}s)",
-              flush=True)
+        if not load_post_lap:
+            # Phase 1+2+3: standard v6 portfolio pipeline.
+            from _portfolio import run_portfolio
+            result_pos, best_cost, overlaps, best_seed = run_portfolio(
+                bench_path,
+                total_budget=per_worker_budget,
+                n_workers=self.N_WORKERS,
+                gpu_workers=self.GPU_WORKERS,
+                base_seed=self.seed,
+                log_prefix=log_prefix,
+                apply_consensus=os.environ.get("PLACER_V6_CONSENSUS", "1") == "1",
+                consensus_refine_budget=int(os.environ.get(
+                    "PLACER_V6_CONSENSUS_REFINE", "180")),
+                consensus_k_best=int(os.environ.get(
+                    "PLACER_V6_CONSENSUS_K", "16")),
+            )
 
-        # Phase 4: Laplacian soft-resolve. Loaded into a fresh
+            portfolio_cost = float(best_cost)
+            portfolio_pos = result_pos.clone()
+            elapsed_after_portfolio = time.time() - t0
+            print(f"  [v7] after portfolio+consensus: cost={portfolio_cost:.6f} "
+                  f"overlaps={overlaps} ({elapsed_after_portfolio:.1f}s)",
+                  flush=True)
+
+        # Phase 4: Laplacian soft-resolve. Skipped when LOAD_POST_LAP is
+        # set (the loaded state is already post-Laplacian).
+        if load_post_lap:
+            self.LAPLACIAN_REFINE = False
+
+        # Loaded into a fresh
         # IncrementalEvaluator + applied as a sequence of per-soft line
         # searches. Strict-improvement gating means this can never make
         # things worse.
@@ -365,6 +400,27 @@ class OptimalPlacer:
                           f"({portfolio_cost:.6f})", flush=True)
             except Exception as e:
                 print(f"  [v7] laplacian err: {e}", flush=True)
+
+        # albania1: save post-Lap state for clean A/B testing of
+        # downstream variants. Set PLACER_V7_SAVE_POST_LAP=path to dump
+        # the placement after v4+Laplacian. Then re-run with
+        # PLACER_V7_LOAD_POST_LAP=path to skip v4+Lap and go straight
+        # to Hessian. This isolates the Hessian effect from v4-baseline
+        # variance (~0.005 per run).
+        save_post_lap = os.environ.get("PLACER_V7_SAVE_POST_LAP")
+        if save_post_lap:
+            try:
+                save_path_pl = save_post_lap.format(name=benchmark.name)
+                Path(save_path_pl).parent.mkdir(parents=True, exist_ok=True)
+                np.save(save_path_pl, portfolio_pos.detach().cpu().numpy())
+                # Also save the cost as metadata
+                with open(save_path_pl + ".meta", "w") as fmeta:
+                    fmeta.write(f"cost={portfolio_cost}\noverlaps={overlaps}\n")
+                print(f"  [v7] saved post-Lap state to {save_path_pl} "
+                      f"(cost={portfolio_cost:.6f})", flush=True)
+            except Exception as e:
+                print(f"  [v7] WARNING: post-Lap save failed: {e}",
+                      flush=True)
 
         # ── Phase 4.6: Hessian negative-eigenvector escape ─────────────
         # At post-Laplacian state, compute Hessian of smooth surrogate.
