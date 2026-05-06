@@ -92,6 +92,13 @@ for _k, _v in [
     # reproduce the verified-1.0109 baseline behavior.
     ("PLACER_V7_HESSIAN_CONG", "1"),
     ("PLACER_V7_K_CONG_FRAC", "0.05"),
+    # Cong weight in the SURROGATE (default 0.5 matches proxy formula).
+    # Boosting this above 0.5 over-weights congestion in the eigenvector
+    # direction without changing the strict-improvement gate (which uses
+    # the exact proxy with weight 0.5). Safe upside: emphasizing the
+    # variance-dominant term during saddle search, monotone gating
+    # prevents regressions.
+    ("PLACER_V7_HESSIAN_CONG_WEIGHT", "0.5"),
 ]:
     _os.environ.setdefault(_k, _v)
 
@@ -1037,8 +1044,10 @@ class OptimalPlacer:
             k_cong_frac = float(
                 os.environ.get("PLACER_V7_K_CONG_FRAC", "0.05"))
             K_c = max(1, int(2 * incr.n_cells * k_cong_frac))
+            cong_weight = float(
+                os.environ.get("PLACER_V7_HESSIAN_CONG_WEIGHT", "0.5"))
             print(f"  [v7] hessian: congestion ENABLED "
-                  f"(K_c={K_c}/{2*incr.n_cells}, "
+                  f"(K_c={K_c}/{2*incr.n_cells}, weight={cong_weight}, "
                   f"v_alloc={v_alloc:.4f}, h_alloc={h_alloc:.4f})",
                   flush=True)
         else:
@@ -1046,6 +1055,7 @@ class OptimalPlacer:
             V_smooth_frozen = H_smooth_frozen = None
             v_alloc = h_alloc = grid_v_routes = grid_h_routes = 0.0
             K_c = 0
+            cong_weight = 0.0
             print("  [v7] hessian: congestion DISABLED "
                   "(PLACER_V7_HESSIAN_CONG=0)", flush=True)
 
@@ -1087,7 +1097,7 @@ class OptimalPlacer:
                 cong_smooth = cvar_smooth(
                     combined.unsqueeze(0), K_c, t_c.detach(),
                     mu=100.0).squeeze()
-                loss = loss + 0.5 * cong_smooth
+                loss = loss + cong_weight * cong_smooth
             return loss
 
         # Compute Hessian eigvec
