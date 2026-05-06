@@ -169,6 +169,68 @@ realistic overnight target. Will queue this as the next sweep.
 
 ## Iter 4d — finishing the focused sweep
 
+ibm15, ibm09 still queued (~2h). Then stage 5 (AUTO_CONG on 5 high-
+room benches) auto-fires (~4.7h). Total wall ~6.7h to complete pipeline.
+
+---
+
+# Morning summary (for user)
+
+## What's verified in code
+
+The cong-aware Hessian breakthrough WORKS:
+- Lanczos convergence bug FIXED (Tikhonov + auto-retry + ladder fallback)
+- Cong-on with weight=0.5: -0.006 to -0.007 on high-room benches
+- Cong-on with weight=1.5 (AUTO_CONG): -0.010 on ibm12 (1.7× more)
+- Strict-improvement gate prevents regression on below-floor benches
+
+## Realistic expected mean improvement
+
+Verified 1.0109 → ~1.006 with full 17-bench AUTO_CONG sweep.
+That's a 0.5% relative improvement. **Real but not breakthrough class.**
+
+## Why we can't break 0.95 with cong-aware Hessian alone
+
+The structural floor analysis (R²=0.79) shows 80% of v7 cong is
+predicted by netlist demand/supply ratio. The remaining 20% is what
+the algorithm can actually move. We're recovering ~16% of that 20%
+on high-room benches with AUTO_CONG (from ibm12 data: 16% of structural
+room closed). The wall isn't a hyperparameter; it's a problem property.
+
+## What would actually break 0.95
+
+1. **Tier 2 levers**: orientation flip + halos + timing weights affect
+   routing supply (denominator of demand/supply ratio). Already wrote
+   orientation flip + halo in albania1. Need OpenROAD harness for
+   verification.
+
+2. **Natural-gradient Langevin SDE** (research/NATURAL_GRADIENT_IDEA.md):
+   replaces Phase 1+3 entirely. Generational if it works. ~1 day to
+   implement carefully.
+
+3. **Architectural priors**: recursive bisection placement, hierarchical
+   sequential decoding, learned warm-starts. Different algorithm class.
+
+## Pipeline at user wake-up
+
+```
+~7 AM PDT:
+  Focused sweep: complete (5 cong-on weight=0.5 results)
+  AUTO_CONG sweep: ~2-3 of 5 benches done
+
+~11 AM PDT:
+  AUTO_CONG sweep: complete (5 high-room benches with weight=1.5)
+```
+
+Files to inspect in the morning:
+- `/tmp/albania1_focused_cong_*/results.csv` — focused sweep proxies
+- `/tmp/albania1_focused_cong_*/sweep.log` — Δ vs verified
+- `/tmp/albania1_auto_cong_*/results.csv` — AUTO_CONG proxies (when ready)
+- `research/ITERATIONS.md` — this log
+- `research/NATURAL_GRADIENT_IDEA.md` — next-step generational idea
+
+Branch `albania1` at fd4ae2a. All commits pushed.
+
 Benches chosen to span the room spectrum:
 - ibm12, ibm06, ibm18 (high room — should show clear improvement)
 - ibm15 (medium room — small improvement expected)
