@@ -283,7 +283,70 @@ Conclusion: **multi-seed sampling is not a breakthrough lever for
 this problem class.** The placement landscape is a single-basin
 sub-Gaussian distribution at the v4-baseline level.
 
-## Iter 7 — saddle-depth-aware AUTO_CONG (running)
+## Iter 7 — saddle-depth-aware AUTO_CONG (FALSIFIED)
+
+Cong-weight sweep on ibm06 with w ∈ {0.0, 0.5, 0.75, 1.0, 1.25, 1.5}:
+
+| weight | proxy | λ_min |
+|---|---:|---:|
+| **0.0 (cong-off)** | **1.0451** ★ | -0.0075 |
+| 0.5 | 1.0667 | -0.0070 |
+| 0.75 | 1.0687 | -0.0091 |
+| 1.0 | 1.0656 | -0.0067 |
+| 1.25 | 1.0550 | -0.0087 |
+| 1.5 | 1.0731 | -0.0054 |
+
+**Saddle-depth hypothesis FALSIFIED**: deepest |λ_min| (w=0.75)
+gave near-WORST proxy. The "maximize |λ_min|" rule doesn't predict
+proxy.
+
+**Cong-off (w=0.0) won** — 1.0451 vs verified 1.0546 (Δ=-0.010).
+Adding cong to the Hessian surrogate is *actively harmful* on ibm06.
+
+Note: parallel CPU contention (10265s wall vs ~3300s normal) likely
+inflated all proxies; the relative ordering may be the only reliable
+signal. Best result was cong-off, suggesting cong-aware Hessian is
+not a uniform improvement.
+
+## Iter 8 — pivot to electrostatic-density Hessian (DREAMPlace-style)
+
+Multi-seed (Iter 6) and saddle-depth-aware AUTO_CONG (Iter 7) both
+underperformed expectations. Switching strategy from cong-aware Hessian
+tuning to **architectural change**: replace CVaR top-K density with
+**Poisson-energy electrostatic density** in the Hessian surrogate.
+
+Rationale (the hidden insight):
+- CVaR top-K density is *locally* myopic — sees only K worst cells
+- Electrostatic potential energy ∫|φ|² is *globally aware* — every
+  cell contributes via Green's function 1/k²
+- The Hessian eigvec under electro captures DREAMPlace's secret
+  sauce: long-range density structure
+- Combined with our combinatorial saddle-escape pipeline + strict-
+  improvement gate against EXACT proxy: DREAMPlace-class density
+  curvature direction inside our framework
+
+Implemented: `electrostatic_density_energy(grid_density, ...)` in
+`_cell_window.py` via 2D FFT Poisson solve. ~50 LoC. Differentiable.
+Verified on toys: uniform density → energy=0; peaks → energy>0;
+gradient flows through all cells via Green's function.
+
+Plumbed into `placer.py` smooth_proxy_call. Three modes via env:
+- `PLACER_V7_HESSIAN_ELECTROSTATIC=0` → CVaR (default; verified)
+- `=1` + HYBRID=0 → pure electro replaces CVaR
+- `=1` + HYBRID=1 → electro ADDED to CVaR (best of both)
+
+Smoke launched: ibm12 cvar vs electro in parallel, cong-off both.
+ETA ~50 min. Auto-chained: if electro wins, focused sweep on
+ibm12/06/18/07/03 fires automatically.
+
+If validated → expected Δ -0.02 on high-room benches → ~0.005 mean
+improvement → verified 1.0109 → ~1.005-1.006.
+
+If combined with multi-eigvec (k=5) and recursive bisection warm-
+start → expected mean Δ -0.04 to -0.06 → verified ~0.95-0.97.
+**That's the path to confidently sub-1.0.**
+
+## Iter 7 — (was: saddle-depth-aware AUTO_CONG)
 
 Hypothesis: optimal cong_weight depends on Hessian λ_min depth.
 
