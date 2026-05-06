@@ -167,10 +167,40 @@ Cannot break below 0.95 without:
 The verified 1.0109 → ~1.006 expected with AUTO_CONG sweep is the
 realistic overnight target. Will queue this as the next sweep.
 
-## Iter 4d — finishing the focused sweep
+## Iter 4d — focused sweep COMPLETE (5/5 benches done)
 
-ibm15, ibm09 still queued (~2h). Then stage 5 (AUTO_CONG on 5 high-
-room benches) auto-fires (~4.7h). Total wall ~6.7h to complete pipeline.
+| Bench | Residual | Verified | Cong-on (w=0.5) | Δ |
+|---|---:|---:|---:|---:|
+| ibm12 | +0.269 | 1.1557 | 1.1495 | -0.0062 |
+| ibm06 | +0.262 | 1.0546 | 1.0482 | -0.0064 |
+| ibm18 | +0.234 | 1.2697 | 1.2760 | +0.0063 |
+| ibm15 | +0.032 | 1.0835 | 1.0867 | +0.0032 |
+| ibm09 | -0.232 | 0.7628 | 0.7623 | -0.0005 |
+
+**Mean: -0.0007. Essentially zero.** v4-baseline variance dominates the
+algorithmic signal at weight=0.5.
+
+But ibm12 AUTO_CONG (weight=1.5) achieved -0.010 (1.7× the weight=0.5
+result), suggesting boosting cong weight gives meaningful additional
+signal. Stage 5 (AUTO_CONG sweep on 5 high-room benches) auto-fired
+at 04:33 PDT, ETA finish 09:15 PDT.
+
+## Iter 5 (running) — AUTO_CONG sweep
+
+Order: ibm06 → ibm18 → ibm07 → ibm03 → ibm12 with AUTO_CONG=1
+(per-bench cong_weight scaled by residual: 1.5 for high-room benches).
+
+Expected results:
+- ibm06: -0.012 to -0.018 (was -0.006 at w=0.5; expect ~3× scaling)
+- ibm18: -0.010 to -0.015 (was +0.006; v4 noise; expect signal stronger
+  with weight=1.5 to overcome it)
+- ibm07: -0.005 to -0.010 (medium room +0.080)
+- ibm03: -0.004 to -0.008 (medium room +0.062)
+- ibm12: -0.010 (already known)
+
+Mean improvement target: ~0.008 across 5 benches → ~0.002 mean over 17.
+Combined with cong-on default for other 12 benches: maybe 0.005 mean
+total improvement. Verified 1.0109 → ~1.006.
 
 ---
 
