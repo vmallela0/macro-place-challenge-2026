@@ -87,6 +87,11 @@ for _k, _v in [
     ("PLACER_V7_ORIENTATION_FLIP", "1"),
     ("PLACER_V7_ORIENTATION_PASSES", "2"),
     ("PLACER_V7_HALO_FRAC", "0.0"),
+    # Congestion-aware Hessian. Default ON (the breakthrough lever);
+    # the prior surrogate omitted congestion entirely. Set to "0" to
+    # reproduce the verified-1.0109 baseline behavior.
+    ("PLACER_V7_HESSIAN_CONG", "1"),
+    ("PLACER_V7_K_CONG_FRAC", "0.05"),
 ]:
     _os.environ.setdefault(_k, _v)
 
@@ -929,7 +934,8 @@ class OptimalPlacer:
         from _hessian_escape import hessian_escape_step
         from _smooth_proxy import (lse_hpwl_vectorized, build_pin_to_net,
                                      cvar_smooth)
-        from _cell_window import (build_window_indices, smooth_density_grid)
+        from _cell_window import (build_window_indices, smooth_density_grid,
+                                    smooth_macro_blockage)
         from _hessian_worker import hessian_candidate_worker
         import importlib.util as _ilu
 
@@ -1003,6 +1009,46 @@ class OptimalPlacer:
         k_dens_frac = float(os.environ.get("PLACER_V7_K_DENS_FRAC", "0.10"))
         K_d = max(1, int(k_dens_frac * incr.n_cells))
 
+        # albania1: CONGESTION in the Hessian surrogate. Critical fix —
+        # without this term the saddle escape only sees HPWL+density
+        # while ~73 % of proxy variance lives in congestion (across the
+        # 17 IBM benches; see research/lower_bounds/FINDINGS.md). The
+        # math mirrors smooth_proxy_for_v7_v2 in _smooth_proxy.py:
+        # combined V/H congestion = V_routing_smooth (frozen, from per-net
+        # RUDY) + V_macro(x)/grid_v_routes (differentiable macro blockage),
+        # CVaR top-(K_c / 2·n_cells) over union.
+        cong_enabled = (os.environ.get("PLACER_V7_HESSIAN_CONG", "1") == "1")
+        if cong_enabled:
+            cell_idx_c, _ = build_window_indices(
+                macro_pos_t.detach(), macro_w_haloed, macro_h_haloed,
+                grid_col=incr.grid_col, grid_row=incr.grid_row,
+                grid_w=incr.grid_width, grid_h=incr.grid_height,
+                margin_cells=4)
+            V_smooth_frozen = torch.tensor(
+                np.asarray(incr.V_routing_smooth),
+                dtype=torch.float32, device=device)
+            H_smooth_frozen = torch.tensor(
+                np.asarray(incr.H_routing_smooth),
+                dtype=torch.float32, device=device)
+            v_alloc = float(np.asarray(incr.vrouting_alloc).mean())
+            h_alloc = float(np.asarray(incr.hrouting_alloc).mean())
+            grid_v_routes = float(incr.grid_v_routes)
+            grid_h_routes = float(incr.grid_h_routes)
+            k_cong_frac = float(
+                os.environ.get("PLACER_V7_K_CONG_FRAC", "0.05"))
+            K_c = max(1, int(2 * incr.n_cells * k_cong_frac))
+            print(f"  [v7] hessian: congestion ENABLED "
+                  f"(K_c={K_c}/{2*incr.n_cells}, "
+                  f"v_alloc={v_alloc:.4f}, h_alloc={h_alloc:.4f})",
+                  flush=True)
+        else:
+            cell_idx_c = None
+            V_smooth_frozen = H_smooth_frozen = None
+            v_alloc = h_alloc = grid_v_routes = grid_h_routes = 0.0
+            K_c = 0
+            print("  [v7] hessian: congestion DISABLED "
+                  "(PLACER_V7_HESSIAN_CONG=0)", flush=True)
+
         def smooth_proxy_call(macro_pos_var):
             is_port = (pin_macro_t < 0)
             safe = torch.where(is_port, torch.zeros_like(pin_macro_t), pin_macro_t)
@@ -1021,7 +1067,28 @@ class OptimalPlacer:
                 t_d = torch.quantile(rho, 1.0 - K_d / incr.n_cells)
             density_smooth = cvar_smooth(rho.unsqueeze(0), K_d, t_d.detach(),
                                            mu=100.0).squeeze()
-            return hpwl + 0.5 * density_smooth
+            loss = hpwl + 0.5 * density_smooth
+            if cong_enabled:
+                V_macro, H_macro = smooth_macro_blockage(
+                    macro_pos_var, macro_w_haloed, macro_h_haloed,
+                    cell_idx_c,
+                    incr.grid_col, incr.grid_row,
+                    incr.grid_width, incr.grid_height,
+                    n_cells=incr.n_cells,
+                    vrouting_alloc=v_alloc,
+                    hrouting_alloc=h_alloc,
+                    mu=100.0)
+                V_total = V_smooth_frozen + V_macro / max(grid_v_routes, 1e-9)
+                H_total = H_smooth_frozen + H_macro / max(grid_h_routes, 1e-9)
+                combined = torch.cat([V_total, H_total], dim=0)
+                with torch.no_grad():
+                    t_c = torch.quantile(
+                        combined, 1.0 - K_c / (2 * incr.n_cells))
+                cong_smooth = cvar_smooth(
+                    combined.unsqueeze(0), K_c, t_c.detach(),
+                    mu=100.0).squeeze()
+                loss = loss + 0.5 * cong_smooth
+            return loss
 
         # Compute Hessian eigvec
         t_h = time.time()
