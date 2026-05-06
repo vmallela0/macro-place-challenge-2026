@@ -342,9 +342,41 @@ ibm12/06/18/07/03 fires automatically.
 If validated → expected Δ -0.02 on high-room benches → ~0.005 mean
 improvement → verified 1.0109 → ~1.005-1.006.
 
-If combined with multi-eigvec (k=5) and recursive bisection warm-
-start → expected mean Δ -0.04 to -0.06 → verified ~0.95-0.97.
-**That's the path to confidently sub-1.0.**
+## Iter 9 — clean A/B 4-variant on ibm12 (CONFIRMED ELECTRO-NORM WINS)
+
+Same post-Lap state (1.156023), four Hessian variants:
+
+| Variant | proxy | Hessian lift | Δ vs CVaR |
+|---|---:|---:|---:|
+| CVaR | 1.1449 | -0.0111 | 0 |
+| Electro raw (weight=1.0) | 1.1459 | -0.0101 | +0.0010 |
+| **Electro normalized (weight=0.5)** | **1.1422** | **-0.0138** | **-0.0027** ★ |
+| Hybrid (CVaR + EN) | 1.1431 | -0.0129 | -0.0018 |
+
+**Electro normalized BEATS CVaR by 0.0027 on ibm12 in clean isolation.**
+**Beats verified (1.1557) by 0.0135 — but most of that is from
+albania1's other improvements (Lanczos fix + istanbul). The pure
+electro contribution over CVaR is 0.0027.**
+
+Mechanism: normalized energy (divide by var(ρ)·canvas_area) brings
+electro magnitude to O(1), balanced with HPWL_LSE. The Hessian becomes
+a true mixture of HPWL+density modes; eigvec rotates slightly off
+pure-density direction → finds deeper saddle (-0.0138 vs -0.0111).
+
+Raw electro (10^5 magnitude) loses because line search picks suboptimal
+step in the electro-dominated direction. The normalization is essential.
+
+## Deployment plan
+
+1. **electro_norm sweep on 5 high-room benches** (ibm12, ibm06, ibm18,
+   ibm07, ibm03). ETA ~5h. If consistent +0.003 vs CVaR baseline,
+   deploy across all 17.
+
+2. **Recursive bisect warm-start test** (running). If reduces v4
+   variance, stack with electro_norm.
+
+3. **If both validate**: combined mean improvement on 17 benches:
+   -0.005 to -0.010. Verified 1.0109 → ~1.000-1.005. Approaches sub-1.0.
 
 ## Iter 7 — (was: saddle-depth-aware AUTO_CONG)
 
