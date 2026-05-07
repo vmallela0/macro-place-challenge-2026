@@ -504,6 +504,18 @@ class OptimalPlacer:
             hess_total_budget_s = int(os.environ.get(
                 "PLACER_V7_HESSIAN_TOTAL_BUDGET", "0"))   # 0 = no cap
             t_hess_start = time.time()
+            # albania2: spectral net criticality. Between iterations,
+            # decompose the previous Hessian's negative eigenvectors
+            # into per-net energy and amplify high-criticality nets in
+            # the next iter's surrogate. Gated by env vars so we can
+            # ablate cleanly. The base (incr.net_weight) — and therefore
+            # the leaderboard cost — is unchanged; only the smooth
+            # surrogate sees the override.
+            spectral_on = (os.environ.get(
+                "PLACER_V7_SPECTRAL_CRITICALITY", "0") == "1")
+            spectral_gain = float(os.environ.get(
+                "PLACER_V7_SPECTRAL_GAIN", "0.5"))
+            net_weight_override = None
             for hess_iter in range(hess_max_iters):
                 if (hess_total_budget_s > 0
                         and time.time() - t_hess_start
@@ -513,9 +525,11 @@ class OptimalPlacer:
                           flush=True)
                     break
                 try:
+                    self._last_hessian_eigeninfo = None
                     new_pos, new_cost = self._hessian_escape_phase(
                         portfolio_pos, portfolio_cost, bench_path,
-                        hess_steps, hess_budget, hess_n_lanczos)
+                        hess_steps, hess_budget, hess_n_lanczos,
+                        net_weight_override=net_weight_override)
                     if isinstance(new_pos, np.ndarray):
                         new_pos = torch.tensor(new_pos, dtype=torch.float32)
                     if new_cost >= portfolio_cost - 1e-7:
@@ -529,6 +543,37 @@ class OptimalPlacer:
                     portfolio_pos = new_pos
                     portfolio_cost = float(new_cost)
                     overlaps = 0
+                    # Spectral criticality reweighting for next iter.
+                    if spectral_on:
+                        eig = getattr(self,
+                                      "_last_hessian_eigeninfo", None)
+                        if (eig is not None
+                                and eig.get("eigvals") is not None
+                                and eig.get("eigvecs") is not None):
+                            try:
+                                from _spectral_criticality import (
+                                    eigvec_net_criticality,
+                                    apply_criticality_to_weights)
+                                crit = eigvec_net_criticality(
+                                    eig["eigvals"], eig["eigvecs"],
+                                    eig["pin_macro"], eig["net_starts"],
+                                    n_total=eig["n_total"])
+                                base_w = eig["base_net_weight"]
+                                new_w = apply_criticality_to_weights(
+                                    base_w, crit, gain=spectral_gain)
+                                k_topcrit = int((crit > 0.1).sum())
+                                print(f"  [v7] spectral: criticality "
+                                      f"computed; {k_topcrit}/{len(crit)} "
+                                      f"nets > 0.1; base_w∈[{base_w.min():.2f},"
+                                      f"{base_w.max():.2f}]→new_w∈"
+                                      f"[{new_w.min():.2f},{new_w.max():.2f}], "
+                                      f"gain={spectral_gain}", flush=True)
+                                net_weight_override = new_w
+                            except Exception as ce:
+                                print(f"  [v7] spectral: criticality "
+                                      f"err {type(ce).__name__}: {ce}",
+                                      flush=True)
+                                net_weight_override = None
                 except Exception as e:
                     print(f"  [v7] hessian iter {hess_iter} err: "
                           f"{type(e).__name__}: {e}", flush=True)
@@ -1110,7 +1155,8 @@ class OptimalPlacer:
         return best_pos, best_cost
 
     def _hessian_escape_phase(self, current_pos, current_cost, bench_path,
-                                step_sizes, hop_budget, n_lanczos_iters):
+                                step_sizes, hop_budget, n_lanczos_iters,
+                                net_weight_override=None):
         """Phase 4.6: Hessian negative-eigenvector escape.
 
         Compute Hessian of smooth surrogate at the post-Laplacian state.
@@ -1165,8 +1211,22 @@ class OptimalPlacer:
             np.asarray(incr.pin_yoff), dtype=torch.float32, device=device)
         net_starts_t = torch.tensor(
             np.asarray(incr.net_starts), dtype=torch.long, device=device)
+        # albania2: spectral criticality reweighting. If
+        # `net_weight_override` is supplied (computed from the previous
+        # Hessian iter's eigvecs), use it; else fall back to incr's own
+        # net_weight (which carries the bench's STA-derived path-count
+        # weights). This decouples surrogate weights from the exact-cost
+        # weights — the leaderboard cost is always evaluated with the
+        # original `incr.net_weight` and unaffected by this override.
+        _nw_src = (np.asarray(net_weight_override)
+                   if net_weight_override is not None
+                   else np.asarray(incr.net_weight))
         net_weight_t = torch.tensor(
-            np.asarray(incr.net_weight), dtype=torch.float32, device=device)
+            _nw_src, dtype=torch.float32, device=device)
+        if net_weight_override is not None:
+            print(f"  [v7] hessian: using SPECTRAL net_weight override "
+                  f"(min={_nw_src.min():.3f}, max={_nw_src.max():.3f}, "
+                  f"mean={_nw_src.mean():.3f})", flush=True)
         macro_w_t = torch.tensor(
             np.asarray(incr.macro_w), dtype=torch.float32, device=device)
         macro_h_t = torch.tensor(
@@ -1416,11 +1476,43 @@ class OptimalPlacer:
                 ls_n_steps=ls_steps,
                 ls_shrink=ls_shrink,
                 verbose=True)
+            # albania2: K-dim trust-region Newton step in the negative
+            # eigenspace, as an ADDITIONAL candidate alongside the per-
+            # eigvec line searches. Coordinated multi-direction descent
+            # — the per-eigvec candidates only explore axis-aligned
+            # cuts of the same K-dim subspace.
+            if (os.environ.get("PLACER_V7_HESSIAN_KDIM_NEWTON", "0") == "1"
+                    and diag.get("eigvecs") is not None
+                    and diag.get("eigvals") is not None):
+                from _hessian_escape import kdim_trust_region_step
+                kdim_trust = float(os.environ.get(
+                    "PLACER_V7_HESSIAN_KDIM_TRUST", "0.10"))
+                kdim_backtrack = int(os.environ.get(
+                    "PLACER_V7_HESSIAN_KDIM_BACKTRACK", "6"))
+                kd_result = kdim_trust_region_step(
+                    macro_pos_t, smooth_proxy_call,
+                    diag["eigvals"], diag["eigvecs"],
+                    canvas_diag=canvas_diag,
+                    trust_radius=kdim_trust,
+                    n_backtrack=kdim_backtrack,
+                    n_hard=n_hard,
+                    soft_only=True,
+                    verbose=True)
+                if kd_result is not None:
+                    kd_label, kd_pos, _kd_f = kd_result
+                    candidates.append((kd_label, kd_pos))
+                    print(f"  [v7] hessian: kdim Newton candidate added "
+                          f"({kd_label}); total candidates={len(candidates)}",
+                          flush=True)
             # Convert to (s, pos) tuple shape that the worker code below
             # expects (existing code uses `s` as a sortkey/seed-shifter).
             # We re-encode the ±step from the label into a numeric sortkey.
+            # kdim labels (e.g. "kdim_K3_r0.050") get sortkey 0.0.
             candidates = [
-                (float(lab.split("_ls")[1]) if "_ls" in lab else 0.0, pos)
+                (float(lab.split("_ls")[1])
+                 if isinstance(lab, str) and "_ls" in lab
+                 else 0.0,
+                 pos)
                 for lab, pos in candidates
             ]
             # Feasibility filter
@@ -1444,6 +1536,18 @@ class OptimalPlacer:
                 n_hard=n_hard,
                 soft_only_perturb=True,
                 verbose=True)
+        # albania2: stash eigvecs/eigvals so the iter loop can derive
+        # spectral net criticality for the next iteration's surrogate.
+        # Done here (before feasibility filter / SA workers) so the
+        # signal is captured even if all candidates fail validation.
+        self._last_hessian_eigeninfo = {
+            "eigvals": diag.get("eigvals"),
+            "eigvecs": diag.get("eigvecs"),
+            "pin_macro": np.asarray(incr.pin_macro),
+            "net_starts": np.asarray(incr.net_starts),
+            "n_total": int(np.asarray(incr.macro_pos).shape[0]),
+            "base_net_weight": np.asarray(incr.net_weight).copy(),
+        }
         if not candidates:
             print(f"  [v7] hessian: no candidates (eigvec degenerate); "
                   f"keeping post-Lap", flush=True)

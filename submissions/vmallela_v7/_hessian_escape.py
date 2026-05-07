@@ -451,8 +451,114 @@ def adaptive_topk_candidates(
         "n_candidates": len(candidates),
         "method": "adaptive_line_search",
         "line_search_results": line_search_results,
+        # albania2: expose the raw eigenpairs so the caller can derive
+        # spectral net criticality from them. These are the SAME
+        # eigvecs that produced the candidates above.
+        "eigvals": np.asarray(eigvals, dtype=np.float64),
+        "eigvecs": np.asarray(eigvecs, dtype=np.float64),
     }
     return candidates, diag
+
+
+def kdim_trust_region_step(
+    macro_pos: "torch.Tensor",
+    smooth_proxy_call,
+    eigvals: np.ndarray,
+    eigvecs: np.ndarray,
+    *,
+    canvas_diag: float = 1.0,
+    trust_radius: float = 0.10,
+    n_backtrack: int = 6,
+    n_hard: int = 0,
+    soft_only: bool = True,
+    neg_eps: float = -1e-6,
+    verbose: bool = False,
+) -> tuple[str, np.ndarray, float] | None:
+    """albania2: K-dim trust-region Newton step in the Hessian's
+    negative-eigenvalue subspace.
+
+    Standard Lanczos saddle escape uses a single eigenvector and a 1-D
+    line search. At a true saddle of rank > 1 the Hessian has multiple
+    negative eigenvalues; their eigenvectors span an independent
+    *negative-curvature subspace*. The locally optimal step within that
+    subspace is the analytic minimizer of the quadratic model:
+
+        a_j* = { -r·sign(g_j)        if λ_j < 0   (concave: boundary)
+                clip(-g_j/λ_j, ±r)   if λ_j > 0   (convex:  Newton)
+
+    where r = trust_radius·canvas_diag and g_j = ∇f·v_j. Backtracking
+    halves the step until the surrogate actually descends — needed when
+    the quadratic model is inaccurate at the chosen radius.
+
+    Returns (label, perturbed_pos, surrogate_f) for use as one extra
+    candidate in the SA worker pool, or None if no descent was found.
+    """
+    import torch
+    K = int(eigvecs.shape[1]) if eigvecs is not None else 0
+    if K == 0 or eigvals.size == 0:
+        return None
+    if not (eigvals < neg_eps).any():
+        # No negative eigenvalues — no saddle to escape, nothing to do.
+        return None
+    n_total = macro_pos.shape[0]
+
+    # Single autograd pass for ∇f at current x.
+    x = macro_pos.detach().clone().requires_grad_(True)
+    f0_t = smooth_proxy_call(x)
+    grad_t = torch.autograd.grad(f0_t, x)[0]
+    grad_np = grad_t.detach().cpu().numpy().reshape(-1).astype(np.float64)
+    f0 = float(f0_t.item())
+
+    # Project gradient onto each eigvec: g_j = g · v_j.
+    g_proj = eigvecs.T @ grad_np                       # (K,)
+    r = float(trust_radius) * float(canvas_diag)
+    a = np.zeros(K, dtype=np.float64)
+    for j in range(K):
+        lam = float(eigvals[j])
+        gj = float(g_proj[j])
+        if lam < neg_eps:
+            a[j] = -r * (1.0 if gj > 0 else (-1.0 if gj < 0 else 1.0))
+        else:
+            a[j] = -gj / max(lam, 1e-9)
+            if a[j] > r: a[j] = r
+            elif a[j] < -r: a[j] = -r
+
+    # Build delta in original 2N coords.
+    delta = (eigvecs @ a).reshape(n_total, 2).astype(np.float64)
+    if soft_only and n_hard > 0:
+        delta[:n_hard] = 0.0
+
+    base = macro_pos.detach().cpu().numpy().astype(np.float64)
+    best_label = None
+    best_pos = None
+    best_f = f0
+    for k_b in range(int(n_backtrack)):
+        scale = 0.5 ** k_b
+        cand = base + scale * delta
+        cand_t = torch.tensor(cand, dtype=macro_pos.dtype,
+                                device=macro_pos.device)
+        try:
+            with torch.no_grad():
+                f_try = float(smooth_proxy_call(cand_t).item())
+        except Exception:
+            continue
+        if f_try < best_f - 1e-9:
+            best_f = f_try
+            best_pos = cand
+            best_label = f"kdim_K{K}_r{scale*float(trust_radius):.3f}"
+            break        # first-descent
+    if verbose:
+        n_neg = int((eigvals < neg_eps).sum())
+        if best_pos is None:
+            print(f"    [hessian.kdim] K={K} (n_neg={n_neg}) no descent "
+                  f"in {n_backtrack} backtrack steps", flush=True)
+        else:
+            print(f"    [hessian.kdim] K={K} (n_neg={n_neg}) "
+                  f"step={best_label} surrogate_f={best_f:.6f} "
+                  f"(Δ={best_f-f0:+.4f})", flush=True)
+    if best_pos is None:
+        return None
+    return best_label, best_pos, best_f
 
 
 def feasibility_filter(
