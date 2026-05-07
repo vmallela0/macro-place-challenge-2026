@@ -1,0 +1,65 @@
+albania1 full 17-bench sweep (MAX_ITERS=3 + electro-norm)
+  started: Wed May  6 16:41:10 PDT 2026
+  results dir: /tmp/albania1_full17_20260506_164110
+  config: HESSIAN_BUDGET=400, MAX_ITERS=3, ELECTROSTATIC=1, NORM=1, weight=0.5, cong-off
+  benches (high-room first): ibm12 ibm06 ibm18 ibm07 ibm03 ibm08 ibm15 ibm02 ibm04 ibm16 ibm17 ibm13 ibm10 ibm14 ibm01 ibm11 ibm09
+  ETA: ~17h (17 runs × ~1h)
+
+=== ibm12: started Wed May  6 16:41:10 PDT 2026 ===
+  ibm12 proxy=1.1444 (verified=1.1557, Δ=-0.0113) cong=1.570 wall=3641s
+  running mean: 1.1444 (verified mean of completed: 1.1557, Δ=-0.0113)
+=== ibm06: started Wed May  6 17:41:51 PDT 2026 ===
+  ibm06 proxy=1.0486 (verified=1.0546, Δ=-0.0060) cong=1.410 wall=3503s
+  running mean: 1.0965 (verified mean of completed: 1.1052, Δ=-0.0087)
+=== ibm18: started Wed May  6 18:40:14 PDT 2026 ===
+  ibm18 proxy=1.2692 (verified=1.2697, Δ=-0.0005) cong=1.719 wall=3618s
+  running mean: 1.1541 (verified mean of completed: 1.1600, Δ=-0.0059)
+=== ibm07: started Wed May  6 19:40:32 PDT 2026 ===
+  ibm07 proxy=1.0320 (verified=1.0324, Δ=-0.0004) cong=1.363 wall=3514s
+  running mean: 1.1236 (verified mean of completed: 1.1281, Δ=-0.0045)
+=== ibm03: started Wed May  6 20:39:06 PDT 2026 ===
+  ibm03 proxy=0.8963 (verified=0.9166, Δ=-0.0203) cong=1.106 wall=3503s
+  running mean: 1.0781 (verified mean of completed: 1.0858, Δ=-0.0077)
+=== ibm08: started Wed May  6 21:37:29 PDT 2026 ===
+  ibm08 proxy=1.0266 (verified=1.0291, Δ=-0.0025) cong=1.349 wall=3506s
+  running mean: 1.0695 (verified mean of completed: 1.0763, Δ=-0.0068)
+=== ibm15: started Wed May  6 22:35:55 PDT 2026 ===
+  ibm15 proxy=1.0888 (verified=1.0835, Δ=+0.0053) cong=1.454 wall=3591s
+  running mean: 1.0723 (verified mean of completed: 1.0774, Δ=-0.0051)
+=== ibm02: started Wed May  6 23:35:46 PDT 2026 ===
+  ibm02 proxy=0.9389 (verified=0.9482, Δ=-0.0093) cong=1.123 wall=3508s
+  running mean: 1.0556 (verified mean of completed: 1.0612, Δ=-0.0056)
+=== ibm04: started Thu May  7 00:34:14 PDT 2026 ===
+  ibm04 proxy=0.9172 (verified=0.9287, Δ=-0.0115) cong=1.159 wall=3473s
+  running mean: 1.0402 (verified mean of completed: 1.0465, Δ=-0.0063)
+=== ibm16: started Thu May  7 01:32:07 PDT 2026 ===
+  ibm16 proxy=1.0527 (verified=1.0435, Δ=+0.0092) cong=1.436 wall=3246s
+  running mean: 1.0415 (verified mean of completed: 1.0462, Δ=-0.0047)
+=== ibm17: started Thu May  7 02:26:13 PDT 2026 ===
+  ibm17 proxy=1.2743 (verified=1.2813, Δ=-0.0070) cong=1.842 wall=3386s
+  running mean: 1.0626 (verified mean of completed: 1.0676, Δ=-0.0050)
+=== ibm13: started Thu May  7 03:22:39 PDT 2026 ===
+  ibm13 proxy=0.8781 (verified=0.8757, Δ=+0.0024) cong=1.104 wall=3536s
+  running mean: 1.0473 (verified mean of completed: 1.0516, Δ=-0.0043)
+=== ibm10: started Thu May  7 04:21:35 PDT 2026 ===
+  ibm10 proxy=0.9529 (verified=0.9492, Δ=+0.0037) cong=1.260 wall=2786s
+  running mean: 1.0400 (verified mean of completed: 1.0437, Δ=-0.0037)
+=== ibm14: started Thu May  7 05:08:01 PDT 2026 ===
+  ibm14 proxy=1.1111 (verified=1.1070, Δ=+0.0041) cong=1.531 wall=3671s
+  running mean: 1.0451 (verified mean of completed: 1.0482, Δ=-0.0031)
+=== ibm01: started Thu May  7 06:09:12 PDT 2026 ===
+  ibm01 proxy=0.7700 (verified=0.7653, Δ=+0.0047) cong=0.868 wall=2530s
+  running mean: 1.0267 (verified mean of completed: 1.0294, Δ=-0.0027)
+=== ibm11: started Thu May  7 06:51:22 PDT 2026 ===
+  ibm11 proxy=0.7954 (verified=0.8013, Δ=-0.0059) cong=0.948 wall=3534s
+  running mean: 1.0123 (verified mean of completed: 1.0151, Δ=-0.0028)
+=== ibm09: started Thu May  7 07:50:16 PDT 2026 ===
+  ibm09 proxy=0.7610 (verified=0.7628, Δ=-0.0018) cong=0.872 wall=3459s
+  running mean: 0.9975 (verified mean of completed: 1.0003, Δ=-0.0028)
+
+=== FINAL ===
+  17/17 valid benches
+  albania1 mean: 0.9975
+  verified mean (matched benches): 1.0003
+  Δ mean: -0.0028
+DONE
