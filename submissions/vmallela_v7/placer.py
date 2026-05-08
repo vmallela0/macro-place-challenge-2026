@@ -329,6 +329,61 @@ class OptimalPlacer:
                 print(f"  [v7] RECURSIVE_BISECT failed: {e} — "
                       f"falling back to .plc init", flush=True)
 
+        # albania2 Bet A: Phase 0 homotopy spreader as warm-start.
+        # CVaR-density + cosine λ-ramp from .plc init. Smoke-tested
+        # to improve standalone proxy by ~6% on ibm06; if v6 + Hessian
+        # carry that lift through, it's a real win.
+        # Mutually exclusive with RECURSIVE_BISECT (whichever fires first
+        # produces the warm-start; gated by env vars).
+        if os.environ.get("PLACER_V7_PHASE0", "0") == "1":
+            try:
+                from _phase0_electrostatic import electrostatic_spread_homotopy
+                import importlib.util as _ilu_p0
+                v1_spec_p0 = _ilu_p0.spec_from_file_location(
+                    "_v1_phase0",
+                    str(_HERE.parent / "vmallela" / "placer.py"))
+                v1_p0 = _ilu_p0.module_from_spec(v1_spec_p0)
+                v1_spec_p0.loader.exec_module(v1_p0)
+                bench_for_p0 = Benchmark.load(bench_path)
+                plc_p0 = v1_p0._load_plc(bench_for_p0.name)
+                incr_p0 = v1_p0.IncrementalEvaluator(plc_p0, bench_for_p0)
+                p0_n_iters = int(os.environ.get(
+                    "PLACER_V7_PHASE0_ITERS", "500"))
+                p0_n_stages = int(os.environ.get(
+                    "PLACER_V7_PHASE0_STAGES", "20"))
+                p0_lambda_0 = float(os.environ.get(
+                    "PLACER_V7_PHASE0_LAMBDA_0", "0.05"))
+                p0_lambda_f = float(os.environ.get(
+                    "PLACER_V7_PHASE0_LAMBDA_F", "2.0"))
+                p0_lr_frac = float(os.environ.get(
+                    "PLACER_V7_PHASE0_LR_FRAC", "0.001"))
+                t_p0 = time.time()
+                phase0_pos = electrostatic_spread_homotopy(
+                    bench_for_p0, incr_p0,
+                    n_iters=p0_n_iters,
+                    n_stages=p0_n_stages,
+                    lambda_0=p0_lambda_0,
+                    lambda_f=p0_lambda_f,
+                    lr_frac_canvas=p0_lr_frac,
+                    init_from_plc=True,
+                    soft_only=False,
+                    verbose=True)
+                # Save the warm-start as a modified .pt next to the bench
+                # (must live inside benchmarks/processed/public/ — see
+                # ROOT computation note in RECURSIVE_BISECT block).
+                bench_for_p0.macro_positions = torch.tensor(
+                    phase0_pos.astype(np.float32))
+                bench_dir = _HERE.parents[1] / "benchmarks" / "processed" / "public"
+                p0_path = bench_dir / f"{bench_for_p0.name}_phase0.pt"
+                bench_for_p0.save(str(p0_path))
+                print(f"  [v7] PHASE0 saved warm-start to {p0_path} "
+                      f"in {time.time()-t_p0:.1f}s; v4 will use it as init",
+                      flush=True)
+                bench_path = str(p0_path)
+            except Exception as e:
+                print(f"  [v7] PHASE0 failed: {type(e).__name__}: {e} — "
+                      f"falling back to .plc init", flush=True)
+
         # albania1: optional fast-path — skip v4+Lap by loading a saved
         # post-Lap placement. Used for clean A/B testing of Hessian
         # variants without v4-baseline variance.
@@ -1335,15 +1390,40 @@ class OptimalPlacer:
                   f"dens_weight={dens_weight if hybrid_density else 0})",
                   flush=True)
 
+        # albania2: HPWL surrogate model selector. "lse" = LSE-HPWL (current
+        # default — only bbox-extreme pins drive gradient at τ=50). "b2b" =
+        # pairwise-Manhattan / (K-1) where every pin in a net pulls every
+        # other pin (denser gradient, equals HPWL exactly at K=2).
+        hpwl_model = os.environ.get("PLACER_V7_HPWL_MODEL", "lse").lower()
+        if hpwl_model == "b2b":
+            from _smooth_proxy import (build_b2b_pair_indices,
+                                          b2b_hpwl_vectorized)
+            pair_a, pair_b, pair_w = build_b2b_pair_indices(
+                pin_to_net_t.cpu(), n_nets)
+            pair_a = pair_a.to(device)
+            pair_b = pair_b.to(device)
+            pair_w = pair_w.to(device).to(torch.float32)
+            pair_to_net = pin_to_net_t[pair_a]
+            print(f"  [v7] hessian: HPWL_MODEL=b2b "
+                  f"(n_pairs={int(pair_a.shape[0])}, "
+                  f"avg/net={float(pair_a.shape[0])/max(n_nets,1):.2f})",
+                  flush=True)
+
         def smooth_proxy_call(macro_pos_var):
             is_port = (pin_macro_t < 0)
             safe = torch.where(is_port, torch.zeros_like(pin_macro_t), pin_macro_t)
             macro_xy = macro_pos_var[safe]
             pin_x = torch.where(is_port, pin_xoff_t, macro_xy[:, 0] + pin_xoff_t)
             pin_y = torch.where(is_port, pin_yoff_t, macro_xy[:, 1] + pin_yoff_t)
-            hpwl = lse_hpwl_vectorized(
-                pin_x, pin_y, pin_to_net_t, net_weight_t, n_nets,
-                cw=cw_f, ch=ch_f, net_cnt=net_cnt, tau_lse=50.0)
+            if hpwl_model == "b2b":
+                hpwl = b2b_hpwl_vectorized(
+                    pin_x, pin_y, pair_a, pair_b, pair_w, pair_to_net,
+                    net_weight_t, n_nets,
+                    cw=cw_f, ch=ch_f, net_cnt=net_cnt)
+            else:
+                hpwl = lse_hpwl_vectorized(
+                    pin_x, pin_y, pin_to_net_t, net_weight_t, n_nets,
+                    cw=cw_f, ch=ch_f, net_cnt=net_cnt, tau_lse=50.0)
             rho = smooth_density_grid(
                 macro_pos_var, macro_w_haloed, macro_h_haloed, cell_idx_d,
                 incr.grid_col, incr.grid_row,

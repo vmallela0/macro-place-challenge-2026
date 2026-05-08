@@ -290,6 +290,99 @@ def lse_hpwl_vectorized(
     return hpwl_total / ((cw + ch) * net_cnt)
 
 
+# ============================================================================
+# albania2: B2B (pairwise) HPWL surrogate.
+#
+# For a net with K pins, the pairwise-Manhattan-sum scaled by 1/(K-1):
+#   B2B_x(net) = (1/(K-1)) · Σ_{i<j} |x_i - x_j|
+# At K=2 this is exactly HPWL; at K≥3 it gives every pin a dense gradient
+# instead of only the bbox-extreme pins (which is what LSE-HPWL gives at
+# τ=50). Dense gradients spread the optimizer's "pull" across all pins,
+# producing smoother saddle-escape directions.
+#
+# Mathematically: pairwise-Manhattan-sum / (K-1) = pairwise mean spread,
+# and the expected pairwise distance approaches HPWL as the pins
+# uniformize across the bbox. The 1/(K-1) factor matches HPWL exactly
+# at K=2 and is a tight upper bound at K≥3.
+#
+# Pre-computation: for each net we enumerate its pin pairs once. With
+# typical K_max ≤ 20 across our benches, total pairs ≈ K_max² × n_nets ≤
+# a few hundred thousand — fully tractable.
+# ============================================================================
+
+
+def build_b2b_pair_indices(
+    pin_to_net: torch.Tensor,          # (n_pins,) long
+    n_nets: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pre-compute (pair_pin_a, pair_pin_b, pair_weight) for B2B.
+
+    For each net with K pins, every unordered pin pair (i, j) gets a
+    weight of 1/(K-1). The weight is chosen so that B2B equals HPWL for
+    K=2 nets (single pair, weight=1).
+
+    Inputs and outputs are CPU long tensors; caller moves to device.
+    Returns:
+        pair_a, pair_b: shape (n_pairs,) long — pin indices for each pair
+        pair_w: shape (n_pairs,) float — 1/(K-1) for the pair's net
+    """
+    pin_to_net_np = pin_to_net.detach().cpu().numpy()
+    # Group pins by net.
+    import numpy as _np
+    n_pins = int(pin_to_net_np.shape[0])
+    per_net_pins: list[list[int]] = [[] for _ in range(n_nets)]
+    for i in range(n_pins):
+        nid = int(pin_to_net_np[i])
+        if 0 <= nid < n_nets:
+            per_net_pins[nid].append(i)
+    pair_a: list[int] = []
+    pair_b: list[int] = []
+    pair_w: list[float] = []
+    for pins in per_net_pins:
+        K = len(pins)
+        if K < 2:
+            continue
+        w = 1.0 / float(K - 1)
+        # All unordered pin pairs in this net.
+        for ii in range(K):
+            for jj in range(ii + 1, K):
+                pair_a.append(pins[ii])
+                pair_b.append(pins[jj])
+                pair_w.append(w)
+    return (torch.tensor(pair_a, dtype=torch.long),
+            torch.tensor(pair_b, dtype=torch.long),
+            torch.tensor(pair_w, dtype=torch.float32))
+
+
+def b2b_hpwl_vectorized(
+    pin_x: torch.Tensor,                # (n_pins,) requires_grad
+    pin_y: torch.Tensor,                # (n_pins,) requires_grad
+    pair_a: torch.Tensor,               # (n_pairs,) long
+    pair_b: torch.Tensor,               # (n_pairs,) long
+    pair_w: torch.Tensor,               # (n_pairs,) float
+    pair_to_net: torch.Tensor,          # (n_pairs,) long — net index per pair
+    net_weight: torch.Tensor,           # (n_nets,) float
+    n_nets: int,
+    cw: float, ch: float, net_cnt: float,
+) -> torch.Tensor:
+    """B2B-style HPWL surrogate: pairwise-Manhattan-sum / (K-1) per net.
+
+    Differentiable. For each pin pair (a, b) in a net, the contribution
+    is `pair_w · (|x_a - x_b| + |y_a - y_b|)`. Summed by net, weighted
+    by net_weight, and normalized by `(cw+ch)·net_cnt` exactly like
+    `lse_hpwl_vectorized` so the two surrogates are directly
+    interchangeable in the same Hessian pipeline.
+    """
+    dx = (pin_x[pair_a] - pin_x[pair_b]).abs()
+    dy = (pin_y[pair_a] - pin_y[pair_b]).abs()
+    pair_cost = pair_w * (dx + dy)                     # (n_pairs,)
+    # Aggregate by net.
+    per_net = torch.zeros(n_nets, device=pin_x.device, dtype=pin_x.dtype)
+    per_net.scatter_add_(0, pair_to_net, pair_cost)
+    total = (net_weight * per_net).sum()
+    return total / ((cw + ch) * net_cnt)
+
+
 def smooth_proxy_for_v7(
     macro_pos: torch.Tensor,           # (n_total, 2) requires_grad
     t_density: torch.Tensor,           # () requires_grad
