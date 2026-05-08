@@ -397,3 +397,218 @@ def electrostatic_spread_homotopy(
         print(f"  [phase0.homotopy] DONE in {time.time()-t0:.1f}s, "
               f"{step} Adam steps", flush=True)
     return final_pos
+
+
+def electrostatic_spread_homotopy_overlap_aware(
+    bench, incr,
+    *,
+    n_iters: int = 500, n_stages: int = 20,
+    lr_frac_canvas: float = 0.001,
+    lambda_0: float = 0.05, lambda_f: float = 2.0,
+    overlap_weight_0: float = 0.0,
+    overlap_weight_f: float = 5.0,
+    tau_lse: float = 50.0,
+    seed: int = 42,
+    init_from_plc: bool = True,
+    soft_only: bool = False,
+    snapshot_every: int = 20,
+    overlap_recompute_every: int = 25,
+    verbose: bool = False,
+):
+    """Phase 0 with overlap-aware penalty in addition to density.
+
+    Adds soft margin penalty:
+        L_overlap = Σ_{(i,j) overlapping} (max(0, sep_x_ij - |dx|))² +
+                    (max(0, sep_y_ij - |dy|))²
+    where sep_x_ij = (w_i + w_j)/2, sep_y_ij = (h_i + h_j)/2.
+
+    Overlap pairs recomputed every `overlap_recompute_every` steps via
+    O(N²) pairwise check on hard macros (cheap for N≤2000).
+
+    Cosine ramp on BOTH λ (density) and overlap_weight, so the optimizer
+    starts HPWL-driven, gradually adds density push-apart, finally adds
+    explicit overlap repair.
+    """
+    from _smooth_proxy import (lse_hpwl_vectorized, build_pin_to_net,
+                                  cvar_smooth)
+    from _cell_window import (build_window_indices, smooth_density_grid)
+
+    device = _select_device()
+    n_total = int(np.asarray(incr.macro_pos).shape[0])
+    n_hard = bench.num_hard_macros
+    cw, ch = float(incr.cw), float(incr.ch)
+    canvas_diag = float(np.hypot(cw, ch))
+
+    pin_macro_t = torch.tensor(np.asarray(incr.pin_macro), dtype=torch.long,
+                                  device=device)
+    pin_xoff_t = torch.tensor(np.asarray(incr.pin_xoff), dtype=torch.float32,
+                                 device=device)
+    pin_yoff_t = torch.tensor(np.asarray(incr.pin_yoff), dtype=torch.float32,
+                                 device=device)
+    net_starts_t = torch.tensor(np.asarray(incr.net_starts), dtype=torch.long,
+                                   device=device)
+    net_weight_t = torch.tensor(np.asarray(incr.net_weight),
+                                   dtype=torch.float32, device=device)
+    macro_w_t = torch.tensor(np.asarray(incr.macro_w), dtype=torch.float32,
+                                device=device)
+    macro_h_t = torch.tensor(np.asarray(incr.macro_h), dtype=torch.float32,
+                                device=device)
+    pin_to_net_t = build_pin_to_net(net_starts_t)
+    n_nets = int(net_weight_t.shape[0])
+    net_cnt = float(incr.net_cnt)
+
+    if init_from_plc:
+        init_pos = np.asarray(incr.macro_pos).copy().astype(np.float32)
+    else:
+        rng = np.random.RandomState(seed)
+        init_pos = np.zeros((n_total, 2), dtype=np.float32)
+        macro_w_np = np.asarray(incr.macro_w)
+        macro_h_np = np.asarray(incr.macro_h)
+        for m in range(n_total):
+            hw = macro_w_np[m] / 2.0; hh = macro_h_np[m] / 2.0
+            init_pos[m, 0] = rng.uniform(hw, max(hw + 1e-3, cw - hw))
+            init_pos[m, 1] = rng.uniform(hh, max(hh + 1e-3, ch - hh))
+
+    macro_pos = torch.tensor(init_pos, dtype=torch.float32,
+                                device=device, requires_grad=True)
+    t_dens = torch.tensor(0.0, dtype=torch.float32,
+                              device=device, requires_grad=True)
+
+    # Pairwise overlap detection on HARD macros (soft macros allowed to
+    # overlap by competition spec).
+    macro_w_np = np.asarray(incr.macro_w)[:n_hard]
+    macro_h_np = np.asarray(incr.macro_h)[:n_hard]
+    sep_x_full = ((macro_w_np[:, None] + macro_w_np[None, :]) / 2.0).astype(np.float32)
+    sep_y_full = ((macro_h_np[:, None] + macro_h_np[None, :]) / 2.0).astype(np.float32)
+
+    def find_overlapping_pairs(pos_np: np.ndarray) -> torch.Tensor:
+        """Returns shape (n_pairs, 2) torch.long; or empty tensor if none."""
+        if n_hard < 2:
+            return torch.zeros((0, 2), dtype=torch.long, device=device)
+        p = pos_np[:n_hard]
+        dx = np.abs(p[:, 0:1] - p[:, 0:1].T)
+        dy = np.abs(p[:, 1:2] - p[:, 1:2].T)
+        ov = (dx < sep_x_full) & (dy < sep_y_full)
+        np.fill_diagonal(ov, False)
+        ov = np.triu(ov, k=1)
+        pairs = np.argwhere(ov)
+        if pairs.size == 0:
+            return torch.zeros((0, 2), dtype=torch.long, device=device)
+        return torch.tensor(pairs, dtype=torch.long, device=device)
+
+    cell_idx_d, _ = build_window_indices(
+        macro_pos.detach(), macro_w_t, macro_h_t,
+        grid_col=incr.grid_col, grid_row=incr.grid_row,
+        grid_w=incr.grid_width, grid_h=incr.grid_height,
+        margin_cells=4)
+
+    lr = lr_frac_canvas * canvas_diag
+    opt = torch.optim.Adam([macro_pos, t_dens], lr=lr)
+    n_iters_per_stage = max(1, int(n_iters // n_stages))
+
+    def lam_at_stage(k, lo, hi):
+        if n_stages <= 1: return float(hi)
+        u = float(k) / float(n_stages - 1)
+        cf = 0.5 * (1.0 - float(np.cos(np.pi * u)))
+        return float(lo + (hi - lo) * cf)
+
+    if verbose:
+        print(f"  [phase0.ovaware] init={'plc' if init_from_plc else 'random'}, "
+              f"n_total={n_total}, n_hard={n_hard}, "
+              f"λ ramp [{lambda_0:.3f}→{lambda_f:.3f}], "
+              f"ov ramp [{overlap_weight_0:.3f}→{overlap_weight_f:.3f}]",
+              flush=True)
+
+    macro_w_t_h = macro_w_t[:n_hard]
+    macro_h_t_h = macro_h_t[:n_hard]
+    overlap_pairs = find_overlapping_pairs(macro_pos.detach().cpu().numpy())
+
+    t0 = time.time()
+    step = 0
+    for stage in range(n_stages):
+        lam = lam_at_stage(stage, lambda_0, lambda_f)
+        ov_w = lam_at_stage(stage, overlap_weight_0, overlap_weight_f)
+        for substep in range(n_iters_per_stage):
+            opt.zero_grad()
+            if step > 0 and step % snapshot_every == 0:
+                cell_idx_d, _ = build_window_indices(
+                    macro_pos.detach(), macro_w_t, macro_h_t,
+                    grid_col=incr.grid_col, grid_row=incr.grid_row,
+                    grid_w=incr.grid_width, grid_h=incr.grid_height,
+                    margin_cells=4)
+            if step > 0 and step % overlap_recompute_every == 0:
+                overlap_pairs = find_overlapping_pairs(
+                    macro_pos.detach().cpu().numpy())
+
+            is_port = (pin_macro_t < 0)
+            safe = torch.where(is_port, torch.zeros_like(pin_macro_t),
+                                  pin_macro_t)
+            macro_xy = macro_pos[safe]
+            pin_x = torch.where(is_port, pin_xoff_t,
+                                  macro_xy[:, 0] + pin_xoff_t)
+            pin_y = torch.where(is_port, pin_yoff_t,
+                                  macro_xy[:, 1] + pin_yoff_t)
+            hpwl = lse_hpwl_vectorized(
+                pin_x, pin_y, pin_to_net_t, net_weight_t, n_nets,
+                cw=cw, ch=ch, net_cnt=net_cnt, tau_lse=tau_lse)
+            rho = smooth_density_grid(
+                macro_pos, macro_w_t, macro_h_t, cell_idx_d,
+                incr.grid_col, incr.grid_row,
+                incr.grid_width, incr.grid_height,
+                n_cells=incr.n_cells, cell_area=incr.grid_area, mu=100.0)
+            K_d = max(1, int(0.10 * incr.n_cells))
+            density_term = cvar_smooth(rho, K_d, t_dens, mu=100.0)
+
+            # Overlap repair penalty (only on hard macros).
+            ov_term = torch.zeros((), dtype=torch.float32, device=device)
+            if overlap_pairs.shape[0] > 0 and ov_w > 1e-6:
+                a_idx = overlap_pairs[:, 0]
+                b_idx = overlap_pairs[:, 1]
+                pa = macro_pos[a_idx]
+                pb = macro_pos[b_idx]
+                dx = (pa[:, 0] - pb[:, 0]).abs()
+                dy = (pa[:, 1] - pb[:, 1]).abs()
+                sep_x = (macro_w_t_h[a_idx] + macro_w_t_h[b_idx]) / 2.0
+                sep_y = (macro_h_t_h[a_idx] + macro_h_t_h[b_idx]) / 2.0
+                # Penalize the SHORTER axis only — that's the axis along
+                # which moving will resolve the overlap with minimum
+                # disruption. Squared-soft-margin per pair.
+                margin_x = torch.relu(sep_x - dx)
+                margin_y = torch.relu(sep_y - dy)
+                # min margin = the resolving axis
+                margin = torch.minimum(margin_x, margin_y)
+                ov_term = (margin * margin).sum()
+                # Normalize by canvas² so it's scale-invariant
+                ov_term = ov_term / (canvas_diag * canvas_diag)
+
+            loss = hpwl + lam * density_term + ov_w * ov_term
+            loss.backward()
+            if soft_only and n_hard > 0:
+                with torch.no_grad():
+                    if macro_pos.grad is not None:
+                        macro_pos.grad[:n_hard] = 0.0
+            opt.step()
+            with torch.no_grad():
+                half_w = macro_w_t / 2.0
+                half_h = macro_h_t / 2.0
+                macro_pos[:, 0] = torch.clamp(macro_pos[:, 0],
+                                                  min=half_w,
+                                                  max=cw - half_w)
+                macro_pos[:, 1] = torch.clamp(macro_pos[:, 1],
+                                                  min=half_h,
+                                                  max=ch - half_h)
+            step += 1
+        if verbose:
+            print(f"  [phase0.ovaware] stage {stage:2d}/{n_stages-1}: "
+                  f"λ={lam:.4f}  ov_w={ov_w:.4f}  "
+                  f"loss={loss.item():.4f}  hpwl={hpwl.item():.4f}  "
+                  f"density={density_term.item():.4f}  "
+                  f"ov_pairs={overlap_pairs.shape[0]}  "
+                  f"ov_term={ov_term.item():.4f} ({time.time()-t0:.1f}s)",
+                  flush=True)
+
+    final_pos = macro_pos.detach().cpu().numpy().astype(np.float32)
+    if verbose:
+        print(f"  [phase0.ovaware] DONE in {time.time()-t0:.1f}s, "
+              f"{step} steps", flush=True)
+    return final_pos
