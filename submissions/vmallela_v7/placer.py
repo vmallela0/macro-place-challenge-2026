@@ -108,6 +108,30 @@ for _k, _v in [
     ("PLACER_V7_HESSIAN_HPWL_WEIGHT", "1.0"),
     ("PLACER_V7_HESSIAN_DENS_WEIGHT", "0.5"),
     ("PLACER_V7_HESSIAN_CONG_WEIGHT", "0.5"),
+    # zeus: Differentiable RUDY routing demand. When enabled (=1), the
+    # frozen V_routing_smooth / H_routing_smooth tensors are replaced
+    # with the Spindler-Johannes RUDY surrogate computed from the
+    # current pin positions via LSE-bbox + softplus cell overlap. See
+    # _rudy_smooth.py for the math and research/ITERATIONS.md (Iter 4d,
+    # 7) for why this matters: the existing cong-aware Hessian was
+    # bench-noise because routing was FROZEN — the eigvec direction
+    # was good on the stale map but actively wrong on the live map.
+    # Default 0 for backwards compatibility with verified 0.9975 sweep.
+    ("PLACER_V7_HESSIAN_RUDY", "0"),
+    ("PLACER_V7_HESSIAN_RUDY_MARGIN", "4"),
+    ("PLACER_V7_HESSIAN_RUDY_MAX_WINDOW", "64"),
+    # zeus: Subspace Hamiltonian Monte Carlo escape (see _subspace_hmc.py).
+    # When K>0 and TRAJ>0, after the adaptive line-search candidates are
+    # generated, run an additional Lanczos call to get K eigvecs of the
+    # smooth-surrogate Hessian, then sample TRAJ HMC trajectories with
+    # random momentum p ~ N(0, |Λ_K|). Each trajectory's endpoint becomes
+    # one additional candidate; the existing strict-improvement gate
+    # against EXACT proxy filters out bad samples. Default off (0,0).
+    ("PLACER_V7_HESSIAN_HMC_K", "0"),
+    ("PLACER_V7_HESSIAN_HMC_TRAJ", "0"),
+    ("PLACER_V7_HESSIAN_HMC_L", "12"),
+    ("PLACER_V7_HESSIAN_HMC_STEP", "0.5"),
+    ("PLACER_V7_HESSIAN_HMC_CAP", "0.20"),
     # Per-bench auto-tuned cong weight based on netlist demand/supply
     # residual (research/lower_bounds/cong_difficulty.csv). High-room
     # benches benefit from aggressive cong weighting; low-room benches
@@ -1372,6 +1396,71 @@ class OptimalPlacer:
             print("  [v7] hessian: congestion DISABLED "
                   "(PLACER_V7_HESSIAN_CONG=0)", flush=True)
 
+        # zeus: Differentiable RUDY routing demand. When enabled, the
+        # frozen V_routing_smooth/H_routing_smooth are replaced with a
+        # per-call RUDY computation that flows gradients through pin
+        # positions to macro_pos. See _rudy_smooth.smooth_rudy_routing.
+        rudy_enabled = (cong_enabled and
+                         os.environ.get("PLACER_V7_HESSIAN_RUDY", "0") == "1")
+        net_cell_idx_t = None
+        rudy_scale = 1.0
+        pair_net_t = pair_cell_t = None
+        if rudy_enabled:
+            from _rudy_smooth import (build_net_window_indices_sparse,
+                                       smooth_rudy_routing_sparse)
+            rudy_margin = int(os.environ.get(
+                "PLACER_V7_HESSIAN_RUDY_MARGIN", "4"))
+            rudy_max_window = int(os.environ.get(
+                "PLACER_V7_HESSIAN_RUDY_MAX_WINDOW", "256"))
+            # Compute pin coords at current state for window construction.
+            with torch.no_grad():
+                _is_port = (pin_macro_t < 0)
+                _safe = torch.where(_is_port,
+                                     torch.zeros_like(pin_macro_t),
+                                     pin_macro_t)
+                _macro_xy = macro_pos_t[_safe]
+                pin_x_init = torch.where(_is_port, pin_xoff_t,
+                                          _macro_xy[:, 0] + pin_xoff_t)
+                pin_y_init = torch.where(_is_port, pin_yoff_t,
+                                          _macro_xy[:, 1] + pin_yoff_t)
+            t_rudy_win = time.time()
+            pair_net_t, pair_cell_t, n_pairs, n_dropped = \
+                build_net_window_indices_sparse(
+                    pin_x_init, pin_y_init, pin_to_net_t, n_nets,
+                    incr.grid_col, incr.grid_row,
+                    incr.grid_width, incr.grid_height,
+                    margin_cells=rudy_margin,
+                    max_window_cells=rudy_max_window)
+            # Auto-scale so V_rudy's median matches V_smooth_frozen's
+            # median at the initial state. Keeps the cong surrogate's
+            # absolute magnitude comparable to the verified config —
+            # CVaR top-K and cong_weight calibration are preserved.
+            rudy_scale_env = float(
+                os.environ.get("PLACER_V7_HESSIAN_RUDY_SCALE", "0"))
+            with torch.no_grad():
+                V_init, H_init = smooth_rudy_routing_sparse(
+                    pin_x_init, pin_y_init, pin_to_net_t, net_weight_t,
+                    n_nets, pair_net_t, pair_cell_t,
+                    incr.grid_col, incr.grid_row,
+                    incr.grid_width, incr.grid_height,
+                    n_cells=incr.n_cells)
+                if rudy_scale_env > 0.0:
+                    rudy_scale = rudy_scale_env
+                else:
+                    Vp = V_init[V_init > 1e-9]
+                    Vf = V_smooth_frozen[V_smooth_frozen > 1e-9] if V_smooth_frozen is not None else None
+                    v_med_rudy = float(Vp.median().item()) if Vp.numel() > 0 else 1.0
+                    v_med_fr = float(Vf.median().item()) if (Vf is not None and Vf.numel() > 0) else 1.0
+                    rudy_scale = (v_med_fr * float(grid_v_routes)
+                                   / max(v_med_rudy, 1e-9))
+            print(f"  [v7] hessian: RUDY differentiable routing ENABLED "
+                  f"(n_pairs={n_pairs}, dropped={n_dropped}, "
+                  f"margin={rudy_margin}, max_win={rudy_max_window}, "
+                  f"scale={rudy_scale:.4f}, "
+                  f"V_init.med={float(V_init[V_init>1e-9].median()) if (V_init>1e-9).any() else 0:.4e}, "
+                  f"V_fr.med={(float(V_smooth_frozen[V_smooth_frozen>1e-9].median()) if (V_smooth_frozen is not None and (V_smooth_frozen>1e-9).any()) else 0):.4e}, "
+                  f"win {time.time()-t_rudy_win:.2f}s)", flush=True)
+
         electro_enabled = (
             os.environ.get("PLACER_V7_HESSIAN_ELECTROSTATIC", "0") == "1")
         electro_weight = float(
@@ -1476,8 +1565,23 @@ class OptimalPlacer:
                     vrouting_alloc=v_alloc,
                     hrouting_alloc=h_alloc,
                     mu=100.0)
-                V_total = V_smooth_frozen + V_macro / max(grid_v_routes, 1e-9)
-                H_total = H_smooth_frozen + H_macro / max(grid_h_routes, 1e-9)
+                if rudy_enabled:
+                    # zeus: differentiable per-net routing demand (sparse
+                    # COO) replaces the frozen V/H_routing_smooth, so the
+                    # eigvec direction tracks the live congestion gradient
+                    # (not the stale one). See _rudy_smooth.py.
+                    from _rudy_smooth import smooth_rudy_routing_sparse
+                    V_rudy, H_rudy = smooth_rudy_routing_sparse(
+                        pin_x, pin_y, pin_to_net_t, net_weight_t, n_nets,
+                        pair_net_t, pair_cell_t,
+                        incr.grid_col, incr.grid_row,
+                        incr.grid_width, incr.grid_height,
+                        n_cells=incr.n_cells)
+                    V_total = (rudy_scale * V_rudy + V_macro) / max(grid_v_routes, 1e-9)
+                    H_total = (rudy_scale * H_rudy + H_macro) / max(grid_h_routes, 1e-9)
+                else:
+                    V_total = V_smooth_frozen + V_macro / max(grid_v_routes, 1e-9)
+                    H_total = H_smooth_frozen + H_macro / max(grid_h_routes, 1e-9)
                 combined = torch.cat([V_total, H_total], dim=0)
                 with torch.no_grad():
                     t_c = torch.quantile(
@@ -1584,17 +1688,72 @@ class OptimalPlacer:
                     print(f"  [v7] hessian: kdim Newton candidate added "
                           f"({kd_label}); total candidates={len(candidates)}",
                           flush=True)
+            # zeus: Subspace Hamiltonian Monte Carlo escape, added as an
+            # additional candidate generator alongside the per-eigvec line
+            # searches. See _subspace_hmc.py for the math. When enabled,
+            # we run a SEPARATE Lanczos call to get a wider K-dim basis
+            # (the existing adaptive call may use k=1 only), then run
+            # HMC trajectories from random momentum in that subspace.
+            # The strict-improvement gate downstream filters bad samples.
+            hmc_K = int(os.environ.get("PLACER_V7_HESSIAN_HMC_K", "0"))
+            hmc_T = int(os.environ.get("PLACER_V7_HESSIAN_HMC_TRAJ", "0"))
+            if hmc_K > 0 and hmc_T > 0:
+                from _hessian_escape import hessian_min_eigvecs_topk
+                from _subspace_hmc import subspace_hmc_candidates
+                hmc_L = int(os.environ.get("PLACER_V7_HESSIAN_HMC_L", "12"))
+                hmc_h = float(os.environ.get("PLACER_V7_HESSIAN_HMC_STEP", "0.5"))
+                hmc_cap = float(os.environ.get("PLACER_V7_HESSIAN_HMC_CAP", "0.20"))
+                # Salt seed with the integer hash of the current macro state
+                # so each MAX_ITERS iter draws fresh momenta (and successive
+                # benches/seeds are independent).
+                state_salt = int((macro_pos_t.detach().sum().item()
+                                   * 1e6)) % 10_000_000
+                hmc_seed = (int(self.seed) + state_salt) & 0x7FFFFFFF
+                t_hmc = time.time()
+                # Use the eigeninfo from adaptive call if it has enough
+                # eigvecs, otherwise spend a separate Lanczos to get hmc_K.
+                ev = diag.get("eigvecs")
+                eg = diag.get("eigvals")
+                if ev is None or eg is None or ev.shape[1] < hmc_K:
+                    eg, ev = hessian_min_eigvecs_topk(
+                        smooth_proxy_call, macro_pos_t,
+                        k=hmc_K, n_lanczos_iters=n_lanczos_iters,
+                        tikhonov=tikhonov, verbose=False)
+                hmc_cands, hmc_diag = subspace_hmc_candidates(
+                    macro_pos_t, smooth_proxy_call, eg, ev,
+                    n_trajectories=hmc_T, n_leapfrog=hmc_L,
+                    step_size=hmc_h, canvas_diag=canvas_diag,
+                    n_hard=n_hard, soft_only=True, seed=hmc_seed,
+                    max_total_step_canvas=hmc_cap, verbose=True)
+                # Append HMC candidates with original-label form.
+                for lab, pos_np in hmc_cands:
+                    candidates.append((lab, pos_np))
+                print(f"  [v7] hessian: HMC added {len(hmc_cands)} candidates "
+                      f"(K={hmc_K}, T={hmc_T}, L={hmc_L}, h={hmc_h}, "
+                      f"{time.time()-t_hmc:.1f}s); total={len(candidates)}",
+                      flush=True)
+
             # Convert to (s, pos) tuple shape that the worker code below
             # expects (existing code uses `s` as a sortkey/seed-shifter).
             # We re-encode the ±step from the label into a numeric sortkey.
-            # kdim labels (e.g. "kdim_K3_r0.050") get sortkey 0.0.
-            candidates = [
-                (float(lab.split("_ls")[1])
-                 if isinstance(lab, str) and "_ls" in lab
-                 else 0.0,
-                 pos)
-                for lab, pos in candidates
-            ]
+            # kdim labels (e.g. "kdim_K3_r0.050") get sortkey 0.0; HMC
+            # labels (e.g. "hmc_t05_K6_dU-1.23") get a unique fractional
+            # sortkey so each worker gets a distinct seed.
+            def _label_to_sortkey(lab):
+                if not isinstance(lab, str):
+                    return 0.0
+                if "_ls" in lab:
+                    try: return float(lab.split("_ls")[1])
+                    except (ValueError, IndexError): return 0.0
+                if lab.startswith("hmc_t"):
+                    # Extract trajectory index for unique seed offset.
+                    try:
+                        tnum = int(lab[5:].split("_")[0])
+                        return 0.001 * (tnum + 1)
+                    except (ValueError, IndexError): return 0.0
+                return 0.0
+            candidates = [(_label_to_sortkey(lab), pos)
+                          for lab, pos in candidates]
             # Feasibility filter
             max_overlaps = int(os.environ.get(
                 "PLACER_V7_HESSIAN_MAX_OVERLAPS", "200"))
