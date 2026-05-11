@@ -1,0 +1,13 @@
+albania2 Phase 0 A/B (ibm06)
+  started: Thu May  7 18:42:10 PDT 2026
+  out: /tmp/albania2_phase0_ab_20260507_184210
+
+=== no_phase0 (PHASE0=0) starting Thu May  7 18:42:10 PDT 2026 ===
+  no_phase0: proxy=1.0717 cong=1.459 wall=3524s
+=== phase0 (PHASE0=1) starting Thu May  7 19:40:54 PDT 2026 ===
+  phase0: proxy=1.0804 cong=1.493 wall=3556s
+
+=== summary (ibm06, verified=1.0546) ===
+  no_phase0: proxy=1.0717 Δ=+0.0171
+  phase0: proxy=1.0804 Δ=+0.0258
+DONE

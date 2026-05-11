@@ -1,0 +1,23 @@
+albania2 stage-2: kdim + combined
+  started: Thu May  7 11:26:33 PDT 2026
+  out: /tmp/albania2_kdim_combined_ab_20260507_112633
+  benches: ibm06, ibm12
+  arms: kdim (K=1,S=0), combined (K=1,S=1)
+
+=== launching 4 runs in parallel ===
+  starting kdim_ibm06
+  starting combined_ibm06
+  starting kdim_ibm12
+  starting combined_ibm12
+  all 4 done in 3518s
+
+=== results ===
+  kdim_ibm06: proxy=1.0557 verified=1.0546 Δ=+0.0011
+  combined_ibm06: proxy=1.0550 verified=1.0546 Δ=+0.0004
+  kdim_ibm12: proxy=1.1660 verified=1.1557 Δ=+0.0103
+  combined_ibm12: proxy=1.1698 verified=1.1557 Δ=+0.0141
+
+=== summary ===
+  kdim mean: 1.1109
+  combined mean: 1.1124
+DONE

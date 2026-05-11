@@ -1,0 +1,6 @@
+[auto-decide] watching /tmp/albania2_phase0_ab_20260507_184210/sweep.log for DONE
+[auto-decide] Phase 0 A/B done at Thu May  7 20:40:38 PDT 2026
+[auto-decide] no_phase0=1.0717  phase0=1.0804  Δ=+0.0087  WIN=0
+[auto-decide] Phase 0 NOT a clear win. NOT launching full-17.
+[auto-decide] If you want to launch despite marginal result:
+[auto-decide]   bash scripts/albania2_phase0_full17.sh

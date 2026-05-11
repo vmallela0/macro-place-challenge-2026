@@ -1,0 +1,20 @@
+albania2 stage-3: spectral gain sweep
+  started: Thu May  7 12:25:29 PDT 2026
+  out: /tmp/albania2_spectral_gain_sweep_20260507_122529
+=== launching 4 runs ===
+  starting g0.1_ibm06
+  starting g-0.1_ibm06
+  starting g0.1_ibm12
+  starting g-0.1_ibm12
+  all 4 done in 3513s
+
+=== results ===
+  g0.1_ibm06: proxy=1.0557 verified=1.0546 Δ=+0.0011
+  g-0.1_ibm06: proxy=1.0522 verified=1.0546 Δ=-0.0024
+  g0.1_ibm12: proxy=1.1641 verified=1.1557 Δ=+0.0084
+  g-0.1_ibm12: proxy=1.1497 verified=1.1557 Δ=-0.0060
+
+=== summary ===
+  gain=0.1 mean: 1.1099
+  gain=-0.1 mean: 1.1010
+DONE

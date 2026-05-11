@@ -1,0 +1,23 @@
+albania2 spectral A/B
+  started: Thu May  7 10:08:10 PDT 2026
+  out: /tmp/albania2_spectral_ab_20260507_100810
+  benches: ibm06, ibm12
+
+=== launching 4 runs in parallel ===
+  starting baseline_ibm06
+  starting spectral_ibm06
+  starting baseline_ibm12
+  starting spectral_ibm12
+  all 4 done in 3524s
+
+=== results ===
+  baseline_ibm06: proxy=1.0507 verified=1.0546 Δ=-0.0039
+  spectral_ibm06: proxy=1.0498 verified=1.0546 Δ=-0.0048
+  baseline_ibm12: proxy=1.1446 verified=1.1557 Δ=-0.0111
+  spectral_ibm12: proxy=1.1525 verified=1.1557 Δ=-0.0032
+
+=== summary ===
+  baseline mean: 1.0977
+  spectral mean: 1.1012
+  Δ (spec - base): +0.0035
+DONE

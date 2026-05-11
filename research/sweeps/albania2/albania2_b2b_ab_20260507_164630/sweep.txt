@@ -1,0 +1,13 @@
+albania2 B2B A/B (ibm06)
+  started: Thu May  7 16:46:30 PDT 2026
+  out: /tmp/albania2_b2b_ab_20260507_164630
+
+=== lse (HPWL_MODEL=lse) starting Thu May  7 16:46:30 PDT 2026 ===
+  lse: proxy=1.0798 cong=1.478 wall=3314s
+=== b2b (HPWL_MODEL=b2b) starting Thu May  7 17:41:44 PDT 2026 ===
+  b2b: proxy=1.0662 cong=1.451 wall=3602s
+
+=== summary (ibm06, verified=1.0546) ===
+  lse: proxy=1.0798 Δ=+0.0252
+  b2b: proxy=1.0662 Δ=+0.0116
+DONE
