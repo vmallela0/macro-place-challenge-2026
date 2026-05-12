@@ -99,6 +99,8 @@ def subspace_hmc_candidates(
     soft_only: bool = True,
     seed: int = 42,
     max_total_step_canvas: float = 0.30, # cap ||x-x_0||/canvas_diag per traj
+    integrator: str = "leapfrog",        # zeus B1: "leapfrog" (2nd-order)
+                                          # or "yoshida4" (4th-order symplectic)
     verbose: bool = False,
 ) -> tuple[list, dict]:
     """Generate candidate placements via subspace HMC.
@@ -193,21 +195,52 @@ def subspace_hmc_candidates(
         return (g_a_t.detach().cpu().numpy().astype(np.float64),
                 float(U_t.item()))
 
+    # zeus B1 — Yoshida 4th-order symplectic composition.
+    # A 2nd-order leapfrog Φ_h has error O(h^3) per step. The 4th-order
+    # composition is
+    #     Φ4_h  =  Φ_{w1 h}  ∘  Φ_{w2 h}  ∘  Φ_{w1 h}
+    # with w1 = 1/(2-2^(1/3)) ≈ 1.3512, w2 = 1-2 w1 ≈ -1.7024
+    # (Yoshida 1990, "Construction of higher order symplectic integrators").
+    # Cost = 3× leapfrog substeps per "step", but error → O(h^5).
+    # Net: at the same wall-clock, we can take ~sqrt(h) larger effective
+    # step → longer trajectories without losing reversibility / symplecticity.
+    cbrt2 = 2.0 ** (1.0 / 3.0)
+    yoshida_w1 = 1.0 / (2.0 - cbrt2)
+    yoshida_w2 = -cbrt2 / (2.0 - cbrt2)
+    use_yoshida = (integrator == "yoshida4")
+
+    def _leapfrog_substep(a, p, sub_h):
+        # Kick-drift-kick form. Returns (a', p') after one Φ_{sub_h}.
+        g_a, _ = _grad_at(a)
+        p = p - 0.5 * sub_h * g_a
+        a = a + sub_h * inv_mass * p
+        g_a, _ = _grad_at(a)
+        p = p - 0.5 * sub_h * g_a
+        return a, p
+
     for traj in range(int(n_trajectories)):
         # Sample initial momentum p ~ N(0, M)
         p = rng.standard_normal(K_int) * sqrt_mass
         a = np.zeros(K_int, dtype=np.float64)
 
-        # Leapfrog
-        g_a, U0 = _grad_at(a)
-        p = p - 0.5 * h * g_a
-        for step in range(L):
-            a = a + h * inv_mass * p
+        _, U0 = _grad_at(a)
+        if use_yoshida:
+            # L outer steps, each a 3-substep Yoshida composition.
+            for _step in range(L):
+                a, p = _leapfrog_substep(a, p, yoshida_w1 * h)
+                a, p = _leapfrog_substep(a, p, yoshida_w2 * h)
+                a, p = _leapfrog_substep(a, p, yoshida_w1 * h)
+        else:
+            # Classic kick-drift-kick leapfrog, L steps total.
             g_a, _ = _grad_at(a)
-            if step == L - 1:
-                p = p - 0.5 * h * g_a
-            else:
-                p = p - h * g_a
+            p = p - 0.5 * h * g_a
+            for step in range(L):
+                a = a + h * inv_mass * p
+                g_a, _ = _grad_at(a)
+                if step == L - 1:
+                    p = p - 0.5 * h * g_a
+                else:
+                    p = p - h * g_a
 
         # Cap trajectory radius
         delta_xy = eigvecs @ a       # (N,)
@@ -237,6 +270,7 @@ def subspace_hmc_candidates(
 
     diag = {
         "method": "subspace_hmc",
+        "integrator": integrator,
         "n_trajectories": int(n_trajectories),
         "n_leapfrog": L,
         "step_size": h,
@@ -252,8 +286,94 @@ def subspace_hmc_candidates(
                             and np.isfinite(d["delta_U"]))
         med_radius = float(np.median(
             [d["radius_microns"] for d in diagnostics_per_traj]))
-        print(f"    [subspace-hmc] K={K_int} L={L} h={h:.3f} "
+        print(f"    [subspace-hmc] K={K_int} L={L} h={h:.3f} integ={integrator} "
               f"trajs={n_trajectories} surrogate-improving={n_improving} "
               f"med_radius={med_radius:.1f}μm  ({diag['wall_s']:.1f}s)",
               flush=True)
+    return candidates, diag
+
+
+# zeus B2 — Replica-overlap diverse subset selection (spin-glass inspired).
+#
+# The Parisi replica trick for spin glasses: when many replicas of the
+# same system are simulated, their pairwise overlap distribution P(q)
+# reveals the basin structure. If P(q) is peaked at high q, the
+# replicas are stuck in one basin (replica-symmetric). If P(q) has
+# multiple peaks, the system has many metastable basins (replica
+# symmetry broken — RSB).
+#
+# In our subspace-HMC, each trajectory = one replica. The overlap
+# between trajectory i and j is the inner product of their endpoints
+# in the K-dim eigvec coord system, normalized. We want maximum spread
+# of endpoints (cover diverse basins) rather than the lowest single
+# surrogate value. Algorithm: greedy farthest-point selection.
+
+def replica_diverse_select(
+    candidates: list,                     # list of (label, pos_np)
+    base_pos: np.ndarray,                 # original macro_pos shape (n,2)
+    n_select: int = 8,                    # candidates to keep
+    *,
+    candidate_diagnostics: list | None = None,  # optional, per-traj dicts
+) -> tuple[list, dict]:
+    """Greedy farthest-point selection on the candidate endpoint set.
+
+    Step 1: pick the candidate with lowest U_final as the seed.
+    Step k: pick the candidate maximizing min-distance to the
+        already-selected set (in placement-displacement L2 norm).
+
+    Returns (selected_candidates, diag).
+
+    Diag carries the pairwise overlap matrix and the chosen subset's
+    minimum spread — both useful for understanding the basin structure.
+    """
+    if not candidates:
+        return [], {"warn": "no candidates"}
+    n_cand = len(candidates)
+    if n_select >= n_cand:
+        return candidates, {"warn": f"n_select {n_select} ≥ n_cand {n_cand}; pass through"}
+
+    # Vectors of displacement from base, flattened to 1D per replica.
+    base = base_pos.reshape(-1).astype(np.float64)
+    disps = np.zeros((n_cand, base.size), dtype=np.float64)
+    for i, (_, pos_np) in enumerate(candidates):
+        disps[i, :] = pos_np.reshape(-1).astype(np.float64) - base
+    # Pairwise L2-distance matrix (replica overlap, in micron units).
+    sq = (disps ** 2).sum(axis=1)
+    D = np.sqrt(np.maximum(sq[:, None] + sq[None, :] - 2 * disps @ disps.T, 0))
+
+    # Greedy seed: lowest U_final if diagnostics provided; else first.
+    if candidate_diagnostics and len(candidate_diagnostics) == n_cand:
+        us = np.array([d.get("U_final", np.inf) for d in candidate_diagnostics])
+        us = np.where(np.isfinite(us), us, np.inf)
+        seed_idx = int(np.argmin(us))
+    else:
+        seed_idx = 0
+
+    selected_idx = [seed_idx]
+    available = set(range(n_cand)) - {seed_idx}
+    while len(selected_idx) < n_select and available:
+        # For each available i, min-distance to the selected set.
+        cands = np.array(sorted(available))
+        sel_arr = np.array(selected_idx)
+        min_d = D[np.ix_(cands, sel_arr)].min(axis=1)
+        winner = int(cands[np.argmax(min_d)])
+        selected_idx.append(winner)
+        available.discard(winner)
+
+    sub_cands = [candidates[i] for i in selected_idx]
+    # Diag: overlap stats over the FULL pool, and the chosen subset's spread.
+    upper_tri = D[np.triu_indices(n_cand, k=1)]
+    sub_D = D[np.ix_(selected_idx, selected_idx)]
+    sub_upper = sub_D[np.triu_indices(len(selected_idx), k=1)]
+    diag = {
+        "method": "replica_diverse_select",
+        "n_cand": n_cand,
+        "n_select": len(selected_idx),
+        "selected_idx": selected_idx,
+        "all_pairwise_median_microns": float(np.median(upper_tri)) if upper_tri.size else 0.0,
+        "all_pairwise_max_microns": float(np.max(upper_tri)) if upper_tri.size else 0.0,
+        "subset_pairwise_min_microns": float(np.min(sub_upper)) if sub_upper.size else 0.0,
+        "subset_pairwise_median_microns": float(np.median(sub_upper)) if sub_upper.size else 0.0,
+    }
+    return sub_cands, diag
     return candidates, diag

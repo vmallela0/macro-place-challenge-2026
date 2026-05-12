@@ -1583,12 +1583,50 @@ class OptimalPlacer:
                     V_total = V_smooth_frozen + V_macro / max(grid_v_routes, 1e-9)
                     H_total = H_smooth_frozen + H_macro / max(grid_h_routes, 1e-9)
                 combined = torch.cat([V_total, H_total], dim=0)
-                with torch.no_grad():
-                    t_c = torch.quantile(
-                        combined, 1.0 - K_c / (2 * incr.n_cells))
-                cong_smooth = cvar_smooth(
-                    combined.unsqueeze(0), K_c, t_c.detach(),
-                    mu=100.0).squeeze()
+                # zeus B3: cong aggregator. "cvar" (default) | "l1" | "lp"
+                # | "linf". L1/Lp/Linf give sparse gradients concentrated on
+                # the hottest cells — closer to the true exact cong gradient.
+                cong_agg = os.environ.get(
+                    "PLACER_V7_HESSIAN_CONG_AGG", "cvar").lower()
+                if cong_agg == "cvar":
+                    with torch.no_grad():
+                        t_c = torch.quantile(
+                            combined, 1.0 - K_c / (2 * incr.n_cells))
+                    cong_smooth = cvar_smooth(
+                        combined.unsqueeze(0), K_c, t_c.detach(),
+                        mu=100.0).squeeze()
+                else:
+                    # Build a per-bench target from the current quantile:
+                    # cells exceeding the (1 − K_c / 2n_cells) quantile
+                    # are the "hot" cells — same effective active set as CVaR.
+                    with torch.no_grad():
+                        t_c = torch.quantile(
+                            combined, 1.0 - K_c / (2 * incr.n_cells))
+                    if cong_agg == "l1":
+                        from _smooth_proxy import l1_excess
+                        cong_smooth = (l1_excess(
+                            combined.unsqueeze(0), t_c.detach(),
+                            mu=100.0).squeeze() / K_c)
+                    elif cong_agg == "lp":
+                        from _smooth_proxy import lp_excess
+                        p_lp = float(os.environ.get(
+                            "PLACER_V7_HESSIAN_CONG_LP_P", "2.0"))
+                        # K_c^{1/p} normalization so this is dimensionally
+                        # comparable to cvar's "per-cell mean of excess".
+                        cong_smooth = (lp_excess(
+                            combined.unsqueeze(0), t_c.detach(),
+                            p=p_lp, mu=100.0).squeeze()
+                                        / (K_c ** (1.0 / max(p_lp, 1e-3))))
+                    elif cong_agg == "linf":
+                        from _smooth_proxy import linf_excess
+                        tau_linf = float(os.environ.get(
+                            "PLACER_V7_HESSIAN_CONG_LINF_TAU", "30.0"))
+                        cong_smooth = linf_excess(
+                            combined.unsqueeze(0), t_c.detach(),
+                            tau=tau_linf).squeeze()
+                    else:
+                        raise ValueError(
+                            f"Unknown CONG_AGG: {cong_agg}")
                 loss = loss + cong_weight * cong_smooth
             return loss
 
@@ -1631,6 +1669,23 @@ class OptimalPlacer:
             print(f"  [v7] hessian AUTO_LAMBDA_SCAN: optimal w={best_w} "
                   f"(λ_min={best_lam:+.6e}, scan {time.time()-t_scan:.1f}s)",
                   flush=True)
+
+        # zeus B7: Free-energy / Gaussian-smoothed wrapper.
+        # When enabled, replaces smooth_proxy_call with F̂(x) = mean over
+        # K Gaussian-perturbed samples, penalizing sharp minima.
+        if os.environ.get("PLACER_V7_HESSIAN_FREE_ENERGY", "0") == "1":
+            from _free_energy import make_free_energy_proxy
+            fe_sigma = float(os.environ.get(
+                "PLACER_V7_HESSIAN_FE_SIGMA", "5.0"))
+            fe_K = int(os.environ.get("PLACER_V7_HESSIAN_FE_K", "4"))
+            fe_state_salt = int((macro_pos_t.detach().sum().item()
+                                  * 1e6)) % 10_000_000
+            fe_seed = (int(self.seed) + 88888 + fe_state_salt) & 0x7FFFFFFF
+            print(f"  [v7] hessian: FREE-ENERGY wrapper "
+                  f"σ={fe_sigma:.2f}μm K={fe_K} seed={fe_seed}", flush=True)
+            smooth_proxy_call = make_free_energy_proxy(
+                smooth_proxy_call, sigma=fe_sigma, K=fe_K, seed=fe_seed,
+                soft_only=True, n_hard=n_hard)
 
         # Compute Hessian eigvec
         t_h = time.time()
@@ -1703,6 +1758,9 @@ class OptimalPlacer:
                 hmc_L = int(os.environ.get("PLACER_V7_HESSIAN_HMC_L", "12"))
                 hmc_h = float(os.environ.get("PLACER_V7_HESSIAN_HMC_STEP", "0.5"))
                 hmc_cap = float(os.environ.get("PLACER_V7_HESSIAN_HMC_CAP", "0.20"))
+                # zeus B1: integrator order. "leapfrog" (2nd) or "yoshida4" (4th).
+                hmc_integ = os.environ.get(
+                    "PLACER_V7_HESSIAN_HMC_INTEGRATOR", "leapfrog")
                 # Salt seed with the integer hash of the current macro state
                 # so each MAX_ITERS iter draws fresh momenta (and successive
                 # benches/seeds are independent).
@@ -1724,13 +1782,74 @@ class OptimalPlacer:
                     n_trajectories=hmc_T, n_leapfrog=hmc_L,
                     step_size=hmc_h, canvas_diag=canvas_diag,
                     n_hard=n_hard, soft_only=True, seed=hmc_seed,
-                    max_total_step_canvas=hmc_cap, verbose=True)
+                    max_total_step_canvas=hmc_cap,
+                    integrator=hmc_integ, verbose=True)
+                # zeus B2: replica-overlap diverse selection. If enabled,
+                # over-sample HMC trajectories and pick the K most diverse.
+                hmc_replica_keep = int(os.environ.get(
+                    "PLACER_V7_HESSIAN_HMC_REPLICA_KEEP", "0"))
+                if hmc_replica_keep > 0 and len(hmc_cands) > hmc_replica_keep:
+                    from _subspace_hmc import replica_diverse_select
+                    base_pos_np = macro_pos_t.detach().cpu().numpy()
+                    hmc_cands, rep_diag = replica_diverse_select(
+                        hmc_cands, base_pos_np,
+                        n_select=hmc_replica_keep,
+                        candidate_diagnostics=hmc_diag.get("trajectories"))
+                    print(f"  [v7] hessian: replica-diverse "
+                          f"keep={len(hmc_cands)}/{rep_diag['n_cand']}, "
+                          f"all_med={rep_diag['all_pairwise_median_microns']:.1f}μm, "
+                          f"sub_min={rep_diag['subset_pairwise_min_microns']:.1f}μm",
+                          flush=True)
                 # Append HMC candidates with original-label form.
                 for lab, pos_np in hmc_cands:
                     candidates.append((lab, pos_np))
                 print(f"  [v7] hessian: HMC added {len(hmc_cands)} candidates "
                       f"(K={hmc_K}, T={hmc_T}, L={hmc_L}, h={hmc_h}, "
                       f"{time.time()-t_hmc:.1f}s); total={len(candidates)}",
+                      flush=True)
+
+            # zeus B5: Diffusion Monte Carlo as an additional candidate
+            # generator. Walker-based imaginary-time evolution; doesn't
+            # need a smooth gradient surface and naturally covers diverse
+            # basins. Env: PLACER_V7_HESSIAN_DMC_WALKERS, _STEPS, _TAU, _BETA.
+            dmc_walkers = int(os.environ.get(
+                "PLACER_V7_HESSIAN_DMC_WALKERS", "0"))
+            dmc_steps = int(os.environ.get(
+                "PLACER_V7_HESSIAN_DMC_STEPS", "30"))
+            if dmc_walkers > 0:
+                from _dmc_walker import diffusion_monte_carlo_candidates
+                dmc_tau = float(os.environ.get(
+                    "PLACER_V7_HESSIAN_DMC_TAU", "0.5"))
+                dmc_beta = float(os.environ.get(
+                    "PLACER_V7_HESSIAN_DMC_BETA", "1.0"))
+                dmc_init_jitter = float(os.environ.get(
+                    "PLACER_V7_HESSIAN_DMC_INIT_JITTER", "5.0"))
+                dmc_cap = float(os.environ.get(
+                    "PLACER_V7_HESSIAN_DMC_STEP_CAP", "50.0"))
+                dmc_keep = int(os.environ.get(
+                    "PLACER_V7_HESSIAN_DMC_KEEP", "8"))
+                dmc_state_salt = int((macro_pos_t.detach().sum().item()
+                                       * 1e6)) % 10_000_000
+                dmc_seed = (int(self.seed) + 77777 + dmc_state_salt) & 0x7FFFFFFF
+                t_dmc = time.time()
+                dmc_cands, dmc_diag = diffusion_monte_carlo_candidates(
+                    macro_pos_t, smooth_proxy_call,
+                    n_walkers=dmc_walkers, n_steps=dmc_steps,
+                    tau=dmc_tau, beta=dmc_beta,
+                    init_jitter=dmc_init_jitter,
+                    n_hard=n_hard,
+                    canvas_w=float(canvas_w),
+                    canvas_h=float(canvas_h),
+                    step_cap_microns=dmc_cap,
+                    seed=dmc_seed, verbose=True)
+                # Keep only top-K best walkers as candidates.
+                for lab, pos_np in dmc_cands[:dmc_keep]:
+                    candidates.append((lab, pos_np))
+                print(f"  [v7] hessian: DMC added "
+                      f"{min(len(dmc_cands), dmc_keep)} candidates "
+                      f"(N0={dmc_walkers}, steps={dmc_steps}, τ={dmc_tau:.2f}, "
+                      f"survivors={dmc_diag.get('n_walkers_final', 0)}, "
+                      f"{time.time()-t_dmc:.1f}s); total={len(candidates)}",
                       flush=True)
 
             # Convert to (s, pos) tuple shape that the worker code below
@@ -1750,6 +1869,11 @@ class OptimalPlacer:
                     try:
                         tnum = int(lab[5:].split("_")[0])
                         return 0.001 * (tnum + 1)
+                    except (ValueError, IndexError): return 0.0
+                if lab.startswith("dmc_w"):
+                    try:
+                        wnum = int(lab[5:].split("_")[0])
+                        return 0.0001 * (wnum + 1)
                     except (ValueError, IndexError): return 0.0
                 return 0.0
             candidates = [(_label_to_sortkey(lab), pos)

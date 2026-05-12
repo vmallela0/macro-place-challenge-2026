@@ -212,6 +212,66 @@ def cvar_smooth(values: torch.Tensor, K: int, t: torch.Tensor,
     return t + softplus_mu(values - t, mu).sum(dim=-1) / K
 
 
+# zeus B3 — sparse / L^p / L^inf aggregators for the cong penalty.
+#
+# Why this exists
+# ---------------
+# CVaR top-K averages the K largest violations. Two failure modes:
+#   1. K is a hyperparameter. Set wrong → either smears across cold cells
+#      (K too large) or sees only the single worst cell (K too small).
+#   2. Top-K gradient is uniform over the active set: every cell in the
+#      top-K contributes equal-weight gradient. The "real" pain — the
+#      most-congested cell — gets diluted.
+# L1 / Lp / Linf aggregators replace top-K with a continuous emphasis
+# on the upper tail.  At Adam's optimum, the gradient is exactly
+# proportional to softplus'(values − target) — a sigmoid weighting
+# concentrated on cells exceeding `target`.
+
+def l1_excess(values: torch.Tensor, target: float | torch.Tensor,
+              mu: float = 100.0) -> torch.Tensor:
+    """L¹ of excess over `target`:
+        L1 = Σ_c softplus_μ(values_c − target)
+    No top-K cap. Every cell whose density exceeds target contributes,
+    weighted by softplus'(excess) = σ(μ·excess). Cells well below the
+    target contribute O(exp(-μ·gap)) — essentially zero.
+
+    Compared to CVaR: this drops the threshold variable `t` (no inner
+    variable to optimize), so it's a cleaner objective component.
+    """
+    return softplus_mu(values - target, mu).sum(dim=-1)
+
+
+def lp_excess(values: torch.Tensor, target: float | torch.Tensor,
+              p: float = 2.0, mu: float = 100.0) -> torch.Tensor:
+    """L^p of excess:
+        Lp = (Σ_c softplus_μ(values_c − target)^p)^(1/p)
+    p=1: equals l1_excess.
+    p=∞: equals smooth max (use `linf_excess` below).
+    p=2..4: emphasizes hot cells without ignoring the rest.
+
+    Gradient: ∂Lp/∂values_c = softplus'(excess_c) · softplus(excess_c)^(p-1)
+    The (p-1)-power means cells in the top quantile of the excess
+    distribution get amplified; cold cells stay suppressed.
+    """
+    sp = softplus_mu(values - target, mu)
+    total = (sp ** p).sum(dim=-1)
+    # Guard against (0)^(1/p) when p<1
+    return (total + 1e-30) ** (1.0 / float(p))
+
+
+def linf_excess(values: torch.Tensor, target: float | torch.Tensor,
+                 tau: float = 30.0) -> torch.Tensor:
+    """L^∞ of excess via LSE-max:
+        Linf = lse_max(values − target, tau)
+    Smooth surrogate of the maximum excess. Gradient is concentrated
+    on the single most-congested cell (softmax over excess).
+
+    tau: lse sharpness. tau→∞ recovers exact max; default 30 gives a
+    reasonable soft maximum.
+    """
+    return lse_max(values - target, tau, dim=-1)
+
+
 def lse_hpwl_vectorized(
     pin_x: torch.Tensor,        # (n_pins,) float, requires_grad
     pin_y: torch.Tensor,        # (n_pins,) float, requires_grad
