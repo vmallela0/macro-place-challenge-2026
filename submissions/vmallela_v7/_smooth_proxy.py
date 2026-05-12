@@ -781,9 +781,36 @@ def adam_warm_start(
     pin_to_net = build_pin_to_net(net_starts)
     n_nets = int(net_weight.shape[0])
 
-    # Optimizer
-    opt = torch.optim.Adam([macro_pos, t_density, t_cong], lr=lr)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_steps)
+    # Optimizer. zeus B4: PLACER_V7_PHASE0_OPTIMIZER selects backend.
+    #   "adam"        (default) — torch.optim.Adam, β=(0.9, 0.999), CosineAnnealing.
+    #   "nesterov_ode" — RK4 of ẍ + (3/(t+t0))ẋ + ∇U = 0, with restart.
+    import os as _os
+    _phase0_optim = _os.environ.get(
+        "PLACER_V7_PHASE0_OPTIMIZER", "adam").lower()
+    if _phase0_optim == "nesterov_ode":
+        from _nesterov_ode import NesterovODE_RK4
+        # Use a smaller lr for the RK4 integrator because each "step"
+        # already does 4 sub-evaluations and integrates over a time h.
+        ode_lr = lr * float(_os.environ.get(
+            "PLACER_V7_PHASE0_NESTEROV_LR_MULT", "0.5"))
+        ode_t_init = float(_os.environ.get(
+            "PLACER_V7_PHASE0_NESTEROV_T_INIT", "5.0"))
+        ode_cap_frac = float(_os.environ.get(
+            "PLACER_V7_PHASE0_NESTEROV_CAP_FRAC", "0.05"))
+        ode_max_step = ode_cap_frac * canvas_diag
+        opt = NesterovODE_RK4(
+            [macro_pos, t_density, t_cong],
+            lr=ode_lr, t_init=ode_t_init,
+            restart=True, max_step_norm=ode_max_step)
+        # CosineAnnealingLR works on the .lr param group entry.
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_steps)
+        if verbose:
+            print(f"    [phase0] optimizer=NesterovODE_RK4 "
+                  f"lr={ode_lr:.4f} t_init={ode_t_init:.1f} "
+                  f"cap={ode_max_step:.1f}μm", flush=True)
+    else:
+        opt = torch.optim.Adam([macro_pos, t_density, t_cong], lr=lr)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_steps)
 
     from _cell_window import build_window_indices
     cell_idx_d = None
@@ -919,18 +946,42 @@ def adam_warm_start(
             if enable_congestion:
                 cell_idx_c = cell_idx
 
-        opt.zero_grad()
-        hpwl, dens, cong, prox = _proxy_call()
-        loss = (a_hpwl * w_hpwl * hpwl
-                + a_dens * w_dens * dens
-                + a_cong * w_cong * cong
-                + prox)
-        loss.backward()
-        # Optional: zero-out hard-macro gradients if soft_only
-        if soft_only:
-            with torch.no_grad():
-                macro_pos.grad[:n_hard] = 0.0
-        opt.step()
+        # zeus B4: closure pattern supports both Adam (closure ignored)
+        # and NesterovODE_RK4 (calls closure 4× per step for RK4 stages).
+        # The closure must zero, forward, backward, and apply soft-only
+        # masking so that p.grad is the masked gradient when used.
+        _step_diag = {"hpwl": None, "dens": None, "cong": None, "prox": None}
+        def _closure():
+            opt.zero_grad()
+            hpwl_, dens_, cong_, prox_ = _proxy_call()
+            loss_ = (a_hpwl * w_hpwl * hpwl_
+                      + a_dens * w_dens * dens_
+                      + a_cong * w_cong * cong_
+                      + prox_)
+            loss_.backward()
+            if soft_only:
+                with torch.no_grad():
+                    if macro_pos.grad is not None:
+                        macro_pos.grad[:n_hard] = 0.0
+            # Latch the FIRST-stage values for history (for RK4, this is
+            # the start-of-step state; for Adam, it's the only call).
+            if _step_diag["hpwl"] is None:
+                _step_diag["hpwl"] = float(hpwl_.item())
+                _step_diag["dens"] = float(dens_.item()) if enable_density else 0.0
+                _step_diag["cong"] = float(cong_.item()) if enable_congestion else 0.0
+                _step_diag["prox"] = float(prox_.item()) if prox_ is not None else 0.0
+            return loss_
+        # NesterovODE_RK4 needs the closure; Adam ignores it.
+        if _phase0_optim == "nesterov_ode":
+            loss_val = opt.step(_closure)
+            loss = torch.tensor(loss_val, device=macro_pos.device)
+        else:
+            loss = _closure()
+            opt.step()
+        hpwl = torch.tensor(_step_diag["hpwl"], device=macro_pos.device)
+        dens = torch.tensor(_step_diag["dens"], device=macro_pos.device)
+        cong = torch.tensor(_step_diag["cong"], device=macro_pos.device)
+        prox = torch.tensor(_step_diag["prox"], device=macro_pos.device)
         sched.step()
 
         # Clip to canvas

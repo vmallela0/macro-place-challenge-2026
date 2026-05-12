@@ -744,6 +744,96 @@ class OptimalPlacer:
                     verbose=True,
                 )
                 adam_tensor = torch.tensor(pos_adam, dtype=torch.float32)
+                # zeus B6: JKO/Wasserstein-2 post-Adam refinement.
+                # Applies N JKO proximal steps after Adam converges.
+                # Each step: gradient → tentative target → Sinkhorn-transport.
+                # Useful when Adam stalls near a basin with non-Euclidean
+                # geometry (high-density region). Default off.
+                jko_steps = int(os.environ.get(
+                    "PLACER_V7_PHASE0_JKO_STEPS", "0"))
+                if jko_steps > 0:
+                    from _jko_step import jko_proximal_step
+                    from _smooth_proxy import (
+                        smooth_proxy_for_v7_v2, build_pin_to_net)
+                    from _cell_window import build_window_indices
+                    jko_tau = float(os.environ.get(
+                        "PLACER_V7_PHASE0_JKO_TAU", "5.0"))
+                    jko_alpha = float(os.environ.get(
+                        "PLACER_V7_PHASE0_JKO_ALPHA", "0.5"))
+                    jko_eps = float(os.environ.get(
+                        "PLACER_V7_PHASE0_JKO_EPS", "10.0"))
+                    jko_iters = int(os.environ.get(
+                        "PLACER_V7_PHASE0_JKO_SINK_ITERS", "30"))
+                    t_jko = time.time()
+                    # Build tensors for the surrogate.
+                    macro_pos_tj = adam_tensor.clone().detach().requires_grad_(True)
+                    t_density = torch.zeros((), requires_grad=True)
+                    t_cong = torch.zeros((), requires_grad=True)
+                    pin_macro_tj = torch.tensor(np.asarray(incr.pin_macro), dtype=torch.long)
+                    pin_xoff_tj = torch.tensor(np.asarray(incr.pin_xoff), dtype=torch.float32)
+                    pin_yoff_tj = torch.tensor(np.asarray(incr.pin_yoff), dtype=torch.float32)
+                    net_starts_tj = torch.tensor(np.asarray(incr.net_starts), dtype=torch.long)
+                    net_weight_tj = torch.tensor(np.asarray(incr.net_weight), dtype=torch.float32)
+                    macro_w_tj = torch.tensor(np.asarray(incr.macro_w), dtype=torch.float32)
+                    macro_h_tj = torch.tensor(np.asarray(incr.macro_h), dtype=torch.float32)
+                    V_smooth_tj = torch.tensor(np.asarray(incr.V_routing_smooth), dtype=torch.float32)
+                    H_smooth_tj = torch.tensor(np.asarray(incr.H_routing_smooth), dtype=torch.float32)
+                    pin_to_net_tj = build_pin_to_net(net_starts_tj)
+                    n_nets_tj = int(net_weight_tj.shape[0])
+                    K_d_tj = max(1, int(incr.n_cells * k_dens_frac))
+                    K_c_tj = max(1, int(2 * incr.n_cells * k_cong_frac))
+                    cell_idx_tj, _ = build_window_indices(
+                        macro_pos_tj.detach(), macro_w_tj, macro_h_tj,
+                        grid_col=incr.grid_col, grid_row=incr.grid_row,
+                        grid_w=incr.grid_width, grid_h=incr.grid_height,
+                        margin_cells=4)
+                    for jko_iter in range(jko_steps):
+                        # Forward + grad for ∇U at current state.
+                        macro_pos_tj.requires_grad_(True)
+                        if macro_pos_tj.grad is not None:
+                            macro_pos_tj.grad.zero_()
+                        loss_tj, _ = smooth_proxy_for_v7_v2(
+                            macro_pos_tj, t_density, t_cong,
+                            macro_w=macro_w_tj, macro_h=macro_h_tj,
+                            pin_macro=pin_macro_tj, pin_xoff=pin_xoff_tj,
+                            pin_yoff=pin_yoff_tj, pin_to_net=pin_to_net_tj,
+                            net_weight=net_weight_tj, n_nets=n_nets_tj,
+                            grid_col=incr.grid_col, grid_row=incr.grid_row,
+                            grid_w=incr.grid_width, grid_h=incr.grid_height,
+                            grid_v_routes=incr.grid_v_routes,
+                            grid_h_routes=incr.grid_h_routes,
+                            V_smooth_frozen=V_smooth_tj,
+                            H_smooth_frozen=H_smooth_tj,
+                            cw=float(incr.cw), ch=float(incr.ch),
+                            net_cnt=float(incr.net_cnt),
+                            K_density=K_d_tj, K_cong=K_c_tj,
+                            cell_area=incr.grid_area,
+                            vrouting_alloc=incr.vrouting_alloc,
+                            hrouting_alloc=incr.hrouting_alloc,
+                            tau_lse=50.0, mu_softplus=100.0,
+                            proximal_pos=adam_tensor,
+                            proximal_weight=0.0,    # off for JKO
+                            hard_only_proximal=True,
+                            n_hard=incr.n_hard,
+                            cell_idx_density=cell_idx_tj,
+                            cell_idx_cong=cell_idx_tj,
+                        )
+                        loss_tj.backward()
+                        grad_U_tj = macro_pos_tj.grad.detach().clone()
+                        # JKO step.
+                        with torch.no_grad():
+                            x_new, jko_diag = jko_proximal_step(
+                                macro_pos_tj, grad_U_tj,
+                                tau=jko_tau, alpha=jko_alpha,
+                                sinkhorn_eps=jko_eps,
+                                sinkhorn_iters=jko_iters,
+                                n_hard=incr.n_hard, soft_only=True)
+                            macro_pos_tj = x_new.requires_grad_(True)
+                    adam_tensor = macro_pos_tj.detach().clone()
+                    pos_adam = adam_tensor.cpu().numpy().astype(np.float64)
+                    print(f"  [v7] phase0 JKO: {jko_steps} steps "
+                          f"τ={jko_tau:.1f} α={jko_alpha:.2f} ε={jko_eps:.1f} "
+                          f"({time.time()-t_jko:.1f}s)", flush=True)
                 # Validate via official PlacementCost.
                 r = compute_proxy_cost(adam_tensor, bench_for_eval, plc)
                 adam_cost = float(r["proxy_cost"])
@@ -1808,6 +1898,69 @@ class OptimalPlacer:
                       f"{time.time()-t_hmc:.1f}s); total={len(candidates)}",
                       flush=True)
 
+            # zeus B8: SMC tempered importance sampler as a candidate
+            # generator. Starts N=16 particles jittered from current state,
+            # runs T tempering stages with adaptive β-schedule + Gaussian
+            # RW Metropolis between stages. Returns top-K final particles.
+            smc_N = int(os.environ.get(
+                "PLACER_V7_HESSIAN_SMC_N", "0"))
+            if smc_N > 0:
+                from _smc import smc_sampler
+                smc_T = int(os.environ.get(
+                    "PLACER_V7_HESSIAN_SMC_STAGES", "10"))
+                smc_jitter = float(os.environ.get(
+                    "PLACER_V7_HESSIAN_SMC_JITTER", "3.0"))
+                smc_mcmc_sigma = float(os.environ.get(
+                    "PLACER_V7_HESSIAN_SMC_MCMC_SIGMA", "2.0"))
+                smc_mcmc_per = int(os.environ.get(
+                    "PLACER_V7_HESSIAN_SMC_MCMC_PER_STAGE", "1"))
+                smc_keep = int(os.environ.get(
+                    "PLACER_V7_HESSIAN_SMC_KEEP", "8"))
+                base_pos_np_smc = macro_pos_t.detach().cpu().numpy()
+                # Jitter init (soft macros only).
+                rng_init = np.random.default_rng(int(self.seed) + 99999)
+                smc_init = np.tile(base_pos_np_smc[None, :, :],
+                                     (smc_N, 1, 1)).astype(np.float64)
+                if smc_init.shape[1] - n_hard > 0:
+                    smc_init[:, n_hard:, :] += (rng_init.standard_normal(
+                        (smc_N, smc_init.shape[1] - n_hard, 2)) * smc_jitter)
+                    smc_init[:, :, 0] = np.clip(
+                        smc_init[:, :, 0], 0.0, float(canvas_w))
+                    smc_init[:, :, 1] = np.clip(
+                        smc_init[:, :, 1], 0.0, float(canvas_h))
+
+                def smc_U_batch(xs_np):
+                    out = np.empty(xs_np.shape[0], dtype=np.float64)
+                    with torch.no_grad():
+                        for i in range(xs_np.shape[0]):
+                            x_t = torch.tensor(xs_np[i], dtype=torch.float32)
+                            out[i] = float(smooth_proxy_call(x_t).item())
+                    return out
+
+                t_smc = time.time()
+                smc_final, smc_diag = smc_sampler(
+                    smc_init, smc_U_batch,
+                    n_steps=smc_T,
+                    target_ess_frac=0.5,
+                    n_mcmc_per_step=smc_mcmc_per,
+                    mcmc_step_sigma=smc_mcmc_sigma,
+                    canvas_w=float(canvas_w), canvas_h=float(canvas_h),
+                    n_hard=n_hard,
+                    seed=(int(self.seed) + 55555) & 0x7FFFFFFF,
+                    verbose=True,
+                )
+                # Sort particles by final U and keep top-K.
+                smc_U_final = smc_U_batch(smc_final)
+                order = np.argsort(smc_U_final)
+                for i, idx in enumerate(order[:smc_keep]):
+                    label = f"smc_p{i:02d}_U{smc_U_final[idx]:+.4f}"
+                    candidates.append((label, smc_final[idx]))
+                print(f"  [v7] hessian: SMC added "
+                      f"{min(smc_keep, len(order))} candidates "
+                      f"(N={smc_N}, stages={smc_T}, β_final={smc_diag['final_beta']:.2f}, "
+                      f"{time.time()-t_smc:.1f}s); total={len(candidates)}",
+                      flush=True)
+
             # zeus B5: Diffusion Monte Carlo as an additional candidate
             # generator. Walker-based imaginary-time evolution; doesn't
             # need a smooth gradient surface and naturally covers diverse
@@ -1874,6 +2027,11 @@ class OptimalPlacer:
                     try:
                         wnum = int(lab[5:].split("_")[0])
                         return 0.0001 * (wnum + 1)
+                    except (ValueError, IndexError): return 0.0
+                if lab.startswith("smc_p"):
+                    try:
+                        pnum = int(lab[5:].split("_")[0])
+                        return 0.00001 * (pnum + 1)
                     except (ValueError, IndexError): return 0.0
                 return 0.0
             candidates = [(_label_to_sortkey(lab), pos)
