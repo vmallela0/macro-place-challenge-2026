@@ -1898,6 +1898,94 @@ class OptimalPlacer:
                       f"{time.time()-t_hmc:.1f}s); total={len(candidates)}",
                       flush=True)
 
+            # zeus B11: NEB minimum-energy path between top-2 diverse
+            # candidates. Finds the saddle/transition state separating
+            # two basins; adds it (and adjacent images) as candidates.
+            neb_enabled = int(os.environ.get(
+                "PLACER_V7_HESSIAN_NEB", "0"))
+            if neb_enabled > 0 and len(candidates) >= 2:
+                from _neb import neb_candidates
+                # Pick top-2 candidates by their candidate-list position.
+                # (The candidates list is unsorted at this stage; we pick
+                # the first 2 with maximally different positions.)
+                neb_images = int(os.environ.get(
+                    "PLACER_V7_HESSIAN_NEB_IMAGES", "7"))
+                neb_iters = int(os.environ.get(
+                    "PLACER_V7_HESSIAN_NEB_ITERS", "20"))
+                neb_lr = float(os.environ.get(
+                    "PLACER_V7_HESSIAN_NEB_LR", "0.3"))
+                neb_spring = float(os.environ.get(
+                    "PLACER_V7_HESSIAN_NEB_SPRING_K", "0.05"))
+                # Compute pairwise distances of existing candidates,
+                # pick the 2 with maximal distance.
+                cand_arr = [c[1] for c in candidates]
+                if len(cand_arr) >= 2:
+                    flats = [c.reshape(-1) for c in cand_arr]
+                    nn = len(flats)
+                    max_d, max_pair = 0.0, (0, 1)
+                    for ii in range(nn):
+                        for jj in range(ii + 1, nn):
+                            d = float(np.linalg.norm(flats[ii] - flats[jj]))
+                            if d > max_d:
+                                max_d = d
+                                max_pair = (ii, jj)
+                    seeds_for_neb = [cand_arr[max_pair[0]],
+                                      cand_arr[max_pair[1]]]
+                    t_neb = time.time()
+                    neb_cands, neb_diag = neb_candidates(
+                        seeds_for_neb, smooth_proxy_call,
+                        n_images=neb_images, n_iters=neb_iters,
+                        lr=neb_lr, spring_k=neb_spring,
+                        n_hard=n_hard,
+                        canvas_w=float(canvas_w), canvas_h=float(canvas_h),
+                        barrier_eps_frac=0.001, verbose=False)
+                    for lab, pos_np in neb_cands:
+                        candidates.append((lab, pos_np))
+                    n_pairs = len(neb_diag.get("pairs", []))
+                    print(f"  [v7] hessian: NEB added "
+                          f"{len(neb_cands)} candidates "
+                          f"(pairs={n_pairs}, images={neb_images}, "
+                          f"max_d={max_d:.1f}μm, "
+                          f"{time.time()-t_neb:.1f}s); "
+                          f"total={len(candidates)}", flush=True)
+
+            # zeus B10: Catastrophe-theory fold candidates. For each
+            # Lanczos eigvec v_k with λ_k < 0, estimate the cubic term
+            # c_k via 4-point finite differences along v_k, then place
+            # one candidate at the EXACT fold critical point
+            # t_k* = -2λ_k / c_k. Closed-form alternative to line search.
+            cata_K = int(os.environ.get(
+                "PLACER_V7_HESSIAN_CATASTROPHE_K", "0"))
+            if cata_K > 0:
+                from _hessian_escape import hessian_min_eigvecs_topk
+                from _catastrophe import catastrophe_fold_candidates
+                cata_h_frac = float(os.environ.get(
+                    "PLACER_V7_HESSIAN_CATASTROPHE_H_FRAC", "0.005"))
+                cata_cap = float(os.environ.get(
+                    "PLACER_V7_HESSIAN_CATASTROPHE_CAP", "0.15"))
+                # Reuse eigeninfo from adaptive call if possible.
+                ev_c = diag.get("eigvecs")
+                eg_c = diag.get("eigvals")
+                if ev_c is None or eg_c is None or ev_c.shape[1] < cata_K:
+                    eg_c, ev_c = hessian_min_eigvecs_topk(
+                        smooth_proxy_call, macro_pos_t,
+                        k=cata_K, n_lanczos_iters=n_lanczos_iters,
+                        tikhonov=tikhonov, verbose=False)
+                t_cata = time.time()
+                cata_cands, cata_diag = catastrophe_fold_candidates(
+                    smooth_proxy_call, macro_pos_t, eg_c, ev_c,
+                    canvas_diag=canvas_diag,
+                    cap_frac=cata_cap, h_frac=cata_h_frac,
+                    n_hard=n_hard, soft_only=True, verbose=True,
+                )
+                for lab, pos_np in cata_cands:
+                    candidates.append((lab, pos_np))
+                print(f"  [v7] hessian: catastrophe-fold added "
+                      f"{len(cata_cands)} candidates "
+                      f"(K={cata_K}, h_frac={cata_h_frac:.3f}, "
+                      f"{time.time()-t_cata:.1f}s); "
+                      f"total={len(candidates)}", flush=True)
+
             # zeus B8: SMC tempered importance sampler as a candidate
             # generator. Starts N=16 particles jittered from current state,
             # runs T tempering stages with adaptive β-schedule + Gaussian
@@ -2032,6 +2120,17 @@ class OptimalPlacer:
                     try:
                         pnum = int(lab[5:].split("_")[0])
                         return 0.00001 * (pnum + 1)
+                    except (ValueError, IndexError): return 0.0
+                if lab.startswith("cata_"):
+                    try:
+                        cnum = int(lab[6:].split("_")[0])
+                        return 0.000001 * (cnum + 1)
+                    except (ValueError, IndexError): return 0.0
+                if lab.startswith("neb_"):
+                    try:
+                        # "neb_p01_img3_..."
+                        pidx = lab.split("_img")[1].split("_")[0]
+                        return 0.0000001 * (int(pidx) + 1)
                     except (ValueError, IndexError): return 0.0
                 return 0.0
             candidates = [(_label_to_sortkey(lab), pos)

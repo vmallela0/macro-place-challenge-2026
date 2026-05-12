@@ -931,7 +931,47 @@ def adam_warm_start(
                       f"{e})", flush=True)
             plc_for_validate = None
 
+    # zeus B9 — RG net-length curriculum (homotopy on net weights).
+    # When enabled, multiply net_weight by γ_n(t) = exp(-L_n²/(2σ²))
+    # where σ anneals from sigma_0·canvas_diag (small) to sigma_inf·canvas_diag.
+    # Net_weight tensor is held in `net_weight` already; we apply
+    # multiplier inside the closure.
+    _rg_enabled = _os.environ.get("PLACER_V7_PHASE0_RG_CURRICULUM", "0") == "1"
+    if _rg_enabled:
+        from _rg_curriculum import (apply_rg_curriculum_weights,
+                                      schedule_sigma,
+                                      compute_per_net_bbox_diag)
+        rg_sigma_0 = float(_os.environ.get(
+            "PLACER_V7_PHASE0_RG_SIGMA_0", "0.05"))
+        rg_sigma_inf = float(_os.environ.get(
+            "PLACER_V7_PHASE0_RG_SIGMA_INF", "10.0"))
+        rg_recompute_bbox_every = int(_os.environ.get(
+            "PLACER_V7_PHASE0_RG_BBOX_EVERY", "5"))
+        # Latch the BASE weight; we'll modify it at each step.
+        net_weight_base_rg = net_weight.detach().clone()
+        net_bbox_diag_rg = compute_per_net_bbox_diag(
+            macro_pos.detach(), pin_macro, pin_xoff, pin_yoff,
+            pin_to_net, n_nets)
+        if verbose:
+            print(f"    [rg-curriculum] enabled: σ_0={rg_sigma_0:.3f}·canvas, "
+                  f"σ_inf={rg_sigma_inf:.3f}·canvas, "
+                  f"recompute_bbox_every={rg_recompute_bbox_every}",
+                  flush=True)
+
     for step in range(n_steps):
+        # zeus B9: apply step-dependent γ_n to net_weight.
+        if _rg_enabled:
+            if step % rg_recompute_bbox_every == 0:
+                net_bbox_diag_rg = compute_per_net_bbox_diag(
+                    macro_pos.detach(), pin_macro, pin_xoff, pin_yoff,
+                    pin_to_net, n_nets)
+            t_frac = float(step) / max(n_steps - 1, 1)
+            sigma_now = schedule_sigma(
+                t_frac, rg_sigma_0, canvas_diag, rg_sigma_inf)
+            # In-place replace net_weight values (we restore base at end).
+            net_weight.data.copy_(apply_rg_curriculum_weights(
+                net_weight_base_rg, net_bbox_diag_rg, sigma_now))
+
         # Re-snapshot the cell windows periodically (default every 10
         # steps — cheap O(n_total · K_max) tensor op, ~50 ms on MPS for
         # ibm15-scale; keeps density/cong gradients fresh as macros drift).
@@ -1030,6 +1070,10 @@ def adam_warm_start(
     # position so callers always get the Adam-optimized result.
     if plc_for_validate is None:
         best_pos_np = macro_pos.detach().cpu().numpy().astype(np.float64)
+
+    # zeus B9: restore base net_weight so caller sees unmodified weights.
+    if _rg_enabled:
+        net_weight.data.copy_(net_weight_base_rg)
 
     history["best_exact_cost"] = best_exact_cost
     history["best_exact_step"] = best_exact_step
