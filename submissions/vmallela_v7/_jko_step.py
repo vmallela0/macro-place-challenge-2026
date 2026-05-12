@@ -74,34 +74,42 @@ import torch
 
 def sinkhorn_log_stabilized(
     C: torch.Tensor,              # (n, m) cost matrix
-    a: torch.Tensor,              # (n,) source mass (default uniform 1/n)
+    a: torch.Tensor,              # (n,) source mass
     b: torch.Tensor,              # (m,) target mass
     epsilon: float = 1.0,         # entropic regularizer
     n_iters: int = 50,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Log-domain Sinkhorn for entropic OT, returns (π, u, v).
+    """Log-domain Sinkhorn for entropic OT (Cuturi 2013).
 
-    π_ij = a_i b_j exp((u_i + v_j - C_ij) / ε)
+    Convention: π_ij = u_i · K_ij · v_j   where   K_ij = exp(-C_ij/ε).
+    Marginal constraints:
+        Σ_j π_ij = a_i     ⇒   u_i = a_i / Σ_j (K_ij · v_j)
+        Σ_i π_ij = b_j     ⇒   v_j = b_j / Σ_i (u_i · K_ij)
 
-    Log-stabilization: track log u, log v instead of u, v to avoid overflow.
+    Log-domain updates (numerically stable):
+        log u_i  =  log a_i - LSE_j[(-C_ij/ε) + log v_j]
+        log v_j  =  log b_j - LSE_i[(-C_ij/ε) + log u_i]
+
+    Returns:
+        pi : (n, m) — transport plan satisfying marginals to ε-accuracy.
+        log_u, log_v : (n,), (m,) — the dual scalings (useful for the
+            gradient of the OT objective).
+
+    Reference: Peyré & Cuturi (2019), "Computational Optimal Transport",
+    Algorithm 3.1.
     """
     n, m = C.shape
     log_a = torch.log(a + 1e-30)
     log_b = torch.log(b + 1e-30)
     log_u = torch.zeros(n, device=C.device, dtype=C.dtype)
     log_v = torch.zeros(m, device=C.device, dtype=C.dtype)
+    neg_C_eps = -C / float(epsilon)
     for _ in range(int(n_iters)):
-        # Update log_u: a_i = exp(log_u) · Σ_j b_j exp((log_v_j - C_ij)/ε)
-        K_logs = (log_v.unsqueeze(0) - C / epsilon)             # (n, m)
-        lse_row = torch.logsumexp(K_logs + log_b.unsqueeze(0), dim=1)  # (n,)
-        log_u = log_a - lse_row
-        K_logs = (log_u.unsqueeze(1) - C / epsilon)             # (n, m)
-        lse_col = torch.logsumexp(K_logs + log_a.unsqueeze(1), dim=0)  # (m,)
-        log_v = log_b - lse_col
-    # Reconstruct π = a_i b_j exp((u + v - C) / ε)
-    log_pi = (log_u.unsqueeze(1) + log_v.unsqueeze(0)
-               + log_a.unsqueeze(1) + log_b.unsqueeze(0)
-               - C / epsilon)
+        log_u = log_a - torch.logsumexp(
+            neg_C_eps + log_v.unsqueeze(0), dim=1)
+        log_v = log_b - torch.logsumexp(
+            neg_C_eps + log_u.unsqueeze(1), dim=0)
+    log_pi = log_u.unsqueeze(1) + log_v.unsqueeze(0) + neg_C_eps
     pi = torch.exp(log_pi)
     return pi, log_u, log_v
 
