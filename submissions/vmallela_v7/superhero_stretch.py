@@ -191,12 +191,23 @@ def superhero_stretch_init(plc, benchmark, stretch=1.10, prior_lambda=500.0,
     return pos
 
 
-# Per-bench tuned hyperparameters (Mac coarse-grid sweep, raw-proxy scored).
-# Note: ibm02 wants stretch < 1.0 (contract) — its hand-tuned default is
-# already over-spread for the proxy's preference. Other benches want
-# expansion. Lambda 500-5000 — larger λ pins us closer to the prior.
-# Fallback for unseen benches: (stretch=1.05, lam=500).
-TUNED = {
+# GLOBAL (competition-compliant) defaults — a SINGLE config applied to every
+# benchmark, no per-bench tuning.
+#
+# Validated on Mac across all 17 IBM benches with v1 _coord_descent polish:
+#   mean default→CD     = 1.4155
+#   mean super →CD      = 1.3702    (15/17 wins, −3.20%)
+#
+# These values are NOT bench-specific. They came from a single coarse-grid
+# sweep on 4 small benches and were verified to win on the full 17.
+GLOBAL_STRETCH = 1.10
+GLOBAL_LAMBDA = 2000.0
+
+# Per-bench tuned hyperparameters (research-only — VIOLATES competition rules
+# against per-bench optimization, kept here for the upper-bound study).
+# With per-bench tuning the same algorithm hits −4.95% mean (all 17 wins) at
+# raw init proxy.
+TUNED_RESEARCH_ONLY = {
     "ibm06": {"stretch": 1.20, "lambda": 1000.0},
     "ibm01": {"stretch": 1.05, "lambda": 5000.0},
     "ibm02": {"stretch": 0.98, "lambda": 2000.0},
@@ -209,9 +220,9 @@ def main():
     p.add_argument("--benchmark", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--stretch", type=float, default=None,
-                   help="prior stretch factor (default: per-bench tuned table, fallback 1.05)")
+                   help=f"prior stretch factor (default: global {GLOBAL_STRETCH})")
     p.add_argument("--prior-lambda", type=float, default=None,
-                   help="Bayesian prior weight (default: per-bench tuned)")
+                   help=f"Bayesian prior weight (default: global {GLOBAL_LAMBDA})")
     p.add_argument("--alpha", type=float, default=1e-3,
                    help="Tikhonov regularization on L_MM")
     p.add_argument("--weight-clip", type=float, default=10.0)
@@ -228,9 +239,9 @@ def main():
         print(f"FATAL: plc load failed for {args.benchmark}", file=sys.stderr)
         sys.exit(2)
 
-    tuned = TUNED.get(args.benchmark, {"stretch": 1.05, "lambda": 500.0})
-    stretch = args.stretch if args.stretch is not None else tuned["stretch"]
-    lam = args.prior_lambda if args.prior_lambda is not None else tuned["lambda"]
+    # GLOBAL (competition-compliant) default: same config for every bench.
+    stretch = args.stretch if args.stretch is not None else GLOBAL_STRETCH
+    lam = args.prior_lambda if args.prior_lambda is not None else GLOBAL_LAMBDA
 
     n_hard = int(benchmark.num_hard_macros)
     print(f"[super] benchmark={args.benchmark} stretch={stretch} λ={lam}", flush=True)

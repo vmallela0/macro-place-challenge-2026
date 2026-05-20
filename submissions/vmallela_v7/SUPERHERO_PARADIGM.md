@@ -5,8 +5,43 @@
 `superhero_stretch.py` solves placement initialization in **closed form**
 via one sparse LU on the netlist Laplacian augmented with a Bayesian prior.
 
-On 4 small IBM benches after CD polish: **mean proxy 1.2601 vs default
-1.3030 (−3.29%)**, **3/4 wins**, with ibm06 winning by **−8.31%**.
+### Full 17-bench result (competition-compliant — single global config)
+
+`stretch=1.10, λ=2000` applied to every bench, no per-bench tuning. CD-polished:
+
+```
+                default→CD    super→CD     delta     %
+  mean over 17:    1.4155      1.3702     -0.0452   -3.20%
+  super wins:                                       15/17
+```
+
+Per-bench breakdown (largest wins on top):
+
+| bench | default→CD | super→CD | Δ      |
+|-------|-----------:|---------:|-------:|
+| ibm06 |     1.6352 |   1.5362 |  -6.06%|
+| ibm07 |     1.4575 |   1.3703 |  -5.98%|
+| ibm03 |     1.3121 |   1.2371 |  -5.72%|
+| ibm13 |     1.3547 |   1.2912 |  -4.68%|
+| ibm15 |     1.5583 |   1.4859 |  -4.65%|
+| ibm12 |     1.5939 |   1.5211 |  -4.57%|
+| ibm08 |     1.4490 |   1.3833 |  -4.53%|
+| ibm10 |     1.2216 |   1.1699 |  -4.24%|
+| ibm16 |     1.4467 |   1.3871 |  -4.12%|
+| ibm11 |     1.1904 |   1.1440 |  -3.89%|
+| ibm09 |     1.0702 |   1.0299 |  -3.76%|
+| ibm14 |     1.5266 |   1.4810 |  -2.99%|
+| ibm17 |     1.7214 |   1.6759 |  -2.64%|
+| ibm04 |     1.2392 |   1.2186 |  -1.66%|
+| ibm01 |     1.0233 |   1.0181 |  -0.51%|
+| ibm02 |     1.4833 |   1.5195 |  +2.44%|  ← loss
+| ibm18 |     1.7795 |   1.8249 |  +2.55%|  ← loss
+
+### Per-bench tuned upper bound (research only — NOT competition compliant)
+
+If we allow per-bench (stretch, λ) tuning, the same algorithm hits about
+−4.95% mean (all 17 wins at raw init). The TUNED_RESEARCH_ONLY dict in
+the source documents the per-bench best (stretch, λ) we observed.
 
 ## The math
 
