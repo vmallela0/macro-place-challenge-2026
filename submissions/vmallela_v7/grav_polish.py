@@ -42,29 +42,50 @@ def atomic_write_json(path, obj):
 
 
 def polish(v1, plc, benchmark, init_hard_pos, cd_time, seed,
-           legalize_iters=0, legalize_damping=0.6):
+           legalize_iters=0, legalize_damping=0.6,
+           init_soft_pos=None):
     """Run v1 _coord_descent from the given init.
+    init_soft_pos: optional (n_soft, 2) ndarray. If provided, sets soft macro
+    positions BEFORE building the IncrementalEvaluator (mutates a fresh copy
+    of benchmark.macro_positions on a clone so we don't corrupt caller state).
     If legalize_iters > 0, first apply _push_apart to bridge the legalization gap.
     Returns (final_pos, final_cost, init_cost, post_legalize_cost).
     """
     import random as _rand
     _rand.seed(seed)
     np.random.seed(seed)
-    incr = v1.IncrementalEvaluator(plc, benchmark)
+
     n_hard = int(benchmark.num_hard_macros)
-    init = np.asarray(init_hard_pos, dtype=np.float64).reshape(n_hard, 2).copy()
-    incr.sync_positions(init.astype(np.float32))
-    init_cost = float(incr.get_proxy_cost())
+    n_total = int(benchmark.macro_positions.shape[0])
 
-    post_legal = init_cost
-    if legalize_iters > 0:
-        legalized = v1._push_apart(init, benchmark,
-                                   max_iters=legalize_iters, damping=legalize_damping)
-        incr.sync_positions(legalized.astype(np.float32))
-        post_legal = float(incr.get_proxy_cost())
-        init = legalized
+    # If soft positions are provided, patch the benchmark in-place. Reverted at end.
+    saved_default = None
+    if init_soft_pos is not None:
+        soft_np = np.asarray(init_soft_pos, dtype=np.float32).reshape(n_total - n_hard, 2)
+        saved_default = benchmark.macro_positions.clone()
+        new_full = benchmark.macro_positions.clone()
+        new_full[n_hard:] = torch.from_numpy(soft_np)
+        benchmark.macro_positions = new_full
 
-    pos, cost = v1._coord_descent(init, benchmark, plc, max_time=cd_time, incr_eval=incr)
+    try:
+        incr = v1.IncrementalEvaluator(plc, benchmark)
+        init = np.asarray(init_hard_pos, dtype=np.float64).reshape(n_hard, 2).copy()
+        incr.sync_positions(init.astype(np.float32))
+        init_cost = float(incr.get_proxy_cost())
+
+        post_legal = init_cost
+        if legalize_iters > 0:
+            legalized = v1._push_apart(init, benchmark,
+                                       max_iters=legalize_iters, damping=legalize_damping)
+            incr.sync_positions(legalized.astype(np.float32))
+            post_legal = float(incr.get_proxy_cost())
+            init = legalized
+
+        pos, cost = v1._coord_descent(init, benchmark, plc, max_time=cd_time, incr_eval=incr)
+    finally:
+        if saved_default is not None:
+            benchmark.macro_positions = saved_default
+
     return pos, float(cost), init_cost, post_legal
 
 
@@ -108,11 +129,22 @@ def main():
         if grav_hard.shape != (n_hard, 2):
             print(f"FATAL: grav init shape {grav_hard.shape} != ({n_hard}, 2)", file=sys.stderr)
             sys.exit(2)
-        print(f"[polish/grav] benchmark={args.benchmark} CD={args.cd_time}s legalize_iters={args.legalize_iters} ...", flush=True)
+        # Optional: soft macro positions from the init (lets diffusion_init pass
+        # its spectral soft coords through so the polish sees the same eval).
+        grav_soft = None
+        if "soft_positions" in g:
+            soft_arr = np.asarray(g["soft_positions"], dtype=np.float32)
+            n_soft = int(benchmark.macro_positions.shape[0]) - n_hard
+            if soft_arr.shape == (n_soft, 2):
+                grav_soft = soft_arr
+        print(f"[polish/grav] benchmark={args.benchmark} CD={args.cd_time}s "
+              f"legalize_iters={args.legalize_iters} "
+              f"soft={'spec' if grav_soft is not None else 'default'} ...", flush=True)
         ta = time.time()
         gpos, gcost, ginit, gpostlegal = polish(
             v1, plc, benchmark, grav_hard, args.cd_time, args.seed,
-            legalize_iters=args.legalize_iters, legalize_damping=args.legalize_damping)
+            legalize_iters=args.legalize_iters, legalize_damping=args.legalize_damping,
+            init_soft_pos=grav_soft)
         wa = time.time() - ta
         print(f"[polish/grav] init={ginit:.4f}  post_legal={gpostlegal:.4f}  "
               f"final={gcost:.4f}  delta_total={gcost-ginit:+.4f}  wall={wa:.1f}s",
