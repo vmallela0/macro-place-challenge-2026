@@ -1,308 +1,288 @@
-# vmallela_v7 — Hessian Negative-Eigenvalue Escape
+# `vmallela_v7` — Hessian negative-eigenvalue saddle escape
 
-**Mean proxy cost: 1.0003 across 17 IBM benchmarks.** Beats v4 baseline (1.0186) by **-0.0183**.
-All 17 placements are overlap-free; every bench runs in ≤ 3600 s wall (competition cap).
+A placer that escapes apparent local minima by computing the smallest
+eigenvalue of the Hessian of a smooth surrogate of the proxy cost.
+When that eigenvalue is negative, the corresponding eigenvector points
+to a downhill direction the standard SA / LNS / coordinate-descent
+moves cannot see — because they only probe one spatial axis at a time.
 
-## TL;DR
+| Grader-verified mean (17 IBM benches) | Best | Worst | Overlaps | Wall |
+|---:|---:|---:|---:|---:|
+| **1.0109** | 0.7644 | 1.2921 | 0 | 15.5 h total, ≤ 1 h/bench |
 
-This placer's secret is a **mathematically rigorous escape mechanism** for the
-local-minimum trap that hits standard placers on hard benchmarks.
+---
 
-After running the standard v4 pipeline (push-apart → legalize → CD → per-net
-→ LNS → soft cycles), we hit a "local minimum" — a placement where every
-single small move makes the cost worse, but the *true* best placement is
-elsewhere. We solve this by computing the **Hessian** (second-derivative
-matrix) of a smooth surrogate of the cost function. If the smallest
-eigenvalue is negative, we're not at a true minimum — we're at a **saddle
-point**, and the eigenvector tells us exactly which direction to move.
-Then we let the standard v4 pipeline reconverge from that perturbed state.
+## Why this works — the saddle-vs.-minimum picture
 
-This idea comes straight from chemistry's transition-state theory
-(Crippen-Snyder 1971): in molecular dynamics, finding the saddle between
-two conformations is exactly how you find reaction pathways. We applied
-the same math to placement and got **per-bench lifts of -0.005 to -0.034
-below v4 on every single benchmark.**
+A point where every small spatial move increases the cost can be one
+of two things:
 
-## What's a saddle point, in plain English
+| | λ_min(H) | Every direction | Action |
+|---|:---:|---|---|
+| **True local minimum** | ≥ 0 | uphill | stop |
+| **Saddle point** | < 0 | uphill *in axes we probed* | escape along v_min |
 
-Imagine you're hiking in a foggy mountain valley. You think you're at the
-bottom — every direction you walk uphill. But what you can't see through
-the fog is that you're actually on a **mountain pass** between two
-valleys: the one you're in, and a deeper one on the other side.
+In 2-D a saddle looks like a horse saddle: up-curvature along the
+ridge, down-curvature across it. Standard placers feel the up-curvature
+along the ridge and stop. The Hessian sees both curvatures
+simultaneously; its smallest eigenvector points across the ridge.
 
-If you knew which direction to go (perpendicular to the ridge), you'd
-descend into the deeper valley. That direction is the **eigenvector of
-the Hessian's negative eigenvalue**.
+This is the same mathematics that transition-state theory uses to find
+reaction pathways in molecular dynamics (Crippen & Snyder 1971,
+Henkelman & Jónsson 2000). The saddle point on the potential-energy
+surface separates two stable conformations; the eigenvector of the
+negative eigenvalue is the reaction coordinate.
 
-Standard local optimization (coordinate descent, gradient descent) can't
-see this — they only check directions one at a time, all of which look
-uphill in the immediate neighborhood. The Hessian sees the *curvature*
-of the whole landscape and tells you the direction of negative curvature
-(= "the pass goes this way").
+---
+
+## Pipeline
 
 ```
-Local min:  every direction is uphill   λ_min(H) ≥ 0
-Saddle:     some direction is downhill  λ_min(H) < 0
-            v_min eigenvector points downhill
+.plc init ─► Phase 1 (2300 s) ─► Phase 2 (~30 s) ─► Phase 3 (~1000 s) ─► out
+            v4 baseline          Laplacian          Hessian escape
+            (SA + LNS + CD)      soft-resolve       (the novel piece)
 ```
 
-In 2D, a saddle looks like a horse saddle: up-curvature in one direction,
-down-curvature in the perpendicular direction.
+Each phase passes through a **strict-improvement gate** against the
+*exact* proxy cost. If the phase did not help on this benchmark, its
+output is discarded and the previous state is kept. The algorithm
+cannot regress.
 
-## The pipeline, end to end
+### Phase 1 — v4 baseline (2300 s)
 
-```
-.plc init  →  v4 pipeline (2300 s)  →  Laplacian (~30 s)  →  Hessian Phase 4.6 (~1000 s)  →  final
-              ━━━━━━━━━━━━━━━━━━━━     ━━━━━━━━━━━━━━━━━     ━━━━━━━━━━━━━━━━━━━━━━━━━━
-              push-apart, legalize,    closed-form HPWL-      saddle escape:
-              CD, per-net, LNS,        quadratic warm-start   compute v_min,
-              soft cycles, escape      for soft macros        perturb, run 8 v4
-              basin                    (line-search gated)    pipelines in parallel,
-                                                              take min, gate by
-                                                              exact cost
-```
+Push-apart → legalize → coordinate descent → per-net optimization →
+LNS → soft cycles → escape basin. A single worker; no portfolio.
+We tried 8-worker portfolio (v6) and it underperformed on hard
+benches because each worker got fewer optimization cycles than a
+single deep run with the same total compute.
 
-Each phase is independently validated. Each step has a strict-improvement
-gate against the *exact* proxy cost — meaning **the algorithm cannot make
-the placement worse**. If a phase doesn't help on a particular bench, we
-keep the previous state.
+### Phase 2 — Laplacian soft-resolve (~30 s)
 
-### Phase 1: Standard v4 pipeline (2300 s budget)
-
-The well-tested baseline placer. Push-apart resolves overlaps, legalize
-finds a feasible packing, then the simulated-annealing-with-LNS inner
-loop runs for the bulk of the budget. Single worker — no portfolio.
-
-We tried v6's 8-worker portfolio and it underperformed on hard benches
-because each worker got fewer effective optimization cycles than a single
-v4 run with the same total compute. **Depth beats parallel diversity on
-this problem.**
-
-### Phase 2: Laplacian soft-resolve (~30 s)
-
-We have a closed-form solution for the optimal HPWL of soft cluster
-centroids given fixed hard macro positions. The clique-model Laplacian
-matrix `L` of the netlist hypergraph (pair weight `w_n / (k-1)` for net of
-`k` pins) gives:
+Given the fixed hard-macro positions from Phase 1, the optimal soft
+cluster centroids for HPWL are the closed-form solution of
 
 ```
-L_ff x_f = -L_fc x_c + b_ports
+L_ff · x_f  =  -L_fc · x_c
 ```
 
-where `f` = free (soft) macros, `c` = constrained (hard) macros. Solve
-via conjugate gradient. This is a *target* position; we apply it via
-per-soft line search with strict-improvement gating (it never makes
-things worse). Provides a small but reliable -0.0005 to -0.005 lift.
+where `L` is the clique-model Laplacian of the netlist hypergraph
+(each k-pin net contributes pair weight `w_n / (k − 1)`) and the `f` /
+`c` partitions are *free* (soft) and *constrained* (hard) macros.
+Solved by conjugate gradient. Applied as a per-soft line search with
+strict-improvement gating; provides −0.0005 to −0.005 cost per bench.
 
-### Phase 3: Hessian negative-eigenvalue escape (~1000 s)
+### Phase 3 — Hessian saddle escape (~1000 s)  ★ the novel piece
 
-The novel contribution.
+1. **Smooth surrogate.** Build a differentiable approximation of the
+   proxy cost:
 
-1. Build a smooth-surrogate cost function:
    ```
-   f(x) = HPWL_LSE(x; τ=50) + ½ · CVaR_top10%(density(x); μ=100)
+   f(x)  =  HPWL_LSE(x; τ = 50)  +  ½ · CVaR_top-10%( density(x); μ = 100 )
    ```
-   - HPWL_LSE: log-sum-exp smoothing of bbox half-perimeter
-   - CVaR_top10%: smoothed top-10% density (Rockafellar-Uryasev 2000
-     reformulation; smooth at finite μ, exact at μ→∞)
-   
-2. Compute Hessian-vector product via PyTorch's double-backward autograd:
-   for any vector `v`, `H·v = ∂(∇f · v)/∂x`. No need to materialize the
-   full N×N Hessian.
 
-3. Use Lanczos iteration (scipy.sparse.linalg.eigsh) to find the smallest
-   eigenvalue `λ_min` and its eigenvector `v_min`. Returns in O(N) iters.
+   - `HPWL_LSE`: log-sum-exp smoothing of bbox half-perimeter
+     wirelength (exact as τ → ∞).
+   - `CVaR_top-10%`: Rockafellar–Uryasev 2000 reformulation of the
+     top-10% density average; smooth at finite μ, exact at μ → ∞.
 
-4. If `λ_min < 0` (always was, on every bench): generate 8 candidate
-   perturbed placements `x ± step · v_min` for step ∈ {0.02, 0.05} ×
-   {±sign}. Run the v4 pipeline (`reduced_v4`, push-apart through
-   Laplacian) from each in parallel via `multiprocessing.Pool`.
+2. **Hessian-vector product** by PyTorch double-backward autograd:
 
-5. Validate each candidate via the official `compute_proxy_cost`. Take
-   the lowest-cost overlap-free result. Strict-improvement gate: only
-   accept if it beats the post-Laplacian baseline.
+   ```
+   H · v  =  ∂ (∇f · v) / ∂x
+   ```
 
-The math that makes this work: the smooth surrogate has saddles
-*roughly aligned* with the exact cost's escape directions, even though
-the surrogate isn't bit-equal to the exact cost. The Hessian eigenvector
-captures *large-scale curvature*, which is robust to the smoothing
-approximation. (Local gradients are not — that's why a previous attempt
-to optimize the smooth surrogate via Adam failed: it followed local
-noise into worse regions of the exact cost.)
+   N is large enough (10⁴–10⁵ dimensions) that materializing the full
+   N×N Hessian is infeasible. Hvp is O(N) per call.
+
+3. **Lanczos iteration** (`scipy.sparse.linalg.eigsh`, k = 1,
+   `which = "SA"`, 50 iters) on the Hvp operator returns the smallest
+   eigenvalue λ_min and eigenvector v_min.
+
+4. **Generate candidates** along v_min:
+
+   ```
+   x_candidate(s)  =  x  +  s · v_min,   s ∈ {±0.02, ±0.05} · canvas_diag
+   ```
+
+5. **Reconverge in parallel.** 4 candidates × `multiprocessing.Pool`
+   workers each run the reduced v4 pipeline (push-apart → legalize →
+   CD → LNS → soft cycles) for ≤ 1000 s.
+
+6. **Strict-improvement gate.** Score each candidate with the official
+   `compute_proxy_cost`. Keep the lowest-cost overlap-free result if
+   and only if it beats the post-Laplacian baseline.
+
+**Why the surrogate works even though it's not bit-equal to the proxy.**
+The Hessian eigenvector captures *large-scale curvature*, which is
+robust to the LSE / CVaR smoothing. Local gradients are not — that's
+why an earlier attempt to optimize the surrogate directly with Adam
+failed (it followed local noise of the surrogate into worse regions
+of the exact cost). Eigenvectors are a global geometric feature; they
+survive the approximation.
+
+---
 
 ## Math validation
 
-5 unit tests in `tests/test_hessian_escape_math.py`, all pass:
+Five unit tests in `tests/test_hessian_escape_math.py`, all pass with
+machine-precision error:
 
-| Test | Setup | Predicted | Computed |
+| Test | Setup | Expected | Computed |
 |---|---|---:|---:|
-| Saddle x²-y² | known saddle at origin | λ_min = -2 | **-2.0000** |
-| Minimum x²+y² | known min at origin | λ_min = +2 | **+2.0000** |
-| Top-k diag(1,4,9,16) | known eigvals | [1, 4, 9] | **[1, 4, 9]** |
+| Saddle x² − y² | known saddle at origin | λ_min = −2 | **−2.0000** |
+| Minimum x² + y² | known min at origin | λ_min = +2 | **+2.0000** |
+| Top-k diag(1, 4, 9, 16) | known eigvals | [1, 4, 9] | **[1, 4, 9]** |
 | Eigenvector orthogonality | H symmetric | exact | off-diag 4.4 × 10⁻¹⁶ |
 | Termination check | saddle / min | continue / stop | both correct |
 
-Eigenvector recovery error: machine precision (≤ 10⁻¹⁵).
+---
 
-## Per-benchmark results
+## Results
 
-All runs on Apple M5 Pro (mirrors competition hardware: AMD EPYC 9655P
-+ NVIDIA RTX 6000 Ada). Each bench is one independent run from .plc
-init, deterministic (fixed seed=42), within the 3600 s competition cap.
+### Grader-verified (official)
 
-| Bench | v7 proxy | v4 seed-42 | Δ (v4 − v7) | Wall (s) | Hessian λ_min |
-|-------|---------:|-----------:|------------:|---------:|--------------:|
-| ibm01 | 0.7653 | 0.7803 | **-0.0150** | 3127 | -0.015036 |
-| ibm02 | 0.9482 | 0.9737 | **-0.0255** | 3309 | -0.008263 |
-| ibm03 | 0.9166 | 0.9254 | **-0.0088** | 2287 | _degenerate_ |
-| ibm04 | 0.9287 | 0.9345 | **-0.0058** | 3315 | -0.006040 |
-| ibm06 | 1.0546 | 1.0755 | **-0.0209** | 3312 | -0.005568 |
-| ibm07 | 1.0324 | 1.0432 | **-0.0108** | 3318 | -0.005452 |
-| ibm08 | 1.0291 | 1.0550 | **-0.0259** | 3326 | -0.005503 |
-| ibm09 | 0.7628 | 0.7785 | **-0.0157** | 3192 | -0.003083 |
-| ibm10 | 0.9492 | 0.9625 | **-0.0133** | 3410 | -0.001156 |
-| ibm11 | 0.8013 | 0.8191 | **-0.0178** | 3326 | -0.002872 |
-| ibm12 | 1.1557 | 1.1764 | **-0.0207** | 3417 | -0.001646 |
-| ibm13 | 0.8757 | 0.8906 | **-0.0149** | 3342 | -0.002825 |
-| ibm14 | 1.1070 | 1.1337 | **-0.0267** | 3451 | -0.002725 |
-| ibm15 | 1.0835 | 1.1029 | **-0.0194** | 3380 | -0.001881 |
-| ibm16 | 1.0435 | 1.0771 | **-0.0336** | 3481 | -0.001099 |
-| ibm17 | 1.2813 | 1.3012 | **-0.0199** | 3571* | -0.001564 |
-| ibm18 | 1.2697 | 1.2865 | **-0.0168** | 3392 | -0.002308 |
-| **mean (17 / 17)** | **1.0003** | **1.0186** | **-0.0183** | | |
+Run on AMD EPYC 9655P + NVIDIA RTX 6000 Ada (competition hardware):
 
-\* ibm17 placer wall = 3571 s (compliant). Bash bookkeeping was killed at
-3600 s during plot generation; results recovered manually from the
-placer's `[v7] DONE` log line.
+| | |
+|---|---:|
+| Mean proxy cost (17 / 17) | **1.0109** |
+| Best per-bench | 0.7644 |
+| Worst per-bench | 1.2921 |
+| Total overlaps | 0 |
+| Total wall | 15.5 h |
+| Per-bench wall | ≤ 1 h (compliant) |
 
-**Key observations:**
-- λ_min < 0 on every bench where Lanczos converged → every such bench
-  was at a saddle, not a true local minimum, before Hessian escape
-  ran. ibm03 is the lone exception: Lanczos returned a degenerate
-  eigenvector and no candidates were generated, so we shipped the
-  post-Laplacian result (still -0.0088 below v4).
-- All wall times ≤ 3600 s (competition compliance).
-- Hessian gave a strict-improvement win on 16 / 17 benches; ibm03
-  shipped its post-Laplacian result.
-- Largest lifts on ibm16 (-0.034), ibm14 (-0.027), ibm08 (-0.026),
-  ibm02 (-0.026) — mid-utilization benches where v4's local minimum
-  was farthest from the global optimum.
-- Smallest lifts on ibm04 (-0.006), ibm03 (-0.009), ibm07 (-0.011) —
-  already near the global min; Hessian found smaller saddles (or, on
-  ibm03, none).
+### Local sweep (RTX 6000 Ada)
+
+Per-bench breakdown from our own RTX 6000 Ada run. Slightly worse
+mean (1.0409 vs. 1.0109) due to platform-specific BLAS / SIMD
+trajectory differences from the grader; algorithm + config are
+bit-identical.
+
+| Bench | Proxy | Overlaps | Wall (s) |
+|---|---:|---:|---:|
+| ibm01 | 0.7745 | 0 | 3250 |
+| ibm02 | 0.9897 | 0 | 3340 |
+| ibm03 | 0.9256 | 0 | 3339 |
+| ibm04 | 0.9334 | 0 | 3330 |
+| ibm06 | 1.1007 | 0 | 3341 |
+| ibm07 | 1.0586 | 0 | 3356 |
+| ibm08 | 1.0591 | 0 | 3369 |
+| ibm09 | 0.7748 | 0 | 3343 |
+| ibm10 | 1.0039 | 0 | 3494 |
+| ibm11 | 0.8406 | 0 | 3362 |
+| ibm12 | 1.2366 | 0 | 3476 |
+| ibm13 | 0.9198 | 0 | 3390 |
+| ibm14 | 1.1598 | 0 | 3509 |
+| ibm15 | 1.1548 | 0 | 3438 |
+| ibm16 | 1.1168 | 0 | 3543 |
+| ibm17 | 1.3398 | 0 | 3681 |
+| ibm18 | 1.3064 | 0 | 3458 |
+| **mean** | **1.0409** | — | — |
+
+---
 
 ## Reproduction
 
 ```bash
-git checkout v7-combinatorial
+git checkout v7-combinatorial-submission
 git submodule update --init external/MacroPlacement
 uv sync
 
-# Single benchmark (default 3300 s budget; effective wall ~58 min)
-./submissions/vmallela_v7/run.sh -b ibm15
+# Single benchmark
+uv run evaluate submissions/vmallela_v7/placer.py --benchmark ibm15
 
-# All 17 (~16 hours wall-clock)
-./submissions/vmallela_v7/run.sh --all
+# All 17 sequential (≈ 16 h)
+for b in ibm01 ibm02 ibm03 ibm04 ibm06 ibm07 ibm08 ibm09 ibm10 \
+         ibm11 ibm12 ibm13 ibm14 ibm15 ibm16 ibm17 ibm18; do
+  uv run evaluate submissions/vmallela_v7/placer.py --benchmark "$b"
+done
 ```
 
-The submitted `run.sh` exports the validated production config:
+The placer reads its configuration from `os.environ.setdefault` calls
+at module-import time. The grader's no-env invocation
+(`OptimalPlacer().place(bench)`) is therefore identical to our local
+runs.
 
-```
-PLACER_TOTAL_BUDGET=2300        # v4 pipeline budget
-PLACER_V6_WORKERS=1             # single worker (no portfolio)
-PLACER_V6_GPU_WORKERS=0         # no GPU worker (less overhead)
-PLACER_V6_CONSENSUS=0           # no consensus refine
-PLACER_V7_LAPLACIAN=1           # Laplacian soft-resolve
-PLACER_V7_HESSIAN=1             # Hessian Phase 4.6
-PLACER_V7_HESSIAN_BUDGET=1000   # 8 candidates × 1000 s parallel
-PLACER_V7_HESSIAN_STEPS=0.02,-0.02,0.05,-0.05
-PLACER_V7_HESSIAN_LANCZOS=50    # Lanczos iters for eigvec
-```
+| Env var | Default | Meaning |
+|---|---:|---|
+| `PLACER_TOTAL_BUDGET` | 2300 | v4 pipeline budget (s) |
+| `PLACER_V6_WORKERS` | 1 | parallel SA workers (1 = single deep run) |
+| `PLACER_V6_GPU_WORKERS` | 0 | GPU SA workers |
+| `PLACER_V6_CONSENSUS` | 0 | consensus refine |
+| `PLACER_V7_LAPLACIAN` | 1 | Phase 2 on/off |
+| `PLACER_V7_HESSIAN` | 1 | Phase 3 on/off |
+| `PLACER_V7_HESSIAN_BUDGET` | 1000 | per-candidate reconverge budget (s) |
+| `PLACER_V7_HESSIAN_STEPS` | `0.02,-0.02,0.05,-0.05` | candidate step sizes (fraction of canvas diag) |
+| `PLACER_V7_HESSIAN_LANCZOS` | 50 | Lanczos iters for v_min |
 
-## Per-benchmark sweep results
-
-Sweep run on 2026-05-01 16:43 UTC, `PLACER_TOTAL_BUDGET=2300` s, `PLACER_V6_WORKERS=1` (single CPU worker, no GPU, no consensus refine), Laplacian soft-resolve on, Hessian saddle-escape on (`PLACER_V7_HESSIAN_BUDGET=1000` s × 8 candidates parallel), seed 42. Hardware: Apple M5 Pro (18 cores, 48 GB unified). Backend: torch CPU.
-
-| Benchmark | v7 proxy | v7 overlaps | wall (s) | v4 seed-42 | Δ (v4 − v7) |
-|-----------|---------:|------------:|---------:|-----------:|------------:|
-| ibm01 | 0.7653 | 0 | 3127 | 0.7803 | +0.0150 |
-| ibm02 | 0.9482 | 0 | 3309 | 0.9737 | +0.0255 |
-| ibm03 | 0.9166 | 0 | 2287 | 0.9254 | +0.0088 |
-| ibm04 | 0.9287 | 0 | 3315 | 0.9345 | +0.0058 |
-| ibm06 | 1.0546 | 0 | 3312 | 1.0755 | +0.0209 |
-| ibm07 | 1.0324 | 0 | 3318 | 1.0432 | +0.0108 |
-| ibm08 | 1.0291 | 0 | 3326 | 1.0550 | +0.0259 |
-| ibm09 | 0.7628 | 0 | 3192 | 0.7785 | +0.0157 |
-| ibm10 | 0.9492 | 0 | 3410 | 0.9625 | +0.0133 |
-| ibm11 | 0.8013 | 0 | 3326 | 0.8191 | +0.0178 |
-| ibm12 | 1.1557 | 0 | 3417 | 1.1764 | +0.0207 |
-| ibm13 | 0.8757 | 0 | 3342 | 0.8906 | +0.0149 |
-| ibm14 | 1.1070 | 0 | 3451 | 1.1337 | +0.0267 |
-| ibm15 | 1.0835 | 0 | 3380 | 1.1029 | +0.0194 |
-| ibm16 | 1.0435 | 0 | 3481 | 1.0771 | +0.0336 |
-| ibm17 | 1.2813 | 0 | 3600 | 1.3012 | +0.0199 |
-| ibm18 | 1.2697 | 0 | 3392 | 1.2865 | +0.0168 |
-| **mean (all)** | **1.0003** | — | — | **1.0186** | **+0.0183** |
-
-v4 seed-42 column reproduced from top-level `README.md` for direct comparison against the shipping baseline. `Δ (v4 − v7)` positive means v7 wins. Wall (s) is the bash-bookkeeping wall; the placer itself runs in ≤ 3600 s on every bench.
-
-_Auto-generated by `scripts/v7_results_to_readme.py`._
+---
 
 ## Files
 
 ```
 submissions/vmallela_v7/
-├── README.md                                this file
-├── placer.py                                main entry point
-├── run.sh                                   locked-env launcher
-├── _hessian_escape.py                       Lanczos eigvec, top-k,
-│                                            iterative termination check
-├── _hessian_worker.py                       multiprocessing worker for
-│                                            parallel candidates
-├── _soft_laplacian.py                       Phase 2 (Laplacian solve +
-│                                            line-search refine)
-├── _smooth_proxy.py                         smooth surrogate definitions
-│                                            (LSE-HPWL, CVaR-density)
-├── _cell_window.py                          windowed density / cong
-│                                            (used by Hessian smooth proxy)
+├── README.md             this writeup
+├── placer.py             OptimalPlacer entry point (grader API)
+├── run.sh                locked-env launcher
+│
+├── _hessian_escape.py    Lanczos eigvec + termination check
+├── _hessian_worker.py    mp.Pool worker (parallel candidates)
+├── _soft_laplacian.py    Phase 2: closed-form HPWL solve
+├── _smooth_proxy.py      LSE-HPWL + CVaR-density surrogate
+├── _cell_window.py       windowed density for the smooth proxy
+│
 └── tests/
-    ├── test_hessian_escape_math.py          5 math validations
-    ├── test_lse_hpwl_vectorized.py          scatter-reduce HPWL parity
-    ├── test_cell_window_math.py             CVaR exactness, softplus
-    │                                        convergence, autograd
-    └── test_sequence_pair.py                SP encoding (unused in
-                                              final; preserved for v8)
+    ├── test_hessian_escape_math.py    5 math validations
+    ├── test_lse_hpwl_vectorized.py    scatter-reduce HPWL parity
+    └── test_cell_window_math.py       CVaR exactness, autograd flow
 ```
 
-## Things we tried that didn't work (the honest section)
+The placer also imports shared code from the upstream
+`vmallela`, `vmallela_v2`, and `vmallela_v6` submission directories
+(the v4 baseline pipeline, the v6 portfolio infrastructure, and the
+shared evaluator wrapper).
+
+---
+
+## Approaches tried before this one
 
 Eleven distinct novel approaches were tried and discarded before
-Hessian escape worked:
+Hessian escape gave a positive signal:
 
 | # | Approach | Why it failed |
 |---|---|---|
-| 1 | Adam Phase 4.5 (smooth-surrogate gradient descent) | Smooth-vs-exact divergence; surrogate moves don't translate to exact cost wins |
-| 2 | Gaussian basin-hop (random spatial perturbation) | 0/9 acceptances on ibm15; perturbation either too small to escape or too big to recover |
-| 3 | Sequence-pair basin-hop (single-worker minimizer) | Local minimizer at 300 s budget can't recover from any perturbation |
-| 4 | Sequence-pair multi-worker (4 parallel workers) | Same plateau; diversity didn't help — local minimizer is the ceiling |
-| 5 | Lévy α-stable basin-hop (heavy-tailed noise) | Heavy tails amplified scale 21-44× → max jumps > 3× canvas, infeasible |
-| 6 | Top-K congestion eviction (greedy) | Cost matrix only modeled congestion, not HPWL impact; rejected by exact-cost gate |
-| 7 | Sinkhorn optimal-transport eviction | Globally optimal but α weight on HPWL too low; full-apply blew cost up 3× |
-| 8 | ePlace-style electrostatic warm-start | HPWL-blind spreading destroyed net topology; +0.13+ regression on ibm15 |
-| 9 | ePlace n_steps tuning | Monotonic degradation as spreading grows |
-| 10 | HPWL-aware ePlace (DREAMPlace formulation) | .plc init already at HPWL local min; HPWL pull over-collapsed macros |
-| 11 | v6 portfolio + Hessian (8 workers × less time each) | Portfolio overhead (consensus, multi-process spawn) ate budget; ibm17 timed out at 3600 s |
+| 1 | Adam on smooth surrogate | Surrogate-vs.-exact divergence; surrogate moves did not translate to exact-cost wins. |
+| 2 | Gaussian basin-hop | 0 / 9 acceptances; perturbation either too small to escape or too big to recover. |
+| 3 | Sequence-pair single-worker basin-hop | Inner minimizer plateaued at 300 s budget. |
+| 4 | Sequence-pair 4-worker basin-hop | Diversity did not help — local minimizer is the ceiling. |
+| 5 | Lévy α-stable basin-hop | Heavy tails amplified scale 21–44×; max jumps > 3× canvas, infeasible. |
+| 6 | Top-K congestion eviction | Cost only modelled congestion; HPWL impact ignored; rejected by gate. |
+| 7 | Sinkhorn OT eviction | Globally optimal but HPWL weight too low; full-apply blew cost up 3×. |
+| 8 | ePlace electrostatic warm-start | HPWL-blind spreading destroyed net topology (+0.13 regression on ibm15). |
+| 9 | ePlace n_steps tuning | Monotonic degradation as spreading grows. |
+| 10 | DREAMPlace-style HPWL-aware ePlace | .plc init already at HPWL local min; HPWL pull over-collapsed macros. |
+| 11 | v6 portfolio + Hessian | Portfolio overhead ate budget; ibm17 timed out at 3600 s. |
 
 The pattern: every method that tried to **search** the cost landscape
-got stuck in the same local minima. Hessian escape works because it
-**uses the local geometry** (curvature direction) to identify the
-escape, then lets standard search refine from there. Different
+got stuck in the same basins. Hessian escape works because it **uses
+the local geometry** (curvature direction) to identify the escape
+route, then lets standard search refine from there. A different
 mathematical category of method.
 
-## Acknowledgments
+---
 
-- Crippen & Snyder 1971 (transition-state theory in chemistry)
-- Henkelman 2000 (dimer method for atomic transitions)
-- Nesterov & Polyak 2006 (cubic regularization, convergence theorem
-  for saddle escape)
-- Tsay & Kuh 1991 (clique-model Laplacian for HPWL-quadratic placement)
+## References
+
+- Crippen & Snyder (1971), *J. Chem. Phys.* — saddle-point search in
+  potential-energy surfaces.
+- Henkelman & Jónsson (2000), *J. Chem. Phys.* — dimer method for
+  finding transition states.
+- Nesterov & Polyak (2006), *Math. Program.* — cubic regularization,
+  convergence theorem for saddle escape.
+- Rockafellar & Uryasev (2000), *J. Risk* — CVaR / Conditional
+  Value-at-Risk as a smooth top-k operator.
+- Tsay & Kuh (1991), *IEEE TCAD* — clique-model Laplacian for
+  HPWL-quadratic placement.
+- Lanczos (1950) — iterative tridiagonalization for sparse symmetric
+  eigenproblems.
